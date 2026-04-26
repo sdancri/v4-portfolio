@@ -87,6 +87,10 @@ class SubaccountRunner:
                                                           # DOAR bare LIVE (după pornire)
                                                           # — afișate pe primary pair
 
+        # Operational flags
+        self.paused: bool = False           # /api/pause endpoint
+        self.pending_withdraw: bool = False  # post-SUCCESS, până la /api/confirm_withdraw
+
     def primary_pair_key(self) -> tuple[str, str] | None:
         """Returnează (symbol, timeframe) al primei perechi (pt chart)."""
         if not self.sub_cfg.pairs:
@@ -115,7 +119,9 @@ class SubaccountRunner:
     # ── Setup ────────────────────────────────────────────────────────────
     async def setup(self) -> None:
         """State FRESH (regula 2: restart = de la 0). Configurează leverage,
-        warmup signal generators."""
+        warmup signal generators. Apoi RECONCILE cu Bybit — dacă găsim
+        poziții sau ordine reziduale → PAUSED + alert.
+        """
         self.state = SubaccountState.fresh(self.cfg.strategy)
         log_event(
             self.cfg.operational.log_dir, self.sub_cfg.name, "BOOT",
@@ -145,10 +151,82 @@ class SubaccountRunner:
             self.positions[pair.symbol] = None
             self.last_signal_dir[(pair.symbol, pair.timeframe)] = 0
 
+        # ── RECONCILE — verifică Bybit pentru rezidue ────────────────────
+        await self._reconcile_with_bybit()
+
+    async def _reconcile_with_bybit(self) -> None:
+        """Detectează poziții / ordine reziduale pe Bybit (de la crash anterior).
+
+        Reguli:
+          - Orice poziție deschisă pe Bybit pe perechi monitorizate → PAUSED.
+          - Orice order deschis (SL stop_market sau limit) → PAUSED.
+          - Cazul critic: position fără SL → ALERT CRITIC + PAUSED.
+
+        Default state pe mismatch: PAUSED (NU auto-recovery — manual review).
+        """
+        residue: list[str] = []
+        for pair in self.sub_cfg.pairs:
+            sym = pair.symbol
+            try:
+                pos = await self.client.fetch_position(sym)
+                orders = await self.client.fetch_open_orders(sym)
+            except Exception as e:
+                residue.append(f"{sym}: fetch failed ({e!r})")
+                continue
+
+            has_position = pos is not None and float(pos.get("contracts") or 0) > 0
+            sl_orders = [o for o in orders if o.get("type") in
+                         ("stop_market", "stop", "stop_loss")
+                         or (o.get("info", {}).get("stopOrderType") in
+                             ("Stop", "TakeProfit", "StopLoss"))]
+            other_orders = [o for o in orders if o not in sl_orders]
+
+            if has_position and not sl_orders:
+                residue.append(
+                    f"{sym}: ⚠️  POSITION FĂRĂ SL — "
+                    f"qty={pos.get('contracts')} avg={pos.get('entryPrice')}"
+                )
+            elif has_position:
+                residue.append(
+                    f"{sym}: position={pos.get('contracts')} @ {pos.get('entryPrice')}, "
+                    f"sl_orders={len(sl_orders)}, other={len(other_orders)}"
+                )
+            elif sl_orders or other_orders:
+                residue.append(
+                    f"{sym}: NO position dar {len(sl_orders)} SL + "
+                    f"{len(other_orders)} alte ordine deschise"
+                )
+
+        if residue:
+            self.paused = True
+            details = "\n".join(f"  - {r}" for r in residue)
+            print(
+                f"  [RECONCILE] ⚠️  REZIDUE Bybit detectat — bot PAUSED\n{details}\n"
+                f"  Trigger /api/resume DOAR după manual review."
+            )
+            log_event(
+                self.cfg.operational.log_dir, self.sub_cfg.name, "RECONCILE_PAUSED",
+                residue=residue,
+            )
+            await tg.send(
+                "⚠️ RECONCILE PAUSED",
+                f"Subaccount: <code>{self.sub_cfg.name}</code>\n"
+                f"Reziduri Bybit detectate la pornire:\n<pre>{details}</pre>\n"
+                f"Bot PAUZAT. Verifică manual și trimite /api/resume."
+            )
+        else:
+            log_event(
+                self.cfg.operational.log_dir, self.sub_cfg.name, "RECONCILE_OK",
+                note="No positions or open orders on Bybit",
+            )
+
     # ── Bar handling ─────────────────────────────────────────────────────
     async def on_bar(self, bar: dict[str, Any]) -> None:
         """Apelat pe fiecare tick WS. Procesează doar bare CONFIRMED."""
         if not bar.get("confirmed"):
+            return
+        # Pause flags: skip toate decizii (chart broadcast continuă în main flow)
+        if self.paused or self.pending_withdraw:
             return
         key = (bar["symbol"], bar["timeframe"])
         if key not in self.signals:
@@ -469,8 +547,19 @@ class SubaccountRunner:
             withdraw_amount=withdraw,
             balance=self.state.balance_broker,
         )
-        # NB: transferul efectiv către master account NU se face automat aici;
-        # în spec e marcat ca decizie operațională user (vezi CONFIG.md secțiunea 9).
+        # PAUSE până la confirmarea manuală a transferului către master.
+        # Bot NU mai deschide trade-uri noi până la POST /api/confirm_withdraw.
+        # Asta previne desync: state.balance crede $100, dar Bybit are încă $10k.
+        self.pending_withdraw = True
+        await tg.send(
+            "🎉 CYCLE SUCCESS — withdraw pending",
+            f"Subaccount: <code>{self.sub_cfg.name}</code>\n"
+            f"Withdraw: <b>${withdraw:,.2f}</b>\n"
+            f"Cycle #{self.state.cycle_num - 1} închis.\n\n"
+            f"<b>Acțiune manuală:</b>\n"
+            f"1. Transferă ${withdraw:,.2f} din subaccount → master (UI Bybit)\n"
+            f"2. Trimite POST la /api/confirm_withdraw pentru a relua tradingul"
+        )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────

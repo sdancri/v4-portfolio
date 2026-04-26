@@ -228,6 +228,22 @@ class BybitClient:
                 return p
         return None
 
+    async def fetch_open_orders(self, symbol: str) -> list[dict[str, Any]]:
+        """Toate ordinele DESCHISE (limit, stop_market, stop_limit) pe symbol."""
+        try:
+            return await self.exchange.fetch_open_orders(symbol)
+        except Exception as e:
+            print(f"  [BYBIT] fetch_open_orders {symbol} error: {e}")
+            return []
+
+    async def fetch_order(self, symbol: str, order_id: str) -> dict[str, Any] | None:
+        """Status ordin specific (folosit pentru ack + partial fill detect)."""
+        try:
+            return await self.exchange.fetch_order(order_id, symbol)
+        except Exception as e:
+            print(f"  [BYBIT] fetch_order {order_id} error: {e}")
+            return None
+
     async def fetch_realized_pnl(
         self, symbol: str, start_ms: int, end_ms: int
     ) -> float:

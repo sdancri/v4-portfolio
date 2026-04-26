@@ -125,12 +125,73 @@ async def open_trade_live(
         reduce_only=False,
     )
 
-    # 2. Stop-market SL reduce-only (opposite side)
+    # 1b. Așteaptă fill REAL (poll fetch_order, timeout 10s).
+    # Cazuri tratate:
+    #   - Filled total: avg_price + qty real
+    #   - PartiallyFilled timeout: folosește qty filled real (mai mic)
+    #   - Rejected: NO position (return None)
+    #   - Timeout fără fill: cancel + NO position
+    import asyncio
+    actual_qty = 0.0
+    actual_entry = signal.entry_price
+    deadline = asyncio.get_event_loop().time() + 10.0
+    last_status = ""
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(0.5)
+        order_status = await client.fetch_order(symbol, entry_order["id"])
+        if order_status is None:
+            continue
+        last_status = order_status.get("status") or order_status.get("info", {}).get("orderStatus", "")
+        filled = float(order_status.get("filled") or 0)
+        avg = order_status.get("average") or order_status.get("info", {}).get("avgPrice")
+        if filled > 0:
+            actual_qty = filled
+            if avg:
+                actual_entry = float(avg)
+        if last_status in ("closed", "filled", "Filled"):
+            break
+        if last_status in ("rejected", "canceled", "Cancelled", "Rejected"):
+            print(
+                f"  [ORDER] {symbol} entry REJECTED status={last_status} — abort"
+            )
+            return None
+
+    if actual_qty <= 0:
+        # Timeout fără fill — cancel safety
+        try:
+            await client.cancel_order(symbol, entry_order["id"])
+        except Exception:
+            pass
+        print(f"  [ORDER] {symbol} entry timeout 10s, status={last_status} — abort")
+        return None
+
+    if actual_qty < qty:
+        print(
+            f"  [ORDER] {symbol} PARTIAL FILL {actual_qty}/{qty} — "
+            f"folosesc qty real, recalc SL pe entry={actual_entry}"
+        )
+
+    # 1c. Verifică SL bounds după real fill (slippage check)
+    sl_dist = abs(actual_entry - signal.sl_price)
+    actual_sl_pct = sl_dist / actual_entry if actual_entry > 0 else 0
+    if actual_sl_pct < cfg.sl_min_pct or actual_sl_pct > cfg.sl_max_pct:
+        # Slippage scoate SL din bounds → close imediat
+        close_side = "sell" if signal.side == "long" else "buy"
+        await client.create_market_order(
+            symbol=symbol, side=close_side, qty=actual_qty, reduce_only=True
+        )
+        print(
+            f"  [ORDER] {symbol} slippage out of bounds (sl_pct={actual_sl_pct:.4f}), "
+            f"closed immediately"
+        )
+        return None
+
+    # 2. Stop-market SL reduce-only (opposite side) cu qty REAL
     sl_side = "sell" if signal.side == "long" else "buy"
     sl_order = await client.create_stop_market(
         symbol=symbol,
         side=sl_side,
-        qty=qty,
+        qty=actual_qty,
         stop_price=signal.sl_price,
         reduce_only=True,
     )
@@ -138,21 +199,23 @@ async def open_trade_live(
     return LivePosition(
         symbol=symbol,
         side=signal.side,
-        qty=qty,
-        entry_price=signal.entry_price,    # va fi reconciliată cu fill-price din WS
+        qty=actual_qty,            # qty REAL filled (poate fi < qty cerut)
+        entry_price=actual_entry,  # avg fill price REAL
         sl_price=signal.sl_price,
         sl_initial=signal.sl_price,
-        pos_usd=pos_final,
+        pos_usd=actual_qty * actual_entry,
         risk_usd=risk_usd,
         opened_ts=datetime.now(timezone.utc),
         order_entry_id=entry_order["id"],
         order_sl_id=sl_order["id"],
         extra={
             "sl_pct_at_signal": signal.sl_pct,
+            "sl_pct_actual": actual_sl_pct,
             "balance_real_at_entry": balance_real,
             "pos_internal": pos_internal,
+            "qty_requested": qty,
+            "partial_fill": actual_qty < qty,
             "was_capped": pos_internal > max_bybit,
-            "max_bybit_at_entry": max_bybit,
         },
     )
 
