@@ -117,33 +117,12 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
         )
         return {"paused": False, "subaccount": runner.sub_cfg.name}
 
-    @app.post("/api/confirm_withdraw")
-    async def api_confirm_withdraw() -> dict[str, Any]:
-        """User confirmă că a transferat manual fondurile la master account.
-        Bot reia tradingul cu cycle nou (state.balance == pool_total).
-        """
-        if not runner.pending_withdraw:
-            return {
-                "ok": False,
-                "msg": "Nu e niciun withdraw pending — nimic de confirmat",
-            }
-        runner.pending_withdraw = False
-        from vse_bot.event_log import log_event
-        log_event(
-            runner.cfg.operational.log_dir, runner.sub_cfg.name,
-            "WITHDRAW_CONFIRMED", source="/api/confirm_withdraw",
-            cycle=runner.state.cycle_num,
-        )
-        return {"ok": True, "subaccount": runner.sub_cfg.name,
-                "cycle": runner.state.cycle_num}
-
     @app.get("/api/state")
     async def api_state() -> dict[str, Any]:
         """Diagnostic snapshot pentru debug."""
         return {
             "subaccount": runner.sub_cfg.name,
             "paused": runner.paused,
-            "pending_withdraw": runner.pending_withdraw,
             "state": {
                 "equity": runner.state.equity,
                 "balance_broker": runner.state.balance_broker,

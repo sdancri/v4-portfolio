@@ -1,16 +1,23 @@
-"""Bybit kline WebSocket client (public, multi-symbol).
+"""Bybit kline WebSocket client (public, multi-symbol) cu STALE detection.
 
-Subscribe la un set de topicuri ``kline.{interval}.{symbol}`` și emite, prin
-callback async, dict-uri ``{symbol, timeframe, ts, open, high, low, close,
-volume, confirmed}``. Heartbeat la 20s; auto-reconnect cu backoff.
+Features:
+  - Subscribe la topicuri ``kline.{interval}.{symbol}``.
+  - Emite prin callback async dict-uri cu OHLC + confirmed flag.
+  - Heartbeat ping la 20s.
+  - Auto-reconnect cu backoff la error.
+  - **Stale detection**: watchdog periodic (every 60s) verifică ultima bară
+    confirmed primită per (symbol, tf). Dacă > 2 × tf_seconds fără bară →
+    callback ``on_stale`` + force reconnect.
 
-Pentru replay-mode nu folosim WS — ci doar la run_live.
+TF seconds:
+  1m=60, 5m=300, 15m=900, 1h=3600, 2h=7200, 4h=14400, 1d=86400
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Awaitable, Callable
 
 import websockets
@@ -25,6 +32,12 @@ _TF_BYBIT = {
     "1d": "D", "1w": "W",
 }
 
+_TF_SECONDS = {
+    "1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+    "1h": 3600, "2h": 7200, "4h": 14400, "6h": 21600, "12h": 43200,
+    "1d": 86400, "1w": 604800,
+}
+
 
 def _bybit_interval(timeframe: str) -> str:
     if timeframe not in _TF_BYBIT:
@@ -32,24 +45,41 @@ def _bybit_interval(timeframe: str) -> str:
     return _TF_BYBIT[timeframe]
 
 
-class BybitKlineWS:
-    """WebSocket public Bybit pentru kline streams.
+def _tf_to_seconds(timeframe: str) -> int:
+    return _TF_SECONDS.get(timeframe, 3600)
 
-    Callback semnătura: ``async def on_bar(bar: dict) -> None``.
-    Bar-urile NEÎNCHISE (``confirmed=False``) sunt și ele trimise — strategia
-    decide ce ignoră (VSE folosește doar bare confirmed).
+
+class BybitKlineWS:
+    """WebSocket public Bybit pentru kline streams cu stale watchdog.
+
+    Callback ``on_bar``:    async def f(bar: dict) -> None
+    Callback ``on_stale``:  async def f(symbol: str, tf: str, age_sec: float) -> None
+
+    Stale threshold: ``stale_factor × tf_seconds`` (default 2.0).
+    Pe stale detect: emite ``on_stale`` și **închide WS-ul** → reconnect prin loop.
     """
 
     def __init__(
         self,
-        subscriptions: list[tuple[str, str]],   # [(symbol, timeframe), ...]
+        subscriptions: list[tuple[str, str]],
         on_bar: Callable[[dict], Awaitable[None]],
         testnet: bool = True,
+        on_stale: Callable[[str, str, float], Awaitable[None]] | None = None,
+        stale_factor: float = 2.0,
+        watchdog_interval_sec: float = 60.0,
     ) -> None:
         self.subscriptions = subscriptions
         self.on_bar = on_bar
+        self.on_stale = on_stale
         self.url = WS_PUBLIC_TESTNET if testnet else WS_PUBLIC_MAINNET
+        self.stale_factor = stale_factor
+        self.watchdog_interval = watchdog_interval_sec
         self._stop = asyncio.Event()
+        # Track ultima bară CONFIRMED primită per (symbol, tf). Inițial = now
+        # (ca să nu trigger stale înainte ca prima bară să apară natural).
+        self._last_bar_ts: dict[tuple[str, str], float] = {
+            (sym, tf): time.time() for sym, tf in subscriptions
+        }
 
     async def run(self) -> None:
         topics = [
@@ -64,7 +94,13 @@ class BybitKlineWS:
                 ) as ws:
                     await ws.send(json.dumps({"op": "subscribe", "args": topics}))
                     backoff = 1.0
+                    # Reset timestamps la (re)connect — dăm bot-ului benefit of doubt
+                    now = time.time()
+                    for k in self._last_bar_ts:
+                        self._last_bar_ts[k] = now
+
                     hb_task = asyncio.create_task(self._heartbeat(ws))
+                    wd_task = asyncio.create_task(self._watchdog(ws))
                     try:
                         async for raw in ws:
                             msg = json.loads(raw)
@@ -76,6 +112,7 @@ class BybitKlineWS:
                             await self._dispatch(topic, msg.get("data", []))
                     finally:
                         hb_task.cancel()
+                        wd_task.cancel()
             except Exception as e:
                 print(f"[ws] {e!r} — reconnect in {backoff:.0f}s")
                 await asyncio.sleep(backoff)
@@ -92,6 +129,43 @@ class BybitKlineWS:
         except Exception:
             return
 
+    async def _watchdog(self, ws) -> None:  # type: ignore[no-untyped-def]
+        """Verifică periodic dacă vreun (symbol, tf) e stale.
+
+        Stale = (now - last_bar_ts) > stale_factor × tf_seconds.
+        Pe stale: emite on_stale callback + închide ws (force reconnect).
+        """
+        try:
+            while True:
+                await asyncio.sleep(self.watchdog_interval)
+                now = time.time()
+                stale: list[tuple[str, str, float]] = []
+                for (sym, tf), last_ts in self._last_bar_ts.items():
+                    age = now - last_ts
+                    threshold = self.stale_factor * _tf_to_seconds(tf)
+                    if age > threshold:
+                        stale.append((sym, tf, age))
+                if stale:
+                    for sym, tf, age in stale:
+                        print(
+                            f"  [WS-WATCHDOG] STALE {sym} {tf}: "
+                            f"{age:.0f}s fără bară confirmed (threshold "
+                            f"{self.stale_factor}×{_tf_to_seconds(tf)}s)"
+                        )
+                        if self.on_stale:
+                            try:
+                                await self.on_stale(sym, tf, age)
+                            except Exception as e:
+                                print(f"  [WS-WATCHDOG] on_stale error: {e!r}")
+                    # Force reconnect — închide ws-ul, run() loop reconnectează
+                    try:
+                        await ws.close()
+                    except Exception:
+                        pass
+                    return
+        except Exception:
+            return
+
     async def _dispatch(self, topic: str, data: list[dict]) -> None:
         # topic = kline.60.KAIAUSDT
         parts = topic.split(".")
@@ -100,6 +174,7 @@ class BybitKlineWS:
         interval, symbol = parts[1], parts[2]
         timeframe = _interval_to_tf(interval)
         for k in data:
+            confirmed = bool(k.get("confirm", False))
             bar = {
                 "symbol": symbol,
                 "timeframe": timeframe,
@@ -109,8 +184,11 @@ class BybitKlineWS:
                 "low": float(k["low"]),
                 "close": float(k["close"]),
                 "volume": float(k.get("volume", 0.0)),
-                "confirmed": bool(k.get("confirm", False)),
+                "confirmed": confirmed,
             }
+            # Update watchdog DOAR pe bare confirmed
+            if confirmed:
+                self._last_bar_ts[(symbol, timeframe)] = time.time()
             await self.on_bar(bar)
 
 

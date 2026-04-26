@@ -87,9 +87,8 @@ class SubaccountRunner:
                                                           # DOAR bare LIVE (după pornire)
                                                           # — afișate pe primary pair
 
-        # Operational flags
-        self.paused: bool = False           # /api/pause endpoint
-        self.pending_withdraw: bool = False  # post-SUCCESS, până la /api/confirm_withdraw
+        # Operational flag — manual pause via /api/pause endpoint
+        self.paused: bool = False
 
     def primary_pair_key(self) -> tuple[str, str] | None:
         """Returnează (symbol, timeframe) al primei perechi (pt chart)."""
@@ -225,8 +224,8 @@ class SubaccountRunner:
         """Apelat pe fiecare tick WS. Procesează doar bare CONFIRMED."""
         if not bar.get("confirmed"):
             return
-        # Pause flags: skip toate decizii (chart broadcast continuă în main flow)
-        if self.paused or self.pending_withdraw:
+        # Pause flag: skip toate decizii (chart broadcast continuă în main flow)
+        if self.paused:
             return
         key = (bar["symbol"], bar["timeframe"])
         if key not in self.signals:
@@ -547,18 +546,17 @@ class SubaccountRunner:
             withdraw_amount=withdraw,
             balance=self.state.balance_broker,
         )
-        # PAUSE până la confirmarea manuală a transferului către master.
-        # Bot NU mai deschide trade-uri noi până la POST /api/confirm_withdraw.
-        # Asta previne desync: state.balance crede $100, dar Bybit are încă $10k.
-        self.pending_withdraw = True
+        # NB: state-ul intern e IZOLAT de balance-ul real Bybit (cap-ul
+        # pe pos folosește fetch_balance_usdt la fiecare entry). Bot continuă
+        # tradingul cu cycle nou (equity=$50), iar transferul către master
+        # rămâne decizia operațională user (manual UI Bybit).
         await tg.send(
-            "🎉 CYCLE SUCCESS — withdraw pending",
+            "🎉 CYCLE SUCCESS",
             f"Subaccount: <code>{self.sub_cfg.name}</code>\n"
-            f"Withdraw: <b>${withdraw:,.2f}</b>\n"
-            f"Cycle #{self.state.cycle_num - 1} închis.\n\n"
-            f"<b>Acțiune manuală:</b>\n"
-            f"1. Transferă ${withdraw:,.2f} din subaccount → master (UI Bybit)\n"
-            f"2. Trimite POST la /api/confirm_withdraw pentru a relua tradingul"
+            f"Withdraw disponibil: <b>${withdraw:,.2f}</b>\n"
+            f"Cycle #{self.state.cycle_num - 1} închis. Cycle #{self.state.cycle_num} începe.\n\n"
+            f"<i>Recomandare: transferă ${withdraw:,.2f} din subaccount → master "
+            f"(UI Bybit) când e convenabil. Bot continuă tradingul oricum.</i>"
         )
 
 
@@ -630,7 +628,22 @@ async def run_live(config_path: str = "config/config.yaml") -> None:
     async def on_bar(bar: dict) -> None:
         await runner.on_bar(bar)
 
-    public_ws = BybitKlineWS(subscriptions, on_bar, testnet=testnet)
+    async def on_stale(symbol: str, tf: str, age_sec: float) -> None:
+        log_event(
+            cfg.operational.log_dir, target_sub.name, "WS_STALE",
+            symbol=symbol, tf=tf, age_sec=round(age_sec, 0),
+        )
+        await tg.send(
+            "⚠️ WS STALE — auto-reconnect",
+            f"Subaccount: <code>{target_sub.name}</code>\n"
+            f"Symbol: <code>{symbol} {tf}</code>\n"
+            f"Age: {age_sec:.0f}s fără bară confirmed.\n"
+            f"Bot face auto-reconnect — verifică următoarele bare."
+        )
+
+    public_ws = BybitKlineWS(
+        subscriptions, on_bar, testnet=testnet, on_stale=on_stale
+    )
 
     # Private WS — order/execution/position events
     private_ws = BybitPrivateWS(
