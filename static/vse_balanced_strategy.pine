@@ -275,6 +275,41 @@ plot(in_short ? trail_stop : na,                    "Trail (Short)",color=color.
 plot(in_long  and not na(entry_sl) ? entry_sl : na, "Entry SL (L)", color=color.new(color.gray, 30),  style=plot.style_circles)
 plot(in_short and not na(entry_sl) ? entry_sl : na, "Entry SL (S)", color=color.new(color.gray, 30),  style=plot.style_circles)
 
+// === DEBUG MARKERS — vezi unde se taie procesul ===
+plotshape(raw_long,         "raw_long",         shape.triangleup,   location.belowbar, color=color.new(color.aqua, 60),    size=size.tiny)
+plotshape(raw_short,        "raw_short",        shape.triangledown, location.abovebar, color=color.new(color.fuchsia, 60), size=size.tiny)
+plotshape(valid_entry_long, "valid_entry_long", shape.triangleup,   location.belowbar, color=color.new(color.lime, 0),     size=size.small, text="L")
+plotshape(valid_entry_short,"valid_entry_short",shape.triangledown, location.abovebar, color=color.new(color.red, 0),      size=size.small, text="S")
+
+// === DEBUG TABLE — counter live ===
+var int n_raw_long  = 0
+var int n_raw_short = 0
+var int n_valid_long  = 0
+var int n_valid_short = 0
+if raw_long
+    n_raw_long  += 1
+if raw_short
+    n_raw_short += 1
+if valid_entry_long
+    n_valid_long  += 1
+if valid_entry_short
+    n_valid_short += 1
+
+if barstate.islast
+    var table dbg = table.new(position.top_right, 2, 6, bgcolor=color.new(color.black, 70), border_width=1)
+    table.cell(dbg, 0, 0, "Counter",  text_color=color.white, text_size=size.small)
+    table.cell(dbg, 1, 0, "Value",    text_color=color.white, text_size=size.small)
+    table.cell(dbg, 0, 1, "raw_long",  text_color=color.aqua,    text_size=size.small)
+    table.cell(dbg, 1, 1, str.tostring(n_raw_long), text_color=color.aqua, text_size=size.small)
+    table.cell(dbg, 0, 2, "raw_short", text_color=color.fuchsia, text_size=size.small)
+    table.cell(dbg, 1, 2, str.tostring(n_raw_short), text_color=color.fuchsia, text_size=size.small)
+    table.cell(dbg, 0, 3, "valid L",   text_color=color.lime,    text_size=size.small)
+    table.cell(dbg, 1, 3, str.tostring(n_valid_long), text_color=color.lime, text_size=size.small)
+    table.cell(dbg, 0, 4, "valid S",   text_color=color.red,     text_size=size.small)
+    table.cell(dbg, 1, 4, str.tostring(n_valid_short), text_color=color.red, text_size=size.small)
+    table.cell(dbg, 0, 5, "trades",    text_color=color.yellow,  text_size=size.small)
+    table.cell(dbg, 1, 5, str.tostring(strategy.closedtrades), text_color=color.yellow, text_size=size.small)
+
 
 // ========== ALERTS ==========
 alertcondition(valid_entry_long,  title="VSE Long Entry",  message="VSE long on {{ticker}} {{interval}} @ {{close}}")
