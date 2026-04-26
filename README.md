@@ -155,11 +155,13 @@ strategy:
 
 ## Workflow în ordine
 
-1. **Bybit setup**: 2 subaccounts, API keys (Trade ON / Withdraw OFF), $100 USDT × 2, leverage 20× isolated.
-2. **`.env`**: completează cu SUB1_*, SUB2_*, TELEGRAM_*, TRADING_MODE=testnet.
+1. **Bybit setup**: 2 subaccounts, API keys MAINNET (Trade ON / Withdraw OFF), $100 USDT × 2, leverage 20× isolated.
+2. **`.env`**: completează cu SUB1_*, SUB2_*, TELEGRAM_*, **`TRADING_MODE=live`**.
 3. **Pre-flight**: `python scripts/preflight_check.py` → toate ✓.
-4. **Testnet 2-4 săpt**: `docker compose up -d` (TRADING_MODE=testnet).
-5. **Live $50/subacc 4 săpt** → **Live $100/subacc full**.
+4. **Live deploy**: 2 stack-uri Portainer (`compose.vse1.yml` + `compose.vse2.yml`).
+5. Monitor primele zile prin chart + Telegram. Cycle 1 SUCCESS așteptat în lunile 14-22.
+
+⚠️ **Default acum e LIVE (banii reali).** Dacă vrei testnet (paper trading) pentru validare: setează explicit `TRADING_MODE=testnet` în `.env`.
 
 ## Wealth target replay (2024-01 → 2026-04, full window)
 

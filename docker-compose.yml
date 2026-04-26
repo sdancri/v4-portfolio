@@ -9,7 +9,7 @@ services:
       - SUBACCOUNT_NAME=subacc_1_kaia_aave
       - BOT_NAME=VSE_1
       - CHART_PORT=8101
-      - TRADING_MODE=${TRADING_MODE:-testnet}
+      - TRADING_MODE=${TRADING_MODE:-live}
       - SUB1_API_KEY=${SUB1_API_KEY}
       - SUB1_API_SECRET=${SUB1_API_SECRET}
       - SUB2_API_KEY=${SUB2_API_KEY}
@@ -37,7 +37,7 @@ services:
       - SUBACCOUNT_NAME=subacc_2_ont_eth
       - BOT_NAME=VSE_2
       - CHART_PORT=8102
-      - TRADING_MODE=${TRADING_MODE:-testnet}
+      - TRADING_MODE=${TRADING_MODE:-live}
       - SUB1_API_KEY=${SUB1_API_KEY}
       - SUB1_API_SECRET=${SUB1_API_SECRET}
       - SUB2_API_KEY=${SUB2_API_KEY}

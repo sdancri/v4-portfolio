@@ -612,7 +612,10 @@ async def run_live(config_path: str = "config/config.yaml") -> None:
 
     print(f"\n{'=' * 70}")
     print(f"  VSE BOT — {target_sub.name}")
-    print(f"  mode: {'testnet' if testnet else 'MAINNET'}")
+    if testnet:
+        print(f"  mode: testnet (paper trading)")
+    else:
+        print(f"  mode: 🔴 MAINNET — REAL MONEY on Bybit")
     print(f"  pairs: {[(p.symbol, p.timeframe) for p in target_sub.pairs]}")
     print(f"  withdraw_target: ${cfg.strategy.withdraw_target:,.0f}  "
           f"opp_exit_mode: {cfg.strategy.opp_exit_mode}")
@@ -661,11 +664,12 @@ async def run_live(config_path: str = "config/config.yaml") -> None:
     print(f"  [chart] http://0.0.0.0:{chart_port}/  (TZ: Europe/Bucharest)")
 
     # Telegram boot notice
+    mode_label = "testnet (paper)" if testnet else "🔴 <b>MAINNET — REAL MONEY</b>"
     await tg.send(
         "BOT STARTED ✅",
         f"Strategy: <code>VSE_Nou1</code>\n"
         f"Subaccount: <code>{target_sub.name}</code>\n"
-        f"Mode: {'testnet' if testnet else 'MAINNET'}\n"
+        f"Mode: {mode_label}\n"
         f"Account init: ${cfg.strategy.pool_total:,.2f}\n"
         f"Pairs: {', '.join(p.symbol for p in target_sub.pairs)}\n"
         f"Chart: port {chart_port}"
