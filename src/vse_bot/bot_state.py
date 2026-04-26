@@ -85,25 +85,26 @@ class BotState:
         self.equity_curve.append((trade.exit_ts_ms // 1000, self.account))
 
     def summary(self) -> dict:
+        """Schema match cu chart_live.html boilerplate (folosește pnl_total / fees_total)."""
         if not self.trades:
             return {
                 "n_trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
-                "total_pnl": 0.0, "total_fees": 0.0,
+                "pnl_total": 0.0, "fees_total": 0.0,
                 "account": self.account,
                 "return_pct": 0.0,
             }
         wins = sum(1 for t in self.trades if t.pnl > 0)
         losses = sum(1 for t in self.trades if t.pnl <= 0)
         n = len(self.trades)
-        total_pnl = sum(t.pnl for t in self.trades)
-        total_fees = sum(t.fees for t in self.trades)
+        pnl_total = sum(t.pnl for t in self.trades)
+        fees_total = sum(t.fees for t in self.trades)
         return {
             "n_trades": n,
             "wins": wins,
             "losses": losses,
             "win_rate": wins / n * 100 if n else 0.0,
-            "total_pnl": round(total_pnl, 2),
-            "total_fees": round(total_fees, 2),
+            "pnl_total": round(pnl_total, 2),
+            "fees_total": round(fees_total, 2),
             "account": round(self.account, 2),
             "return_pct": round((self.account / self.initial_account - 1) * 100, 2),
         }
