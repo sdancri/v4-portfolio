@@ -284,11 +284,11 @@ var label dbg_lbl = na
 if barstate.islast
     if not na(dbg_lbl)
         label.delete(dbg_lbl)
-    txt = "VSE counters\n"
-        + "Long entries:  " + str.tostring(n_valid_long)  + "\n"
-        + "Short entries: " + str.tostring(n_valid_short) + "\n"
-        + "OPP exits:     " + str.tostring(n_opp_exits)   + "\n"
-        + "Closed trades: " + str.tostring(strategy.closedtrades)
+    txt = "VSE counters\n" +
+          "Long entries:  " + str.tostring(n_valid_long)  + "\n" +
+          "Short entries: " + str.tostring(n_valid_short) + "\n" +
+          "OPP exits:     " + str.tostring(n_opp_exits)   + "\n" +
+          "Closed trades: " + str.tostring(strategy.closedtrades)
     dbg_lbl := label.new(
          x=bar_index, y=high,
          text=txt,
