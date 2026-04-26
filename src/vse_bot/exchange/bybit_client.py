@@ -55,11 +55,16 @@ class BybitClient:
             "apiKey": api_key,
             "secret": api_secret,
             "enableRateLimit": True,
+            "timeout": 30_000,                  # 30s (default 10s prea strict pe VPS slow)
             "options": {
                 "defaultType": "swap",          # USDT perpetuals
                 "recvWindow": recv_window_ms,
             },
         })
+        # SKIP fetch_currencies în load_markets — endpoint-ul privat
+        # /v5/asset/coin/query-info cere scope "Wallet Read" pe API key, pe care
+        # NU-l avem (Trade-only). Setăm flag-ul has direct pe instance.
+        ex.has["fetchCurrencies"] = False
         if testnet:
             ex.set_sandbox_mode(True)
         return cls(ex)

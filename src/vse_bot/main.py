@@ -626,8 +626,14 @@ async def run_live(config_path: str = "config/config.yaml") -> None:
     print(f"{'=' * 70}\n")
 
     client = await BybitClient.create(api_key, api_secret, testnet=testnet)
-    runner = SubaccountRunner(sub_cfg=target_sub, cfg=cfg, client=client)
-    await runner.setup()
+    try:
+        runner = SubaccountRunner(sub_cfg=target_sub, cfg=cfg, client=client)
+        await runner.setup()
+    except Exception as e:
+        # Asigură close pe client dacă setup eșuează (evită "Unclosed client session")
+        print(f"  [SETUP FAILED] {e!r} — closing client and exit")
+        await client.close()
+        raise
 
     # Public WS — kline (multi-symbol pentru perechile subaccount-ului)
     subscriptions = [(p.symbol, p.timeframe) for p in target_sub.pairs]
