@@ -235,22 +235,29 @@ class SubaccountRunner:
         confirmed = bool(bar.get("confirmed"))
 
         # Chart broadcast — DOAR pe primary pair (regula 8+10).
-        # Pe bare neconfirmate: trimitem update real-time (chart desenează
-        # bara curentă în formare). Pe bare confirmed: append la candles_live.
+        # candles_live persistă AMBELE: bare confirmed + bara curentă în formare.
+        # La refresh /api/init, chart vede întreg istoricul live (NU pierde
+        # bara curentă). Replace tail dacă timestamp identic (update tick),
+        # altfel append nou.
         if key == self.primary_pair_key():
             from vse_bot.chart_server import broadcast as _bc
+            candle_arr = [
+                ts_s,
+                round(bar["open"], 6),
+                round(bar["high"], 6),
+                round(bar["low"], 6),
+                round(bar["close"], 6),
+            ]
+            if self.candles_live and self.candles_live[-1][0] == ts_s:
+                # Update bara curentă (acelaș timestamp = tick update)
+                self.candles_live[-1] = candle_arr
+            else:
+                # Bară nouă (prima sau timestamp diferit)
+                self.candles_live.append(candle_arr)
             if confirmed:
                 self.bot.mark_first_candle(ts_s)
-                candle_arr = [
-                    ts_s,
-                    round(bar["open"], 6),
-                    round(bar["high"], 6),
-                    round(bar["low"], 6),
-                    round(bar["close"], 6),
-                ]
-                self.candles_live.append(candle_arr)
-                if len(self.candles_live) > 20000:
-                    self.candles_live.pop(0)
+            if len(self.candles_live) > 20000:
+                self.candles_live.pop(0)
             await _bc(self, {
                 "type": "candle",
                 "confirmed": confirmed,
