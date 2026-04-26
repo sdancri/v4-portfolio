@@ -78,8 +78,8 @@ docker compose logs -f VSE_2
 ```bash
 # DockerHub
 docker login -u sdancri
-docker build -t sdancri/vse-bot:latest .
-docker push sdancri/vse-bot:latest
+docker build -t sdancri/vse:latest .
+docker push sdancri/vse:latest
 
 # GitHub
 git init
@@ -100,7 +100,7 @@ git push -u origin main
 | 3 | **PnL real Bybit** | `BybitClient.fetch_pnl_for_trade()` la close |
 | 4 | Port chart Bucharest TZ | `Dockerfile::TZ=Europe/Bucharest`, `CHART_PORT=8101/8102` |
 | 5 | `account += real PnL` | `BotState.add_closed_trade()` cu pnl=Bybit real |
-| 6 | DockerHub: sdancri | `docker-compose.yml::image: sdancri/vse-bot:latest` |
+| 6 | DockerHub: sdancri | `docker-compose.yml::image: sdancri/vse:latest` |
 | 7 | Telegram cu BOT_NAME | `telegram_bot.py::_header()` |
 | 8 | chart_template | `static/chart_live.html` |
 | 9 | **Cap pe balanță Bybit reală** | `trade_lifecycle.py`: `if pos > balance×20: pos = 0.95×balance×20` |
