@@ -1,13 +1,13 @@
 services:
-  vse_sub1:
-    build: .
+  VSE_1:
     image: sdancri/vse-bot:latest
-    container_name: vse_sub1_kaia_aave
+    pull_policy: always
+    container_name: VSE_1
     restart: unless-stopped
     environment:
       - TZ=Europe/Bucharest
       - SUBACCOUNT_NAME=subacc_1_kaia_aave
-      - BOT_NAME=vse_sub1_kaia_aave
+      - BOT_NAME=VSE_1
       - CHART_PORT=8101
       - TRADING_MODE=${TRADING_MODE:-testnet}
       - SUB1_API_KEY=${SUB1_API_KEY}
@@ -27,15 +27,15 @@ services:
       retries: 3
       start_period: 45s
 
-  vse_sub2:
-    build: .
+  VSE_2:
     image: sdancri/vse-bot:latest
-    container_name: vse_sub2_ont_eth
+    pull_policy: always
+    container_name: VSE_2
     restart: unless-stopped
     environment:
       - TZ=Europe/Bucharest
       - SUBACCOUNT_NAME=subacc_2_ont_eth
-      - BOT_NAME=vse_sub2_ont_eth
+      - BOT_NAME=VSE_2
       - CHART_PORT=8102
       - TRADING_MODE=${TRADING_MODE:-testnet}
       - SUB1_API_KEY=${SUB1_API_KEY}

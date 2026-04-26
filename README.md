@@ -18,12 +18,12 @@
 
 ```
 Host VPS
-├── vse_sub1_kaia_aave (container)
+├── VSE_1 (container)
 │   ├── 1 process, SUBACCOUNT_NAME=subacc_1_kaia_aave
 │   ├── chart: http://VPS:8101/
 │   ├── Bybit subacc 1 (KAIA + AAVE 1H)
 │   └── logs: ./logs/sub1/subacc_1_kaia_aave.jsonl
-└── vse_sub2_ont_eth (container)
+└── VSE_2 (container)
     ├── 1 process, SUBACCOUNT_NAME=subacc_2_ont_eth
     ├── chart: http://VPS:8102/
     ├── Bybit subacc 2 (ONT 1H + ETH 2H)
@@ -65,8 +65,8 @@ docker compose up -d
 
 # 3. Verifică
 docker compose ps
-docker compose logs -f vse_sub1
-docker compose logs -f vse_sub2
+docker compose logs -f VSE_1
+docker compose logs -f VSE_2
 
 # 4. Charts
 # http://localhost:8101  (subacc 1: KAIA + AAVE)
