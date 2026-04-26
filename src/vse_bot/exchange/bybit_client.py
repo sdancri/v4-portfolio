@@ -59,11 +59,15 @@ class BybitClient:
             "options": {
                 "defaultType": "swap",          # USDT perpetuals
                 "recvWindow": recv_window_ms,
+                # CRITICAL: load_markets fără filter încarcă TOATE categoriile
+                # (spot + linear + inverse + OPTION). Endpoint-ul option e lent
+                # (mii de strike-uri BTC/ETH/SOL) → timeout pe VPS-uri normale.
+                # Restrângem la "linear" — KAIA/AAVE/ONT/ETH sunt USDT perpetuals.
+                "fetchMarkets": ["linear"],
             },
         })
-        # SKIP fetch_currencies în load_markets — endpoint-ul privat
-        # /v5/asset/coin/query-info cere scope "Wallet Read" pe API key, pe care
-        # NU-l avem (Trade-only). Setăm flag-ul has direct pe instance.
+        # SKIP fetch_currencies în load_markets — endpoint privat
+        # /v5/asset/coin/query-info cere scope "Wallet Read" pe API key (NU avem).
         ex.has["fetchCurrencies"] = False
         if testnet:
             ex.set_sandbox_mode(True)
