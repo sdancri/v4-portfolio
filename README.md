@@ -50,28 +50,49 @@ cp .env.example .env
 .venv/bin/python scripts/preflight_check.py
 ```
 
-## Deploy (Docker compose)
+## Deploy
+
+### Opțiunea 1: Portainer (recomandat) — 2 stack-uri separate
+
+Creează 2 stack-uri INDEPENDENTE (redeploy unul nu-l afectează pe celălalt):
+
+**Stack VSE_1**:
+- Repository: `https://github.com/sdancri/vse-bot.git`
+- Compose path: `compose.vse1.yml`
+- Env vars: setează `TRADING_MODE`, `SUB1_*`, `SUB2_*`, `TELEGRAM_*`
+
+**Stack VSE_2**:
+- Repository: `https://github.com/sdancri/vse-bot.git`
+- Compose path: `compose.vse2.yml`
+- Env vars: aceleași (ambele stack-uri au nevoie de SUB1+SUB2 pentru Bybit auth)
+
+În Portainer: Stacks → Add stack → Repository → completează settings de mai sus.
+
+### Opțiunea 2: docker-compose direct (ambele într-un singur stack)
 
 ```bash
-# 1. Pe host (VPS sau local)
 git clone https://github.com/sdancri/vse-bot.git
 cd vse-bot
-cp .env.example .env
-# editează .env cu credentials
+cp .env.example .env   # editează cu credentials
+docker compose up -d   # pornește VSE_1 + VSE_2
 
-# 2. Build + start ambele containere
-docker compose build
-docker compose up -d
-
-# 3. Verifică
+# Verifică
 docker compose ps
 docker compose logs -f VSE_1
 docker compose logs -f VSE_2
-
-# 4. Charts
-# http://localhost:8101  (subacc 1: KAIA + AAVE)
-# http://localhost:8102  (subacc 2: ONT + ETH)
 ```
+
+⚠️ **Atenție** la Opțiunea 2: `docker compose down` sau Portainer "Redeploy stack" reset-ează AMBII boți simultan (state fresh, charts goale, reconnect WS Bybit ~5s downtime).
+
+Pentru restart selectiv pe Opțiunea 2:
+```bash
+docker compose up -d VSE_1   # restart DOAR VSE_1, VSE_2 continuă
+```
+
+### Charts
+
+- `http://VPS_IP:8101` — VSE_1 (KAIA + AAVE)
+- `http://VPS_IP:8102` — VSE_2 (ONT + ETH)
 
 ## Push DockerHub + GitHub (sdancri)
 
