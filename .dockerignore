@@ -1,0 +1,17 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.git
+.gitignore
+.env
+.env.example
+logs/
+state/
+trades_setup_target5k.csv
+replay_trades.csv
+*.parquet
+.claude
+.vscode
+*.code-workspace

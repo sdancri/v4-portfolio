@@ -1,0 +1,591 @@
+"""Multi-subaccount orchestrator (live).
+
+Per Setari BOT regula 2: la RESTART, istoric trade și equity = de la 0.
+NU folosim state persistence (JSON load) — fiecare pornire e cycle nou cu
+balance = pool_total, equity = equity_start.
+
+Per regula 14: stdout line_buffering pentru Docker (logs vizibile imediat).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io as _io
+import os
+import sys as _sys
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from dotenv import load_dotenv
+
+# Regula 14: line-buffering stdout/stderr pentru Docker logs live.
+# `PYTHONUNBUFFERED=1` din Dockerfile e override-uit de TextIOWrapper default.
+_sys.stdout = _io.TextIOWrapper(
+    _sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+)
+_sys.stderr = _io.TextIOWrapper(
+    _sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True
+)
+
+from vse_bot import telegram_bot as tg
+from vse_bot.bot_state import BotState, TradeRecord
+from vse_bot.config import AppConfig, SubaccountConfig, load_config
+from vse_bot.cycle_manager import (
+    SubaccountState,
+    on_trade_closed,
+    restart_cycle_after_success,
+)
+from vse_bot.event_log import log_event
+from vse_bot.exchange.bybit_client import BybitClient, MarketInfo
+from vse_bot.exchange.bybit_private_ws import BybitPrivateWS
+from vse_bot.exchange.bybit_ws import BybitKlineWS
+from vse_bot.trade_lifecycle import (
+    LivePosition,
+    close_position_market,
+    open_trade_live,
+    update_trailing_stop,
+)
+from vse_bot.vse_signal_live import VSESignalLive
+
+
+class SubaccountRunner:
+    """O instanță per subaccount. Coordonează semnale → ordine → cycle.
+
+    Două state separate (per design):
+      - ``state`` (SubaccountState): cycle-pure (equity, balance, pool_used).
+        Folosit pentru sizing & cycle SUCCESS detection. Calculat local.
+      - ``bot`` (BotState): account real Bybit + trades + equity curve UI.
+        Folosit pentru chart & telegram. ``bot.account += real_pnl`` (regula 5).
+    """
+
+    def __init__(
+        self,
+        sub_cfg: SubaccountConfig,
+        cfg: AppConfig,
+        client: BybitClient,
+    ) -> None:
+        self.sub_cfg = sub_cfg
+        self.cfg = cfg
+        self.client = client
+        # Cycle-logic state (cycle SUCCESS, sizing)
+        self.state: SubaccountState = SubaccountState.fresh(cfg.strategy)
+        # UI/account real state (regula 5: account += real PnL Bybit)
+        self.bot: BotState = BotState(
+            initial_account=cfg.strategy.pool_total,
+            account=cfg.strategy.pool_total,
+        )
+
+        self.signals: dict[tuple[str, str], VSESignalLive] = {}
+        self.positions: dict[str, LivePosition | None] = {}
+        self.market_info: dict[str, MarketInfo] = {}
+        self.last_signal_dir: dict[tuple[str, str], int] = {}
+
+        # Chart UI state (per regula 4+8+10+13)
+        self.clients: set = set()                        # WebSocket clients
+        self.candles_live: list[list] = []               # [[ts_s, o, h, l, c], ...]
+                                                          # DOAR bare LIVE (după pornire)
+                                                          # — afișate pe primary pair
+
+    def primary_pair_key(self) -> tuple[str, str] | None:
+        """Returnează (symbol, timeframe) al primei perechi (pt chart)."""
+        if not self.sub_cfg.pairs:
+            return None
+        p = self.sub_cfg.pairs[0]
+        return (p.symbol, p.timeframe)
+
+    def active_position_payload(self) -> dict | None:
+        """Pentru chart /api/init — poziția activă pe primary pair (dacă există)."""
+        primary = self.primary_pair_key()
+        if not primary:
+            return None
+        pos = self.positions.get(primary[0])
+        if pos is None:
+            return None
+        return {
+            "symbol": pos.symbol,
+            "direction": "LONG" if pos.side == "long" else "SHORT",
+            "entry": pos.entry_price,
+            "sl": pos.sl_price,
+            "tp": 0,    # VSE n-are TP, e trailing-only
+            "qty": pos.qty,
+            "risk_usd": pos.risk_usd,
+        }
+
+    # ── Setup ────────────────────────────────────────────────────────────
+    async def setup(self) -> None:
+        """State FRESH (regula 2: restart = de la 0). Configurează leverage,
+        warmup signal generators."""
+        self.state = SubaccountState.fresh(self.cfg.strategy)
+        log_event(
+            self.cfg.operational.log_dir, self.sub_cfg.name, "BOOT",
+            balance=self.state.balance_broker, equity=self.state.equity,
+            cycle=self.state.cycle_num,
+            note="FRESH state (no persistence per regula 2)",
+        )
+
+        for pair in self.sub_cfg.pairs:
+            mi = await self.client.fetch_market_info(pair.symbol)
+            self.market_info[pair.symbol] = mi
+            await self.client.set_isolated_margin(pair.symbol, self.cfg.strategy.leverage)
+            await self.client.set_leverage(pair.symbol, self.cfg.strategy.leverage)
+
+            sig = VSESignalLive(
+                strategy_cfg=self.cfg.strategy,
+                indicator_cfg=self.cfg.indicator,
+                symbol=pair.symbol,
+                timeframe=pair.timeframe,
+            )
+            # Warmup cu 400 bare istorice
+            ohlcv = await self.client.fetch_ohlcv(pair.symbol, pair.timeframe, limit=400)
+            df = _ohlcv_list_to_df(ohlcv)
+            if not df.empty:
+                sig.warm_up(df)
+            self.signals[(pair.symbol, pair.timeframe)] = sig
+            self.positions[pair.symbol] = None
+            self.last_signal_dir[(pair.symbol, pair.timeframe)] = 0
+
+    # ── Bar handling ─────────────────────────────────────────────────────
+    async def on_bar(self, bar: dict[str, Any]) -> None:
+        """Apelat pe fiecare tick WS. Procesează doar bare CONFIRMED."""
+        if not bar.get("confirmed"):
+            return
+        key = (bar["symbol"], bar["timeframe"])
+        if key not in self.signals:
+            return
+
+        # Chart broadcast — DOAR pe primary pair (regula 8+10).
+        # Timestamp Bybit e ms → convertim la SECUNDE pentru chart (regula 12).
+        ts_s = int(bar["ts_ms"]) // 1000
+        if key == self.primary_pair_key():
+            self.bot.mark_first_candle(ts_s)
+            candle_arr = [
+                ts_s,
+                round(bar["open"], 6),
+                round(bar["high"], 6),
+                round(bar["low"], 6),
+                round(bar["close"], 6),
+            ]
+            self.candles_live.append(candle_arr)
+            if len(self.candles_live) > 20000:
+                self.candles_live.pop(0)
+            from vse_bot.chart_server import broadcast as _bc
+            await _bc(self, {
+                "type": "candle",
+                "confirmed": True,
+                "data": {
+                    "time": ts_s,
+                    "open": bar["open"],
+                    "high": bar["high"],
+                    "low": bar["low"],
+                    "close": bar["close"],
+                },
+            })
+
+        sig_engine = self.signals[key]
+        ts = pd.Timestamp(bar["ts_ms"], unit="ms", tz="UTC")
+        candle = {
+            "ts": ts,
+            "open": bar["open"], "high": bar["high"],
+            "low": bar["low"], "close": bar["close"],
+            "volume": bar.get("volume", 0.0),
+        }
+
+        # 1. Pe pozițiile deschise pentru acest pair:
+        #    a) execute OPP exit planificat (din bara anterioară) la NEXT bar open
+        #    b) update trailing stop SuperTrend
+        #    c) detectează OPP signal pe bara curentă → planifică exit
+        pos = self.positions.get(bar["symbol"])
+        if pos is not None:
+            # 1a. Execute planned OPP exit (signaled la close anterioară)
+            if pos.opp_exit_planned:
+                result = await close_position_market(
+                    client=self.client, pos=pos, reason="opp"
+                )
+                # Reconciliere PnL real se face în on_trade_filled_close prin
+                # WS execution events; aici doar marchem intent.
+                log_event(
+                    self.cfg.operational.log_dir, self.sub_cfg.name,
+                    "OPP_EXIT_EXECUTED",
+                    symbol=pos.symbol, side=pos.side,
+                    bar_open=bar["open"],
+                )
+                # Pos rămâne în self.positions până la confirm WS — but mark
+                self.positions[pos.symbol] = None
+                # Cooldown clock
+                for (sym, _tf), eng in self.signals.items():
+                    if sym == pos.symbol:
+                        eng.mark_position_closed(ts)
+                # Continuă spre Phase 2 (poate fi nou signal pe aceeași bară —
+                # mode "pure" cooldown 3 bars va respinge oricum).
+                pos = None
+
+        if pos is not None:
+            # 1b. Update buffer & trailing
+            sig_engine.update(candle)   # ignorăm signal-ul (poziție deja open)
+            st_pair = sig_engine.latest_supertrend()
+            if st_pair is not None:
+                long_stop, short_stop = st_pair
+                target_stop = long_stop if pos.side == "long" else short_stop
+                changed = await update_trailing_stop(
+                    client=self.client, pos=pos, new_stop=target_stop
+                )
+                if changed:
+                    log_event(
+                        self.cfg.operational.log_dir, self.sub_cfg.name,
+                        "TRAILING_UPDATE",
+                        symbol=pos.symbol, new_stop=pos.sl_price,
+                    )
+
+            # 1c. Detectează OPP signal — planifică exit la NEXT bar open
+            raw_signals = sig_engine.latest_raw_signals()
+            if raw_signals is not None:
+                raw_long, raw_short = raw_signals
+                opp_detected = (
+                    (pos.side == "long" and raw_short)
+                    or (pos.side == "short" and raw_long)
+                )
+                if opp_detected and not pos.opp_exit_planned:
+                    pos.opp_exit_planned = True
+                    log_event(
+                        self.cfg.operational.log_dir, self.sub_cfg.name,
+                        "OPP_EXIT_PLANNED",
+                        symbol=pos.symbol, side=pos.side,
+                        ts=str(ts),
+                    )
+            return
+
+        # 2. Fără poziție: încercăm signal pe bara curentă
+        log_event(
+            self.cfg.operational.log_dir, self.sub_cfg.name, "BAR_RECEIVED",
+            symbol=bar["symbol"], tf=bar["timeframe"],
+            ts=str(ts), close=bar["close"],
+        )
+        signal = sig_engine.update(candle)
+        if signal is None:
+            self.last_signal_dir[key] = 0
+            # FILTER_REJECTED: log motivul (sl out of bounds, cooldown, etc.)
+            raw = sig_engine.latest_raw_signals()
+            if raw and (raw[0] or raw[1]):
+                log_event(
+                    self.cfg.operational.log_dir, self.sub_cfg.name,
+                    "FILTER_REJECTED",
+                    symbol=bar["symbol"],
+                    raw_long=raw[0], raw_short=raw[1],
+                    reason="sl_bounds_or_cooldown_or_st_nan",
+                )
+            return
+
+        log_event(
+            self.cfg.operational.log_dir, self.sub_cfg.name, "SIGNAL_EVALUATED",
+            symbol=bar["symbol"], side=signal.side,
+            entry_price=signal.entry_price,
+            sl_price=signal.sl_price, sl_pct=signal.sl_pct,
+        )
+
+        log_event(
+            self.cfg.operational.log_dir, self.sub_cfg.name, "SIGNAL_DETECTED",
+            symbol=bar["symbol"], side=signal.side, sl_pct=signal.sl_pct,
+            entry_price=signal.entry_price, sl_price=signal.sl_price,
+            ts=str(signal.ts),
+        )
+        self.last_signal_dir[key] = 1 if signal.side == "long" else -1
+
+        mi = self.market_info[bar["symbol"]]
+        used_margin = sum(
+            (p.pos_usd / self.cfg.strategy.leverage)
+            for p in self.positions.values() if p is not None
+        )
+        new_pos = await open_trade_live(
+            client=self.client,
+            signal=signal,
+            symbol=bar["symbol"],
+            state=self.state,
+            cfg=self.cfg.strategy,
+            qty_step=mi.qty_step,
+            qty_min=mi.qty_min,
+            used_margin_other=used_margin,
+        )
+        if new_pos is not None:
+            self.positions[bar["symbol"]] = new_pos
+            log_event(
+                self.cfg.operational.log_dir, self.sub_cfg.name, "TRADE_OPENED",
+                symbol=new_pos.symbol, side=new_pos.side, qty=new_pos.qty,
+                pos_usd=new_pos.pos_usd, sl=new_pos.sl_price,
+            )
+            # Chart broadcast — afișează linii LIVE entry/SL/TP (regula 13)
+            if (new_pos.symbol, signal.ts.tz_localize(None) if hasattr(signal.ts, "tz_localize") else None) and key == self.primary_pair_key():
+                from vse_bot.chart_server import broadcast as _bc
+                await _bc(self, {
+                    "type": "position_open",
+                    "direction": "LONG" if new_pos.side == "long" else "SHORT",
+                    "entry": new_pos.entry_price,
+                    "sl": new_pos.sl_price,
+                    "tp": 0,
+                    "qty": new_pos.qty,
+                    "risk_usd": new_pos.risk_usd,
+                })
+
+    # ── Position event handler (Bybit private WS) ─────────────────────────
+    async def on_bybit_position_event(self, event: dict[str, Any]) -> None:
+        """Bybit position update — detectează close (size=0) și trage PnL real.
+
+        Spec regula 3 + 5: PnL nu se calculează local; se trage de pe Bybit
+        prin ``fetch_pnl_for_trade`` după ce poziția se confirmă închisă.
+        """
+        symbol = event.get("symbol", "")
+        size = float(event.get("size") or 0)
+        # Map Bybit symbol → our internal (Bybit returnează "KAIAUSDT" raw)
+        pos = self.positions.get(symbol)
+        if pos is None:
+            return
+        if size > 0:
+            # poziția încă deschisă — ignore
+            return
+
+        # Position size = 0 → trade closed pe Bybit. Trage PnL real.
+        entry_ts_ms = int(pos.opened_ts.timestamp() * 1000)
+        exit_ts_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+        pnl_data = await self.client.fetch_pnl_for_trade(
+            symbol, entry_ts_ms, exit_ts_ms
+        )
+        pnl_real = pnl_data["pnl"]
+        fees_real = pnl_data["fees"]
+        avg_exit = pnl_data["avg_exit"] or pos.sl_price
+
+        # Reason heuristic: opp dacă era planificat, altfel TS / MANUAL
+        if pos.opp_exit_planned:
+            reason = "OPP"
+        elif pos.sl_price and abs(avg_exit - pos.sl_price) / max(pos.sl_price, 1e-9) < 0.005:
+            reason = "TS"
+        else:
+            reason = "MANUAL"
+
+        await self._on_trade_closed_finalize(
+            symbol=symbol, pos=pos,
+            exit_price=avg_exit, pnl_net=pnl_real, fees=fees_real,
+            reason=reason,
+        )
+
+    async def _on_trade_closed_finalize(
+        self,
+        *,
+        symbol: str,
+        pos: LivePosition,
+        exit_price: float,
+        pnl_net: float,
+        fees: float,
+        reason: str,
+    ) -> None:
+        """Finalizare close: log, trade record, update state + bot.account."""
+        ts_now = pd.Timestamp.utcnow().tz_localize("UTC")
+        entry_ts_ms = int(pos.opened_ts.timestamp() * 1000)
+        exit_ts_ms = int(ts_now.timestamp() * 1000)
+
+        # Adaugă în BotState (regula 5: account += pnl real)
+        trade_rec = TradeRecord(
+            id=0,   # set de add_closed_trade
+            date=ts_now.strftime("%Y-%m-%d"),
+            direction="LONG" if pos.side == "long" else "SHORT",
+            symbol=symbol,
+            entry_ts_ms=entry_ts_ms,
+            entry_price=pos.entry_price,
+            sl_price=pos.sl_price,
+            tp_price=None,
+            qty=pos.qty,
+            exit_ts_ms=exit_ts_ms,
+            exit_price=exit_price,
+            exit_reason=reason,
+            pnl=pnl_net,
+            fees=fees,
+            extra={"sl_initial": pos.sl_initial, "pos_usd": pos.pos_usd},
+        )
+        self.bot.add_closed_trade(trade_rec)
+
+        log_event(
+            self.cfg.operational.log_dir, self.sub_cfg.name, "TRADE_CLOSED",
+            symbol=symbol, side=pos.side, qty=pos.qty,
+            entry=pos.entry_price, exit=exit_price,
+            pnl_net=pnl_net, fees=fees, reason=reason,
+            account_after=self.bot.account,
+        )
+
+        # Telegram alert
+        sign = "📈" if pnl_net >= 0 else "📉"
+        await tg.send(
+            f"{sign} TRADE INCHIS — {pos.side.upper()} {symbol}",
+            f"Exit: {exit_price:.6f}  ({reason})\n"
+            f"PnL: <b>${pnl_net:+,.2f}</b>  (Bybit real)\n"
+            f"Account: ${self.bot.account:,.2f}  "
+            f"Return: {(self.bot.account/self.bot.initial_account - 1)*100:+.2f}%"
+        )
+
+        # Chart broadcast: trade closed + position cleared
+        from vse_bot.chart_server import broadcast as _bc
+        await _bc(self, {
+            "type": "trade_closed",
+            "trade": trade_rec.to_dict(),
+            "equity": self.bot.account,
+            "summary": self.bot.summary(),
+        })
+        await _bc(self, {"type": "position_close"})
+
+        # Cleanup positions + cooldown
+        self.positions[symbol] = None
+        for (sym, _tf), eng in self.signals.items():
+            if sym == symbol:
+                eng.mark_position_closed(ts_now)
+
+        # Cycle logic — folosește pnl_real (NU calc local)
+        ev = on_trade_closed(self.state, pnl_net, self.cfg.strategy)
+
+        if ev == "SUCCESS":
+            await self._handle_cycle_success()
+        elif ev == "RESET":
+            log_event(
+                self.cfg.operational.log_dir, self.sub_cfg.name, "RESET",
+                cycle=self.state.cycle_num, reset_count=self.state.reset_count,
+                pool_used=self.state.pool_used, equity=self.state.equity,
+            )
+        elif ev == "POOL_LOW":
+            log_event(
+                self.cfg.operational.log_dir, self.sub_cfg.name, "POOL_LOW",
+                balance=self.state.balance_broker,
+            )
+
+    async def _handle_cycle_success(self) -> None:
+        # Close ALL open positions (force market exit)
+        for sym, pos in list(self.positions.items()):
+            if pos is not None:
+                await close_position_market(
+                    client=self.client, pos=pos, reason="cycle_success"
+                )
+                self.positions[sym] = None
+
+        withdraw = restart_cycle_after_success(self.state, self.cfg.strategy)
+        log_event(
+            self.cfg.operational.log_dir, self.sub_cfg.name, "CYCLE_SUCCESS",
+            cycle_num_completed=self.state.cycle_num - 1,
+            withdraw_amount=withdraw,
+            balance=self.state.balance_broker,
+        )
+        # NB: transferul efectiv către master account NU se face automat aici;
+        # în spec e marcat ca decizie operațională user (vezi CONFIG.md secțiunea 9).
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────
+def _ohlcv_list_to_df(ohlcv: list[list[float]]) -> pd.DataFrame:
+    if not ohlcv:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+    df = pd.DataFrame(ohlcv, columns=["ts_ms", "open", "high", "low", "close", "volume"])
+    df["ts"] = pd.to_datetime(df["ts_ms"], unit="ms", utc=True)
+    df = df.set_index("ts").drop(columns=["ts_ms"])
+    return df
+
+
+# ── Top-level ────────────────────────────────────────────────────────────
+async def run_live(config_path: str = "config/config.yaml") -> None:
+    """Pornește bot LIVE pentru UN SINGUR subaccount.
+
+    Env vars cheie:
+      SUBACCOUNT_NAME  — nume din config (ex ``subacc_1_kaia_aave``).
+                         Default: primul enabled din config.yaml.
+      TRADING_MODE     — testnet | live.
+      <PREFIX>_API_KEY / _API_SECRET — credentials (PREFIX e configurat per subaccount).
+      BOT_NAME         — pentru Telegram + chart header.
+      TELEGRAM_TOKEN, TELEGRAM_CHAT_ID — opțional.
+
+    Per regula utilizator: 2 procese separate cu Docker compose, fiecare
+    rulează acest script cu SUBACCOUNT_NAME diferit + chart pe port unic.
+    """
+    load_dotenv()
+    cfg = load_config(config_path)
+    cfg.operational.log_dir.mkdir(parents=True, exist_ok=True)
+
+    testnet = os.getenv("TRADING_MODE", "testnet").lower() != "live"
+
+    # Selectează subaccount-ul pentru acest proces
+    sub_name = os.getenv("SUBACCOUNT_NAME", "")
+    target_sub = None
+    for sub in cfg.subaccounts:
+        if not sub.enabled:
+            continue
+        if sub_name == sub.name or (not sub_name and target_sub is None):
+            target_sub = sub
+            if sub_name:
+                break
+    if target_sub is None:
+        raise SystemExit(f"Subaccount '{sub_name}' nu există în config")
+
+    prefix = target_sub.api_credentials_env_prefix
+    api_key = os.environ.get(f"{prefix}_API_KEY", "")
+    api_secret = os.environ.get(f"{prefix}_API_SECRET", "")
+    if not api_key or not api_secret:
+        raise SystemExit(f"Lipsește {prefix}_API_KEY / {prefix}_API_SECRET")
+
+    print(f"\n{'=' * 70}")
+    print(f"  VSE BOT — {target_sub.name}")
+    print(f"  mode: {'testnet' if testnet else 'MAINNET'}")
+    print(f"  pairs: {[(p.symbol, p.timeframe) for p in target_sub.pairs]}")
+    print(f"  withdraw_target: ${cfg.strategy.withdraw_target:,.0f}  "
+          f"opp_exit_mode: {cfg.strategy.opp_exit_mode}")
+    print(f"{'=' * 70}\n")
+
+    client = await BybitClient.create(api_key, api_secret, testnet=testnet)
+    runner = SubaccountRunner(sub_cfg=target_sub, cfg=cfg, client=client)
+    await runner.setup()
+
+    # Public WS — kline (multi-symbol pentru perechile subaccount-ului)
+    subscriptions = [(p.symbol, p.timeframe) for p in target_sub.pairs]
+
+    async def on_bar(bar: dict) -> None:
+        await runner.on_bar(bar)
+
+    public_ws = BybitKlineWS(subscriptions, on_bar, testnet=testnet)
+
+    # Private WS — order/execution/position events
+    private_ws = BybitPrivateWS(
+        api_key=api_key,
+        api_secret=api_secret,
+        testnet=testnet,
+        on_position=runner.on_bybit_position_event,
+        log_prefix=f"ws-priv {target_sub.name}",
+    )
+
+    # Chart FastAPI server (regula 4 + 8)
+    from vse_bot.chart_server import create_app, serve_chart
+    chart_port = int(os.getenv("CHART_PORT", "8101"))
+    app = create_app(runner)
+    print(f"  [chart] http://0.0.0.0:{chart_port}/  (TZ: Europe/Bucharest)")
+
+    # Telegram boot notice
+    await tg.send(
+        "BOT STARTED ✅",
+        f"Strategy: <code>VSE_Nou1</code>\n"
+        f"Subaccount: <code>{target_sub.name}</code>\n"
+        f"Mode: {'testnet' if testnet else 'MAINNET'}\n"
+        f"Account init: ${cfg.strategy.pool_total:,.2f}\n"
+        f"Pairs: {', '.join(p.symbol for p in target_sub.pairs)}\n"
+        f"Chart: port {chart_port}"
+    )
+
+    try:
+        await asyncio.gather(
+            public_ws.run(),
+            private_ws.run(),
+            serve_chart(app, chart_port),
+        )
+    finally:
+        await client.close()
+
+
+def main() -> None:
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config/config.yaml")
+    args = ap.parse_args()
+    asyncio.run(run_live(args.config))
+
+
+if __name__ == "__main__":
+    main()

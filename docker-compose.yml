@@ -1,0 +1,56 @@
+services:
+  vse_sub1:
+    build: .
+    image: sdancri/vse-bot:latest
+    container_name: vse_sub1_kaia_aave
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Bucharest
+      - SUBACCOUNT_NAME=subacc_1_kaia_aave
+      - BOT_NAME=vse_sub1_kaia_aave
+      - CHART_PORT=8101
+      - TRADING_MODE=${TRADING_MODE:-testnet}
+      - SUB1_API_KEY=${SUB1_API_KEY}
+      - SUB1_API_SECRET=${SUB1_API_SECRET}
+      - SUB2_API_KEY=${SUB2_API_KEY}
+      - SUB2_API_SECRET=${SUB2_API_SECRET}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+    ports:
+      - "8101:8101"
+    volumes:
+      - ./logs/sub1:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8101/api/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
+
+  vse_sub2:
+    build: .
+    image: sdancri/vse-bot:latest
+    container_name: vse_sub2_ont_eth
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Bucharest
+      - SUBACCOUNT_NAME=subacc_2_ont_eth
+      - BOT_NAME=vse_sub2_ont_eth
+      - CHART_PORT=8102
+      - TRADING_MODE=${TRADING_MODE:-testnet}
+      - SUB1_API_KEY=${SUB1_API_KEY}
+      - SUB1_API_SECRET=${SUB1_API_SECRET}
+      - SUB2_API_KEY=${SUB2_API_KEY}
+      - SUB2_API_SECRET=${SUB2_API_SECRET}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+    ports:
+      - "8102:8102"
+    volumes:
+      - ./logs/sub2:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8102/api/status"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
