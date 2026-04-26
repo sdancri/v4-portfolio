@@ -604,11 +604,15 @@ async def run_live(config_path: str = "config/config.yaml") -> None:
     if target_sub is None:
         raise SystemExit(f"Subaccount '{sub_name}' nu există în config")
 
-    prefix = target_sub.api_credentials_env_prefix
-    api_key = os.environ.get(f"{prefix}_API_KEY", "")
-    api_secret = os.environ.get(f"{prefix}_API_SECRET", "")
+    # Credentials generice (least privilege): fiecare container primește
+    # DOAR cheile subaccount-ului lui. Compose files mapează SUB1/SUB2 → BYBIT_*.
+    api_key = os.environ.get("BYBIT_API_KEY", "")
+    api_secret = os.environ.get("BYBIT_API_SECRET", "")
     if not api_key or not api_secret:
-        raise SystemExit(f"Lipsește {prefix}_API_KEY / {prefix}_API_SECRET")
+        raise SystemExit(
+            f"Lipsește BYBIT_API_KEY / BYBIT_API_SECRET pentru {target_sub.name}. "
+            f"Verifică env vars din container."
+        )
 
     print(f"\n{'=' * 70}")
     print(f"  VSE BOT — {target_sub.name}")

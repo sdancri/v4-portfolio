@@ -72,7 +72,6 @@ subaccounts:
         timeframe: 1h
       - symbol: AAVEUSDT
         timeframe: 1h
-    api_credentials_env_prefix: SUB1
     expected_wealth_2_3y: 13364
 
   - name: subacc_2_ont_eth
@@ -82,7 +81,6 @@ subaccounts:
         timeframe: 1h
       - symbol: ETHUSDT
         timeframe: 2h
-    api_credentials_env_prefix: SUB2
     expected_wealth_2_3y: 11485
 
 # Doar pentru replay (backtest validation)

@@ -1,5 +1,8 @@
 # Stack Portainer pentru VSE_2 (subacc 2: ONT 1H + ETH 2H)
 # Restart / redeploy NU afectează VSE_1 (e în stack separat).
+#
+# Security: container-ul primește DOAR credentials subaccount-ului 2.
+# Mapping: SUB2_API_KEY (env-ul Portainer) → BYBIT_API_KEY (în container).
 
 services:
   VSE_2:
@@ -13,10 +16,8 @@ services:
       - BOT_NAME=VSE_2
       - CHART_PORT=8102
       - TRADING_MODE=${TRADING_MODE:-live}
-      - SUB1_API_KEY=${SUB1_API_KEY}
-      - SUB1_API_SECRET=${SUB1_API_SECRET}
-      - SUB2_API_KEY=${SUB2_API_KEY}
-      - SUB2_API_SECRET=${SUB2_API_SECRET}
+      - BYBIT_API_KEY=${SUB2_API_KEY}
+      - BYBIT_API_SECRET=${SUB2_API_SECRET}
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
     ports:

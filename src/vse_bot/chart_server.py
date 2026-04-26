@@ -64,14 +64,44 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
         })
 
     @app.get("/api/status")
-    async def api_status() -> dict[str, Any]:
+    async def api_status() -> JSONResponse:
+        """Healthcheck endpoint cu reguli smart:
+          - 200 OK: bot funcțional (running, candele recent, NU paused)
+          - 503 Service Unavailable: degraded (paused, bar stale, no candles yet
+            după start_period grace)
+
+        Folosit de Docker healthcheck (interval 30s, retries 3).
+        """
+        import time as _t
+        from vse_bot.exchange.bybit_ws import _tf_to_seconds   # type: ignore
+
         last = runner.candles_live[-1] if runner.candles_live else None
-        return {
+        primary = runner.primary_pair_key()
+        primary_tf = primary[1] if primary else "1h"
+
+        # Health rules
+        warnings = []
+        if runner.paused:
+            warnings.append("paused")
+        if last is None:
+            # Niciun candle încă — OK în primele minute după start
+            # (start_period 45s în compose acoperă asta)
+            warnings.append("no_candles_yet")
+        else:
+            age_s = _t.time() - last[0]
+            stale_threshold = 2 * _tf_to_seconds(primary_tf)
+            if age_s > stale_threshold:
+                warnings.append(f"bar_stale_{int(age_s)}s")
+
+        body = {
             "bot_name": os.getenv("BOT_NAME", runner.sub_cfg.name),
             "subaccount": runner.sub_cfg.name,
+            "healthy": len(warnings) == 0,
+            "warnings": warnings,
             "candles_total": len(runner.candles_live),
             "last_candle_ts": last[0] if last else None,
             "connected_clients": len(runner.clients),
+            "paused": runner.paused,
             "summary": runner.bot.summary(),
             "state": {
                 "equity": runner.state.equity,
@@ -81,6 +111,12 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
                 "reset_count": runner.state.reset_count,
             },
         }
+        # 503 dacă bot e degraded (Docker healthcheck va marca unhealthy)
+        # — dar NU pentru "no_candles_yet" în primele minute (acoperit de start_period)
+        critical = [w for w in warnings if w != "no_candles_yet" and w != "paused"]
+        # paused != unhealthy (e operational pause); doar bar_stale e critical
+        status_code = 503 if critical else 200
+        return JSONResponse(body, status_code=status_code)
 
     @app.websocket("/ws")
     async def ws_endpoint(ws: WebSocket) -> None:

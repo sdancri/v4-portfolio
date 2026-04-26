@@ -64,7 +64,6 @@ class SubaccountConfig:
     name: str
     enabled: bool
     pairs: list[PairConfig]
-    api_credentials_env_prefix: str
     expected_wealth_2_3y: float = 0.0
 
 
@@ -130,7 +129,6 @@ def load_config(path: str | Path = "config/config.yaml") -> AppConfig:
             enabled=bool(sa.get("enabled", True)),
             pairs=[PairConfig(symbol=p["symbol"], timeframe=p["timeframe"])
                    for p in sa["pairs"]],
-            api_credentials_env_prefix=sa["api_credentials_env_prefix"],
             expected_wealth_2_3y=float(sa.get("expected_wealth_2_3y", 0.0)),
         )
         for sa in raw["subaccounts"]

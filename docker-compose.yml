@@ -1,3 +1,8 @@
+# Convenience: pornește ambii boți într-un singur stack (deploy local rapid).
+# Pentru Portainer recomandat: 2 stack-uri separate (compose.vse1.yml + compose.vse2.yml).
+#
+# Security: fiecare service primește DOAR credentials subaccount-ului lui.
+
 services:
   VSE_1:
     image: sdancri/vse:latest
@@ -10,10 +15,8 @@ services:
       - BOT_NAME=VSE_1
       - CHART_PORT=8101
       - TRADING_MODE=${TRADING_MODE:-live}
-      - SUB1_API_KEY=${SUB1_API_KEY}
-      - SUB1_API_SECRET=${SUB1_API_SECRET}
-      - SUB2_API_KEY=${SUB2_API_KEY}
-      - SUB2_API_SECRET=${SUB2_API_SECRET}
+      - BYBIT_API_KEY=${SUB1_API_KEY}
+      - BYBIT_API_SECRET=${SUB1_API_SECRET}
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
     ports:
@@ -38,10 +41,8 @@ services:
       - BOT_NAME=VSE_2
       - CHART_PORT=8102
       - TRADING_MODE=${TRADING_MODE:-live}
-      - SUB1_API_KEY=${SUB1_API_KEY}
-      - SUB1_API_SECRET=${SUB1_API_SECRET}
-      - SUB2_API_KEY=${SUB2_API_KEY}
-      - SUB2_API_SECRET=${SUB2_API_SECRET}
+      - BYBIT_API_KEY=${SUB2_API_KEY}
+      - BYBIT_API_SECRET=${SUB2_API_SECRET}
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
     ports:
