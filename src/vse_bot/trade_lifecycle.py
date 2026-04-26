@@ -165,6 +165,9 @@ async def update_trailing_stop(
 ) -> bool:
     """Modifică SL-ul DOAR dacă e îmbunătățire (sus pe long, jos pe short).
 
+    Folosește ``modify_stop_price`` care are fallback intern la cancel+create.
+    Dacă fallback-ul produce un nou order_id, ``pos.order_sl_id`` se update-ează.
+
     Returnează True dacă a updated, False dacă no-op.
     """
     if pos.side == "long":
@@ -174,11 +177,17 @@ async def update_trailing_stop(
         if new_stop >= pos.sl_price:
             return False
 
-    await client.modify_stop_price(
+    sl_side = "sell" if pos.side == "long" else "buy"
+    result = await client.modify_stop_price(
         symbol=pos.symbol,
         order_id=pos.order_sl_id,
         new_stop_price=new_stop,
+        side=sl_side,
+        qty=pos.qty,
     )
+    new_id = result.get("id") if isinstance(result, dict) else None
+    if new_id and new_id != pos.order_sl_id:
+        pos.order_sl_id = str(new_id)
     pos.sl_price = float(new_stop)
     return True
 

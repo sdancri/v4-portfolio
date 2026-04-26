@@ -155,20 +155,60 @@ class BybitClient:
         )
 
     async def modify_stop_price(
-        self, symbol: str, order_id: str, new_stop_price: float
+        self,
+        symbol: str,
+        order_id: str,
+        new_stop_price: float,
+        *,
+        side: str,
+        qty: float,
     ) -> dict[str, Any]:
-        return await self.exchange.edit_order(
-            id=order_id,
+        """Modifică SL pe Bybit. Fallback la cancel+create dacă edit eșuează.
+
+        Bybit poate respinge ``edit_order`` în câteva cazuri:
+          - noul stop e prea aproape de market price (mai mic decât tick × N),
+          - ordinul a fost deja triggered (SL hit între ultima query și edit),
+          - parametri V5 incompatibili pe versiuni ccxt.
+
+        În toate cazurile, fallback la ``cancel`` + ``create_stop_market``.
+        Returnează dict cu ``id`` (noul order ID — folosește-l ca să update-ezi
+        ``pos.order_sl_id``).
+        """
+        # Try edit first
+        try:
+            r = await self.exchange.edit_order(
+                id=order_id,
+                symbol=symbol,
+                type="market",
+                side=side,
+                amount=qty,
+                price=None,
+                params={
+                    "triggerPrice": new_stop_price,
+                    "stopLossPrice": new_stop_price,
+                    "reduceOnly": True,
+                    "closeOnTrigger": True,
+                    "triggerDirection": 2 if side == "sell" else 1,
+                },
+            )
+            return r if isinstance(r, dict) and r.get("id") else {"id": order_id}
+        except Exception as e:
+            print(f"  [SL] edit failed ({e!r}) — fallback cancel+create")
+
+        # Fallback: cancel + create_stop_market
+        try:
+            await self.cancel_order(symbol, order_id)
+        except Exception as e:
+            # poate ordinul a fost deja triggered/cancelled
+            print(f"  [SL] cancel old SL warned: {e!r}")
+        new_order = await self.create_stop_market(
             symbol=symbol,
-            type="market",
-            side="buy",         # rewritten by params; required arg
-            amount=None,
-            price=None,
-            params={
-                "triggerPrice": new_stop_price,
-                "stopLossPrice": new_stop_price,
-            },
+            side=side,
+            qty=qty,
+            stop_price=new_stop_price,
+            reduce_only=True,
         )
+        return new_order
 
     async def cancel_order(self, symbol: str, order_id: str) -> dict[str, Any]:
         return await self.exchange.cancel_order(order_id, symbol)
