@@ -279,18 +279,22 @@ if valid_entry_short
 if (in_long and raw_short) or (in_short and raw_long)
     n_opp_exits += 1
 
+// Var table at TOP-LEVEL (created once on bar 0, persists across bars).
+var table dbg = table.new(position.top_right, 2, 5,
+                          bgcolor=color.new(color.black, 30),
+                          border_width=1, border_color=color.gray, frame_color=color.white)
+
 if barstate.islast
-    var table dbg = table.new(position.top_right, 2, 5, bgcolor=color.new(color.black, 70), border_width=1)
-    table.cell(dbg, 0, 0, "Counter",     text_color=color.white, text_size=size.small)
-    table.cell(dbg, 1, 0, "Value",       text_color=color.white, text_size=size.small)
-    table.cell(dbg, 0, 1, "Long entries",  text_color=color.lime, text_size=size.small)
-    table.cell(dbg, 1, 1, str.tostring(n_valid_long), text_color=color.lime, text_size=size.small)
-    table.cell(dbg, 0, 2, "Short entries", text_color=color.red,  text_size=size.small)
-    table.cell(dbg, 1, 2, str.tostring(n_valid_short), text_color=color.red, text_size=size.small)
-    table.cell(dbg, 0, 3, "OPP exits",     text_color=color.orange, text_size=size.small)
-    table.cell(dbg, 1, 3, str.tostring(n_opp_exits), text_color=color.orange, text_size=size.small)
-    table.cell(dbg, 0, 4, "Closed trades", text_color=color.yellow, text_size=size.small)
-    table.cell(dbg, 1, 4, str.tostring(strategy.closedtrades), text_color=color.yellow, text_size=size.small)
+    table.cell(dbg, 0, 0, "Counter",       bgcolor=color.new(color.gray, 50),  text_color=color.white,  text_size=size.normal)
+    table.cell(dbg, 1, 0, "Value",         bgcolor=color.new(color.gray, 50),  text_color=color.white,  text_size=size.normal)
+    table.cell(dbg, 0, 1, "Long entries",  text_color=color.lime,   text_size=size.normal)
+    table.cell(dbg, 1, 1, str.tostring(n_valid_long),       text_color=color.lime,   text_size=size.normal)
+    table.cell(dbg, 0, 2, "Short entries", text_color=color.red,    text_size=size.normal)
+    table.cell(dbg, 1, 2, str.tostring(n_valid_short),      text_color=color.red,    text_size=size.normal)
+    table.cell(dbg, 0, 3, "OPP exits",     text_color=color.orange, text_size=size.normal)
+    table.cell(dbg, 1, 3, str.tostring(n_opp_exits),        text_color=color.orange, text_size=size.normal)
+    table.cell(dbg, 0, 4, "Closed trades", text_color=color.yellow, text_size=size.normal)
+    table.cell(dbg, 1, 4, str.tostring(strategy.closedtrades), text_color=color.yellow, text_size=size.normal)
 
 
 // ========== ALERTS ==========
