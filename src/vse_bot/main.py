@@ -150,6 +150,18 @@ class SubaccountRunner:
             self.positions[pair.symbol] = None
             self.last_signal_dir[(pair.symbol, pair.timeframe)] = 0
 
+        # Telegram READY notice (după warmup, înainte de reconcile)
+        pairs_str = ", ".join(f"{p.symbol} {p.timeframe}" for p in self.sub_cfg.pairs)
+        await tg.send(
+            "✅ STRATEGY READY",
+            f"Subaccount: <code>{self.sub_cfg.name}</code>\n"
+            f"Pairs: <code>{pairs_str}</code>\n"
+            f"Indicators warmed (400 bare/pereche)\n"
+            f"SL bounds: {self.cfg.strategy.sl_min_pct * 100:.2f}% — "
+            f"{self.cfg.strategy.sl_max_pct * 100:.2f}%\n"
+            f"Equity init: ${self.cfg.strategy.equity_start:,.2f}"
+        )
+
         # ── RECONCILE — verifică Bybit pentru rezidue ────────────────────
         await self._reconcile_with_bybit()
 
@@ -718,6 +730,17 @@ async def run_live(config_path: str = "config/config.yaml") -> None:
             serve_chart(app, chart_port),
         )
     finally:
+        try:
+            n_trades = len(runner.bot.trades)
+            ret_pct = (runner.bot.account / runner.bot.initial_account - 1) * 100
+            await tg.send(
+                "🛑 BOT STOPPED",
+                f"Subaccount: <code>{target_sub.name}</code>\n"
+                f"Account: ${runner.bot.account:,.2f}  |  Return: {ret_pct:+.2f}%\n"
+                f"Trades: {n_trades}"
+            )
+        except Exception as e:
+            print(f"  [SHUTDOWN] tg.send failed: {e}")
         await client.close()
 
 

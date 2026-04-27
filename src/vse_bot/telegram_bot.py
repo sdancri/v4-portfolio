@@ -14,6 +14,7 @@ Utilizare:
 """
 from __future__ import annotations
 
+import html
 import os
 import httpx
 
@@ -26,9 +27,9 @@ def _header() -> str:
         🤖 [BOT_NAME · STRATEGY_NAME] SYMBOL    (daca STRATEGY_NAME e setat)
         🤖 [BOT_NAME] SYMBOL                     (altfel)
     """
-    name     = os.getenv("BOT_NAME", "bot")
-    strategy = os.getenv("STRATEGY_NAME", "").strip()
-    symbol   = os.getenv("SYMBOL",  "")
+    name     = html.escape(os.getenv("BOT_NAME", "bot"))
+    strategy = html.escape(os.getenv("STRATEGY_NAME", "").strip())
+    symbol   = html.escape(os.getenv("SYMBOL",  ""))
     label    = f"{name} · {strategy}" if strategy else name
     if symbol:
         return f"🤖 <b>[{label}]</b> <code>{symbol}</code>"
@@ -44,7 +45,8 @@ async def send(title: str, body: str = "") -> None:
 
     Daca `body` e gol, `title` apare singur sub header.
     """
-    text = f"{_header()}\n<b>{title}</b>"
+    safe_title = html.escape(title)
+    text = f"{_header()}\n<b>{safe_title}</b>"
     if body:
         text += f"\n{body}"
     await send_raw(text)
