@@ -407,8 +407,17 @@ class SubaccountRunner:
                 symbol=new_pos.symbol, side=new_pos.side, qty=new_pos.qty,
                 pos_usd=new_pos.pos_usd, sl=new_pos.sl_price,
             )
-            # Chart broadcast — afișează linii LIVE entry/SL/TP (regula 13)
-            if (new_pos.symbol, signal.ts.tz_localize(None) if hasattr(signal.ts, "tz_localize") else None) and key == self.primary_pair_key():
+            sign = "🟢" if new_pos.side == "long" else "🔴"
+            await tg.send(
+                f"{sign} TRADE DESCHIS — {new_pos.side.upper()} {new_pos.symbol}",
+                f"Entry: {new_pos.entry_price:.6f}\n"
+                f"SL: {new_pos.sl_price:.6f} ({signal.sl_pct * 100:.2f}%)\n"
+                f"Pos: ${new_pos.pos_usd:,.2f}  Risk: ${new_pos.risk_usd:.2f}\n"
+                f"Account: ${self.bot.account:,.2f}"
+            )
+            # Chart broadcast — afișează linii LIVE entry/SL doar pe primary pair
+            # (chart-ul afișează candele primary; SL line are sens doar acolo).
+            if key == self.primary_pair_key():
                 from vse_bot.chart_server import broadcast as _bc
                 await _bc(self, {
                     "type": "position_open",
