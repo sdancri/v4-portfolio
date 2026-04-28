@@ -25,7 +25,7 @@ strategy:
   cooldown_bars: 3
 
   # Bybit
-  leverage: 20
+  leverage: 15
   cap_pct_of_max: 0.95
   taker_fee: 0.00055
   slippage_bps: 0.0           # mărește pentru sanity-check pe replay
