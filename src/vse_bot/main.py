@@ -141,8 +141,13 @@ class SubaccountRunner:
                 symbol=pair.symbol,
                 timeframe=pair.timeframe,
             )
-            # Warmup cu 400 bare istorice
+            # Warmup cu 400 bare istorice. fetch_ohlcv include bara CURENTĂ ÎN
+            # FORMARE (Bybit V5 default). filter_closed_bars o elimină → buffer
+            # primește DOAR bare confirmed → fără duplicate când WS livrează
+            # ulterior aceeași bară confirmed.
+            from vse_bot.no_lookahead import filter_closed_bars
             ohlcv = await self.client.fetch_ohlcv(pair.symbol, pair.timeframe, limit=400)
+            ohlcv = filter_closed_bars(ohlcv, pair.timeframe)
             df = _ohlcv_list_to_df(ohlcv)
             if not df.empty:
                 sig.warm_up(df)
