@@ -123,7 +123,14 @@ class VSESignalLive:
         # tz-align with buffer if needed
         if not self._buffer.empty and self._buffer.index.tz is None:
             row.index = row.index.tz_localize(None)
-        self._buffer = pd.concat([self._buffer, row]).tail(self.lookback_bars)
+        # IMPORTANT: drop bara cu același timestamp dacă există deja în buffer.
+        # Cazul tipic: warmup-ul fetch_ohlcv(limit=400) la pornire include bara
+        # CURENTĂ ÎN FORMARE (Bybit V5 default). WS livrează apoi acea bară
+        # CONFIRMED → duplicate index în buffer → indicators corupți.
+        # keep="last" prefers WS confirmed over warmup partial.
+        self._buffer = pd.concat([self._buffer, row])
+        self._buffer = self._buffer[~self._buffer.index.duplicated(keep="last")]
+        self._buffer = self._buffer.tail(self.lookback_bars)
 
         if len(self._buffer) < self.warmup_bars:
             return None

@@ -159,13 +159,29 @@ async def open_trade_live(
             return None
 
     if actual_qty <= 0:
-        # Timeout fără fill — cancel safety
+        # Timeout fără fill din fetch_order. Verifică DIRECT pe Bybit poziția —
+        # fetch_order poate să returneze filled=0 deși market order-ul a fost
+        # executat instant (race API) → fără verificare, am abandona un trade
+        # real pe Bybit fără SL.
         try:
-            await client.cancel_order(symbol, entry_order["id"])
+            real_pos = await client.fetch_position(symbol)
         except Exception:
-            pass
-        print(f"  [ORDER] {symbol} entry timeout 10s, status={last_status} — abort")
-        return None
+            real_pos = None
+        if real_pos and float(real_pos.get("contracts") or 0) > 0:
+            actual_qty = float(real_pos["contracts"])
+            actual_entry = float(real_pos.get("entryPrice") or signal.entry_price)
+            print(
+                f"  [ORDER] {symbol} fetch_order timeout dar POZIȚIE EXISTĂ pe Bybit "
+                f"(qty={actual_qty} @ {actual_entry}) — adopt și plasez SL"
+            )
+            # NB: fall-through la SL placement (block-ul de mai jos) va seta SL.
+        else:
+            try:
+                await client.cancel_order(symbol, entry_order["id"])
+            except Exception:
+                pass
+            print(f"  [ORDER] {symbol} entry timeout 10s, status={last_status} — abort")
+            return None
 
     if actual_qty < qty:
         print(
