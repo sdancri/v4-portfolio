@@ -219,8 +219,8 @@ class SubaccountRunner:
                 self.cfg.operational.log_dir, self.sub_cfg.name, "RECONCILE_PAUSED",
                 residue=residue,
             )
-            await tg.send(
-                "⚠️ RECONCILE PAUSED",
+            await tg.send_critical(
+                "RECONCILE PAUSED",
                 f"Subaccount: <code>{self.sub_cfg.name}</code>\n"
                 f"Reziduri Bybit detectate la pornire:\n<pre>{details}</pre>\n"
                 f"Bot PAUZAT. Verifică manual și trimite /api/resume."
@@ -412,6 +412,7 @@ class SubaccountRunner:
             qty_min=mi.qty_min,
             used_margin_other=used_margin,
             notify=tg.send,
+            notify_critical=tg.send_critical,
         )
         if new_pos is not None:
             self.positions[bar["symbol"]] = new_pos
@@ -534,13 +535,15 @@ class SubaccountRunner:
             account_after=self.bot.account,
         )
 
-        # Telegram alert
+        # Telegram alert — pattern aliniat cu boilerplate main.py:427
         sign = "📈" if pnl_net >= 0 else "📉"
+        prec = int(os.getenv("PRICE_PRECISION", "6"))
         await tg.send(
             f"{sign} TRADE INCHIS — {pos.side.upper()} {symbol}",
-            f"Exit: {exit_price:.6f}  ({reason})\n"
-            f"PnL: <b>${pnl_net:+,.2f}</b>  (Bybit real)\n"
-            f"Account: ${self.bot.account:,.2f}  "
+            f"<b>Strategy:</b> <code>VSE_Nou1</code>\n"
+            f"Exit: {exit_price:,.{prec}f}  ({reason})\n"
+            f"PnL: <b>${pnl_net:+,.2f}</b>  (Bybit real, fees incluse)\n"
+            f"Account: ${self.bot.account:,.2f}  |  "
             f"Return: {(self.bot.account/self.bot.initial_account - 1)*100:+.2f}%"
         )
 

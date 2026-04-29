@@ -66,6 +66,7 @@ async def open_trade_live(
     qty_min: float,
     used_margin_other: float = 0.0,
     notify: "Callable[[str, str], Awaitable[None]] | None" = None,
+    notify_critical: "Callable[[str, str], Awaitable[None]] | None" = None,
 ) -> LivePosition | None:
     """Plasează entry market + SL stop-market reduce-only.
 
@@ -220,17 +221,17 @@ async def open_trade_live(
             )
         except Exception as e2:
             print(f"  [ORDER] {symbol} CRITICAL — close after SL fail also failed: {e2!r}")
-        if notify is not None:
+        if notify_critical is not None:
             try:
-                await notify(
-                    f"🚨 CRITICAL — SL ORDER FAILED {symbol}",
+                await notify_critical(
+                    f"SL ORDER FAILED {symbol}",
                     f"Side: <code>{signal.side.upper()}</code>\n"
                     f"Entry: {actual_entry:.6f}  Qty: {actual_qty}\n"
                     f"Eroare SL: <code>{type(e).__name__}: {str(e)[:200]}</code>\n"
                     f"Poziția a fost ÎNCHISĂ market reduce-only. Verifică manual pe Bybit."
                 )
             except Exception as _e:
-                print(f"  [TG] notify failed: {_e}")
+                print(f"  [TG] notify_critical failed: {_e}")
         return None
 
     return LivePosition(
