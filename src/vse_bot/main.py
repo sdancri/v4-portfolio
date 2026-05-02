@@ -113,6 +113,7 @@ class SubaccountRunner:
             "tp": 0,    # VSE n-are TP, e trailing-only
             "qty": pos.qty,
             "risk_usd": pos.risk_usd,
+            "entry_ms": int(pos.opened_ts.timestamp() * 1000),
         }
 
     # ── Setup ────────────────────────────────────────────────────────────
@@ -463,6 +464,8 @@ class SubaccountRunner:
                     "tp": 0,
                     "qty": new_pos.qty,
                     "risk_usd": new_pos.risk_usd,
+                    # Chart cere entry_ms ca să deseneze liniile bounded entry→current.
+                    "entry_ms": int(new_pos.opened_ts.timestamp() * 1000),
                 })
 
     # ── Position event handler (Bybit private WS) ─────────────────────────
