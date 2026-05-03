@@ -87,8 +87,22 @@ class SubaccountRunner:
                                                           # DOAR bare LIVE (după pornire)
                                                           # — afișate pe primary pair
 
-        # Operational flag — manual pause via /api/pause endpoint
-        self.paused: bool = False
+        # Operational pause: per-symbol granularity.
+        # paused_symbols: set of symbols blocked din strategy processing.
+        # Bot continuă să primească bare WS pentru toate perechile, dar pe un
+        # symbol "paused" SARE strategy update + entry. Permite ca o pereche
+        # cu poziție rezidentă pe Bybit să nu blocheze cealaltă pereche.
+        self.paused_symbols: set[str] = set()
+
+    @property
+    def paused(self) -> bool:
+        """Backward-compat: True dacă măcar un symbol e paused.
+
+        Folosit de chart_server.py (status, state endpoint) și de testele care
+        examinează nivelul global. Pentru control granular, folosește
+        ``paused_symbols`` direct.
+        """
+        return bool(self.paused_symbols)
 
     def primary_pair_key(self) -> tuple[str, str] | None:
         """Returnează (symbol, timeframe) al primei perechi (pt chart)."""
@@ -218,23 +232,24 @@ class SubaccountRunner:
                         )
                 continue
 
-            # Position există → verific stopLoss field (V5 trading stop)
+            # Position există → blochez DOAR acest symbol, nu tot subaccount-ul.
+            # Cealaltă pereche poate continua să tradeze normal.
+            self.paused_symbols.add(sym)
             info = pos.get("info") or {}
             sl_set = float(info.get("stopLoss") or 0)
             if sl_set <= 0:
                 residue.append(
                     f"{sym}: ⚠️  POSITION FĂRĂ SL — "
                     f"qty={pos.get('contracts')} avg={pos.get('entryPrice')} "
-                    f"(stopLoss field=0 pe Bybit)"
+                    f"(stopLoss field=0 pe Bybit) → {sym} PAUSED"
                 )
             else:
                 residue.append(
                     f"{sym}: position={pos.get('contracts')} @ {pos.get('entryPrice')}, "
-                    f"stopLoss={sl_set} (state mismatch — bot fresh, manual review)"
+                    f"stopLoss={sl_set} → {sym} PAUSED (manual review)"
                 )
 
         if residue:
-            self.paused = True
             details = "\n".join(f"  - {r}" for r in residue)
             print(
                 f"  [RECONCILE] ⚠️  REZIDUE Bybit detectat — bot PAUSED\n{details}\n"
@@ -319,7 +334,9 @@ class SubaccountRunner:
         # Strategy processing DOAR pe bare CONFIRMED (signal, cycle, trade).
         if not confirmed:
             return
-        if self.paused:
+        # Per-symbol pause: blochează doar symbol-ul cu rezidu Bybit, nu tot
+        # subaccount-ul. Cealaltă pereche continuă să tradeze normal.
+        if bar["symbol"] in self.paused_symbols:
             return
 
         sig_engine = self.signals[key]

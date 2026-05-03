@@ -101,8 +101,8 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
 
         # Health rules
         warnings = []
-        if runner.paused:
-            warnings.append("paused")
+        if runner.paused_symbols:
+            warnings.append(f"paused:{','.join(sorted(runner.paused_symbols))}")
         if last is None:
             # Niciun candle încă — OK în primele minute după start
             # (start_period 45s în compose acoperă asta)
@@ -121,7 +121,8 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
             "candles_total": len(runner.candles_live),
             "last_candle_ts": last[0] if last else None,
             "connected_clients": len(runner.clients),
-            "paused": runner.paused,
+            "paused": runner.paused,                         # backward-compat
+            "paused_symbols": sorted(runner.paused_symbols),
             "summary": runner.bot.summary(),
             "state": {
                 "equity": runner.state.equity,
@@ -153,49 +154,98 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
 
     # ── Operational endpoints ───────────────────────────────────────────
     @app.post("/api/pause")
-    async def api_pause() -> dict[str, Any]:
-        was_paused = runner.paused
-        runner.paused = True
+    async def api_pause(symbol: str | None = None) -> dict[str, Any]:
+        """Pause symbol specific (ex ?symbol=KAIAUSDT) sau toate (default).
+
+        Per-symbol granularity: dacă o pereche are rezidu pe Bybit, blocăm
+        doar acel symbol; cealaltă continuă să tradeze normal.
+        """
         from vse_bot.event_log import log_event
         from vse_bot import telegram_bot as tg
-        log_event(
-            runner.cfg.operational.log_dir, runner.sub_cfg.name,
-            "MANUAL_PAUSE", source="/api/pause",
-        )
-        if not was_paused:
-            await tg.send(
-                "🛑 BOT PAUSED",
-                f"Subaccount: <code>{runner.sub_cfg.name}</code>\n"
-                f"Source: <code>/api/pause (manual)</code>\n"
-                f"Bot nu mai intră trade-uri noi pe semnale. "
-                f"Trimite <code>POST /api/resume</code> ca să continue."
+        if symbol:
+            was_paused = symbol in runner.paused_symbols
+            runner.paused_symbols.add(symbol)
+            log_event(
+                runner.cfg.operational.log_dir, runner.sub_cfg.name,
+                "MANUAL_PAUSE", source="/api/pause", symbol=symbol,
             )
-        return {"paused": True, "subaccount": runner.sub_cfg.name}
+            if not was_paused:
+                await tg.send(
+                    f"🛑 PAUSED — {symbol}",
+                    f"Subaccount: <code>{runner.sub_cfg.name}</code>\n"
+                    f"Symbol: <code>{symbol}</code>\n"
+                    f"Bot nu intră trade-uri noi pe acest symbol. "
+                    f"Trimite <code>POST /api/resume?symbol={symbol}</code> ca să continue."
+                )
+        else:
+            # Pause toate perechile
+            paused_now = []
+            for p in runner.sub_cfg.pairs:
+                if p.symbol not in runner.paused_symbols:
+                    runner.paused_symbols.add(p.symbol)
+                    paused_now.append(p.symbol)
+            log_event(
+                runner.cfg.operational.log_dir, runner.sub_cfg.name,
+                "MANUAL_PAUSE", source="/api/pause", scope="all",
+            )
+            if paused_now:
+                await tg.send(
+                    "🛑 BOT PAUSED (toate perechile)",
+                    f"Subaccount: <code>{runner.sub_cfg.name}</code>\n"
+                    f"Pairs paused: <code>{', '.join(paused_now)}</code>\n"
+                    f"Trimite <code>POST /api/resume</code> ca să continue."
+                )
+        return {
+            "paused_symbols": sorted(runner.paused_symbols),
+            "subaccount": runner.sub_cfg.name,
+        }
 
     @app.post("/api/resume")
-    async def api_resume() -> dict[str, Any]:
-        was_paused = runner.paused
-        runner.paused = False
+    async def api_resume(symbol: str | None = None) -> dict[str, Any]:
+        """Resume symbol specific (?symbol=KAIAUSDT) sau toate (default)."""
         from vse_bot.event_log import log_event
         from vse_bot import telegram_bot as tg
-        log_event(
-            runner.cfg.operational.log_dir, runner.sub_cfg.name,
-            "MANUAL_RESUME", source="/api/resume", was_paused=was_paused,
-        )
-        if was_paused:
-            await tg.send(
-                "▶️ BOT RESUMED",
-                f"Subaccount: <code>{runner.sub_cfg.name}</code>\n"
-                f"Bot procesează din nou semnale pe bare confirmed."
+        if symbol:
+            was_paused = symbol in runner.paused_symbols
+            runner.paused_symbols.discard(symbol)
+            log_event(
+                runner.cfg.operational.log_dir, runner.sub_cfg.name,
+                "MANUAL_RESUME", source="/api/resume", symbol=symbol,
+                was_paused=was_paused,
             )
-        return {"paused": False, "subaccount": runner.sub_cfg.name}
+            if was_paused:
+                await tg.send(
+                    f"▶️ RESUMED — {symbol}",
+                    f"Subaccount: <code>{runner.sub_cfg.name}</code>\n"
+                    f"Symbol: <code>{symbol}</code> procesează din nou semnale."
+                )
+        else:
+            had_paused = bool(runner.paused_symbols)
+            resumed = sorted(runner.paused_symbols)
+            runner.paused_symbols.clear()
+            log_event(
+                runner.cfg.operational.log_dir, runner.sub_cfg.name,
+                "MANUAL_RESUME", source="/api/resume", scope="all",
+                was_paused=had_paused,
+            )
+            if had_paused:
+                await tg.send(
+                    "▶️ BOT RESUMED (toate perechile)",
+                    f"Subaccount: <code>{runner.sub_cfg.name}</code>\n"
+                    f"Pairs resumed: <code>{', '.join(resumed)}</code>"
+                )
+        return {
+            "paused_symbols": sorted(runner.paused_symbols),
+            "subaccount": runner.sub_cfg.name,
+        }
 
     @app.get("/api/state")
     async def api_state() -> dict[str, Any]:
         """Diagnostic snapshot pentru debug."""
         return {
             "subaccount": runner.sub_cfg.name,
-            "paused": runner.paused,
+            "paused": runner.paused,                         # backward-compat
+            "paused_symbols": sorted(runner.paused_symbols),
             "state": {
                 "equity": runner.state.equity,
                 "balance_broker": runner.state.balance_broker,
