@@ -154,12 +154,22 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
     # ── Operational endpoints ───────────────────────────────────────────
     @app.post("/api/pause")
     async def api_pause() -> dict[str, Any]:
+        was_paused = runner.paused
         runner.paused = True
         from vse_bot.event_log import log_event
+        from vse_bot import telegram_bot as tg
         log_event(
             runner.cfg.operational.log_dir, runner.sub_cfg.name,
             "MANUAL_PAUSE", source="/api/pause",
         )
+        if not was_paused:
+            await tg.send(
+                "🛑 BOT PAUSED",
+                f"Subaccount: <code>{runner.sub_cfg.name}</code>\n"
+                f"Source: <code>/api/pause (manual)</code>\n"
+                f"Bot nu mai intră trade-uri noi pe semnale. "
+                f"Trimite <code>POST /api/resume</code> ca să continue."
+            )
         return {"paused": True, "subaccount": runner.sub_cfg.name}
 
     @app.post("/api/resume")
@@ -167,10 +177,17 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
         was_paused = runner.paused
         runner.paused = False
         from vse_bot.event_log import log_event
+        from vse_bot import telegram_bot as tg
         log_event(
             runner.cfg.operational.log_dir, runner.sub_cfg.name,
             "MANUAL_RESUME", source="/api/resume", was_paused=was_paused,
         )
+        if was_paused:
+            await tg.send(
+                "▶️ BOT RESUMED",
+                f"Subaccount: <code>{runner.sub_cfg.name}</code>\n"
+                f"Bot procesează din nou semnale pe bare confirmed."
+            )
         return {"paused": False, "subaccount": runner.sub_cfg.name}
 
     @app.get("/api/state")
