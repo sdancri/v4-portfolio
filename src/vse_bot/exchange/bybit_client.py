@@ -4,7 +4,7 @@ Operații expuse:
   - load_markets / fetch_market_info(symbol) → step size, min qty, tick size.
   - set_leverage / set_margin_mode (isolated) — la startup.
   - fetch_ohlcv(symbol, timeframe, limit) — pentru warm-up indicator.
-  - create_market_order, create_stop_market, modify_stop_price, cancel_order.
+  - create_market_order, set_position_sl (V5 setTradingStop), cancel_order.
   - fetch_position, fetch_balance.
   - fetch_realized_pnl(symbol, start_ms, end_ms) — pentru reconciliere PnL.
 
@@ -139,85 +139,30 @@ class BybitClient:
             symbol=symbol, type="market", side=side, amount=qty, params=params
         )
 
-    async def create_stop_market(
-        self,
-        symbol: str,
-        side: str,
-        qty: float,
-        stop_price: float,
-        reduce_only: bool = True,
-    ) -> dict[str, Any]:
-        # Bybit V5 stop loss: triggerPrice + reduceOnly + closeOnTrigger
-        params = {
-            "stopLossPrice": stop_price,
-            "triggerPrice": stop_price,
-            "reduceOnly": reduce_only,
-            "closeOnTrigger": True,
-            "triggerDirection": 2 if side == "sell" else 1,
-        }
-        return await self.exchange.create_order(
-            symbol=symbol,
-            type="market",
-            side=side,
-            amount=qty,
-            params=params,
-        )
+    async def set_position_sl(self, symbol: str, sl_price: float) -> dict[str, Any]:
+        """Setează SL pe POZIȚIE (Bybit V5 ``setTradingStop``) — atomic.
 
-    async def modify_stop_price(
-        self,
-        symbol: str,
-        order_id: str,
-        new_stop_price: float,
-        *,
-        side: str,
-        qty: float,
-    ) -> dict[str, Any]:
-        """Modifică SL pe Bybit. Fallback la cancel+create dacă edit eșuează.
+        SL-ul devine atribut al poziției, NU order separat. Avantaje:
+          - La close (orice motiv), SL dispare singur — fără orphan.
+          - Trailing modify: single call atomic — fără race cancel→create.
+          - Reconcile simplu: verific position.stopLoss, NU separate orders.
 
-        Bybit poate respinge ``edit_order`` în câteva cazuri:
-          - noul stop e prea aproape de market price (mai mic decât tick × N),
-          - ordinul a fost deja triggered (SL hit între ultima query și edit),
-          - parametri V5 incompatibili pe versiuni ccxt.
+        Args:
+            symbol: simbol Bybit ("KAIAUSDT")
+            sl_price: noul stop-loss. Folosește 0 pentru a clear SL.
 
-        În toate cazurile, fallback la ``cancel`` + ``create_stop_market``.
-        Returnează dict cu ``id`` (noul order ID — folosește-l ca să update-ezi
-        ``pos.order_sl_id``).
+        Bybit V5 endpoint: POST /v5/position/trading-stop
         """
-        # Try edit first
-        try:
-            r = await self.exchange.edit_order(
-                id=order_id,
-                symbol=symbol,
-                type="market",
-                side=side,
-                amount=qty,
-                price=None,
-                params={
-                    "triggerPrice": new_stop_price,
-                    "stopLossPrice": new_stop_price,
-                    "reduceOnly": True,
-                    "closeOnTrigger": True,
-                    "triggerDirection": 2 if side == "sell" else 1,
-                },
-            )
-            return r if isinstance(r, dict) and r.get("id") else {"id": order_id}
-        except Exception as e:
-            print(f"  [SL] edit failed ({e!r}) — fallback cancel+create")
-
-        # Fallback: cancel + create_stop_market
-        try:
-            await self.cancel_order(symbol, order_id)
-        except Exception as e:
-            # poate ordinul a fost deja triggered/cancelled
-            print(f"  [SL] cancel old SL warned: {e!r}")
-        new_order = await self.create_stop_market(
-            symbol=symbol,
-            side=side,
-            qty=qty,
-            stop_price=new_stop_price,
-            reduce_only=True,
-        )
-        return new_order
+        market_id = self.exchange.market(symbol)["id"]
+        params = {
+            "category": "linear",
+            "symbol": market_id,
+            "stopLoss": str(sl_price),
+            "tpslMode": "Full",       # SL pe poziția completă
+            "slOrderType": "Market",  # market exit la trigger
+            "positionIdx": 0,         # one-way mode (n-avem hedge)
+        }
+        return await self.exchange.private_post_v5_position_trading_stop(params)
 
     async def cancel_order(self, symbol: str, order_id: str) -> dict[str, Any]:
         return await self.exchange.cancel_order(order_id, symbol)

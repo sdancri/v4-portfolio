@@ -48,7 +48,6 @@ class LivePosition:
     risk_usd: float
     opened_ts: datetime
     order_entry_id: str
-    order_sl_id: str
     extra: dict[str, Any]
     # OPP exit planning — set la TRUE când raw opposite signal apare pe bara
     # curentă; exit-ul se execută la NEXT bar open (per spec STRATEGY_LOGIC sec 6).
@@ -216,20 +215,13 @@ async def open_trade_live(
                 print(f"  [TG] notify failed: {_e}")
         return None
 
-    # 2. Stop-market SL reduce-only (opposite side) cu qty REAL
-    sl_side = "sell" if signal.side == "long" else "buy"
+    # 2. Set SL pe POZIȚIE (Bybit V5 setTradingStop) — SL e atribut al poziției,
+    # NU order separat. Cleanup automat la close. Single atomic call.
     try:
-        sl_order = await client.create_stop_market(
-            symbol=symbol,
-            side=sl_side,
-            qty=actual_qty,
-            stop_price=signal.sl_price,
-            reduce_only=True,
-        )
+        await client.set_position_sl(symbol, signal.sl_price)
     except Exception as e:
-        # SL order eșuează → poziția deschisă pe Bybit FĂRĂ SL = critical.
-        # Close imediat (market reduce-only) și alert critic.
-        print(f"  [ORDER] {symbol} SL create FAILED: {e!r} — closing position")
+        # SL set eșuează → poziția deschisă pe Bybit FĂRĂ SL = critical.
+        print(f"  [SL] {symbol} set_position_sl FAILED: {e!r} — closing position")
         try:
             close_side = "sell" if signal.side == "long" else "buy"
             await client.create_market_order(
@@ -240,7 +232,7 @@ async def open_trade_live(
         if notify_critical is not None:
             try:
                 await notify_critical(
-                    f"SL ORDER FAILED {symbol}",
+                    f"SL SET FAILED {symbol}",
                     f"Side: <code>{signal.side.upper()}</code>\n"
                     f"Entry: {actual_entry:.6f}  Qty: {actual_qty}\n"
                     f"Eroare SL: <code>{type(e).__name__}: {str(e)[:200]}</code>\n"
@@ -261,7 +253,6 @@ async def open_trade_live(
         risk_usd=risk_usd,
         opened_ts=datetime.now(timezone.utc),
         order_entry_id=entry_order["id"],
-        order_sl_id=sl_order["id"],
         extra={
             "sl_pct_at_signal": signal.sl_pct,
             "sl_pct_actual": actual_sl_pct,
@@ -282,8 +273,8 @@ async def update_trailing_stop(
 ) -> bool:
     """Modifică SL-ul DOAR dacă e îmbunătățire (sus pe long, jos pe short).
 
-    Folosește ``modify_stop_price`` care are fallback intern la cancel+create.
-    Dacă fallback-ul produce un nou order_id, ``pos.order_sl_id`` se update-ează.
+    Folosește ``set_position_sl`` (Bybit V5 setTradingStop) — single atomic
+    call. SL e atribut al poziției, fără order_id de tracked.
 
     Returnează True dacă a updated, False dacă no-op.
     """
@@ -294,17 +285,8 @@ async def update_trailing_stop(
         if new_stop >= pos.sl_price:
             return False
 
-    sl_side = "sell" if pos.side == "long" else "buy"
-    result = await client.modify_stop_price(
-        symbol=pos.symbol,
-        order_id=pos.order_sl_id,
-        new_stop_price=new_stop,
-        side=sl_side,
-        qty=pos.qty,
-    )
-    new_id = result.get("id") if isinstance(result, dict) else None
-    if new_id and new_id != pos.order_sl_id:
-        pos.order_sl_id = str(new_id)
+    # Single atomic call — SL e atribut al poziției, NU order separat.
+    await client.set_position_sl(pos.symbol, new_stop)
     pos.sl_price = float(new_stop)
     return True
 
@@ -315,9 +297,12 @@ async def close_position_market(
     pos: LivePosition,
     reason: str,
 ) -> dict[str, Any]:
-    """Force-close pe market. Folosit la signal_reverse, cycle_success, panic."""
+    """Force-close pe market. Folosit la signal_reverse, cycle_success, panic.
+
+    SL e atribut al poziției — dispare automat când close-ul reduce qty la 0.
+    Nu mai trebuie cancel SL separat.
+    """
     bybit_side = "sell" if pos.side == "long" else "buy"
-    await client.cancel_order(symbol=pos.symbol, order_id=pos.order_sl_id)
     result = await client.create_market_order(
         symbol=pos.symbol,
         side=bybit_side,

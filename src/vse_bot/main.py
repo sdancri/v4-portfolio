@@ -172,65 +172,66 @@ class SubaccountRunner:
         await self._reconcile_with_bybit()
 
     async def _reconcile_with_bybit(self) -> None:
-        """Detectează poziții / ordine reziduale pe Bybit.
+        """Detectează poziții reziduale pe Bybit.
+
+        Cu set_position_sl (V5 setTradingStop), SL e atribut al poziției —
+        nu mai există order separat care să rămână orphan. Reconcile devine:
 
         Reguli:
-          - Position fără SL → CRITIC + PAUSED.
-          - Position + SL (state mismatch local) → PAUSED (manual review).
-          - NO position + ordine deschise (orphan SL/limit) → AUTO-CLEANUP
-            (cancel orders + continue), NU pause. Cazul tipic: SL trigger sau
-            OPP close — poziția e închisă, dar SL-ul/order-ul rămâne uneori
-            "open" pe Bybit. Safe să cancel.
+          - Position cu stopLoss=0 → CRITIC (poziție fără protecție).
+          - Position cu stopLoss>0 → state mismatch local (bot fresh, Bybit
+            are poziție) → PAUSED, manual review.
+          - NO position → OK (SL atribut dispare cu poziția; orphan orders
+            din versiunea veche cu create_stop_market — auto-cleanup).
         """
         residue: list[str] = []
         for pair in self.sub_cfg.pairs:
             sym = pair.symbol
             try:
                 pos = await self.client.fetch_position(sym)
-                orders = await self.client.fetch_open_orders(sym)
             except Exception as e:
-                residue.append(f"{sym}: fetch failed ({e!r})")
+                residue.append(f"{sym}: fetch_position failed ({e!r})")
                 continue
 
             has_position = pos is not None and float(pos.get("contracts") or 0) > 0
-            sl_orders = [o for o in orders if o.get("type") in
-                         ("stop_market", "stop", "stop_loss")
-                         or (o.get("info", {}).get("stopOrderType") in
-                             ("Stop", "TakeProfit", "StopLoss"))]
-            other_orders = [o for o in orders if o not in sl_orders]
+            if not has_position:
+                # Cleanup orphan stop orders din versiuni anterioare (V5
+                # create_stop_market). Cu set_position_sl pure, asta nu mai
+                # generează orphan, dar curățăm legacy.
+                try:
+                    legacy_orders = await self.client.fetch_open_orders(sym)
+                except Exception:
+                    legacy_orders = []
+                if legacy_orders:
+                    cancelled = 0
+                    for o in legacy_orders:
+                        try:
+                            await self.client.cancel_order(sym, o["id"])
+                            cancelled += 1
+                        except Exception:
+                            pass
+                    if cancelled:
+                        log_event(
+                            self.cfg.operational.log_dir, self.sub_cfg.name,
+                            "RECONCILE_LEGACY_ORPHAN_CLEANED",
+                            symbol=sym, cancelled=cancelled,
+                        )
+                continue
 
-            if has_position and not sl_orders:
+            # Position există → verific stopLoss field (V5 trading stop)
+            info = pos.get("info") or {}
+            sl_set = float(info.get("stopLoss") or 0)
+            if sl_set <= 0:
                 residue.append(
                     f"{sym}: ⚠️  POSITION FĂRĂ SL — "
-                    f"qty={pos.get('contracts')} avg={pos.get('entryPrice')}"
+                    f"qty={pos.get('contracts')} avg={pos.get('entryPrice')} "
+                    f"(stopLoss field=0 pe Bybit)"
                 )
-            elif has_position:
+            else:
                 residue.append(
                     f"{sym}: position={pos.get('contracts')} @ {pos.get('entryPrice')}, "
-                    f"sl_orders={len(sl_orders)}, other={len(other_orders)}"
+                    f"stopLoss={sl_set} (state mismatch — bot fresh, manual review)"
                 )
-            elif sl_orders or other_orders:
-                # AUTO-CLEANUP: orphan orders fără poziție corespondentă —
-                # cancel toate (safe: nu mai există nimic de protejat).
-                cancelled = 0
-                failed = 0
-                for o in sl_orders + other_orders:
-                    try:
-                        await self.client.cancel_order(sym, o["id"])
-                        cancelled += 1
-                    except Exception as e:
-                        failed += 1
-                        print(f"  [RECONCILE] cancel orphan {sym} {o.get('id')[:8]} fail: {e}")
-                print(
-                    f"  [RECONCILE] {sym}: orphan orders auto-cleanup — "
-                    f"cancelled={cancelled} failed={failed} (NO position, safe)"
-                )
-                log_event(
-                    self.cfg.operational.log_dir, self.sub_cfg.name,
-                    "RECONCILE_ORPHAN_CLEANED",
-                    symbol=sym, cancelled=cancelled, failed=failed,
-                )
-                # NB: nu adăugăm la residue → NU pause
 
         if residue:
             self.paused = True
@@ -503,21 +504,9 @@ class SubaccountRunner:
             # poziția încă deschisă — ignore
             return
 
-        # Position size = 0 → trade closed pe Bybit (SL hit, manual close, sau
-        # liquidare). Cancel proactiv SL-ul rămas — dacă era SL hit (bot detect),
-        # SL-ul e deja "Filled" și cancel returnează error (prinse silent).
-        # Dacă close-ul a venit de la altă sursă (manual UI, liquidare), SL-ul
-        # poate fi încă "open" → orphan dacă nu cancel.
-        if pos.order_sl_id:
-            try:
-                await self.client.cancel_order(symbol, pos.order_sl_id)
-            except Exception as e:
-                # SL deja consumed (Filled) — case normal pe SL hit.
-                msg = str(e).lower()
-                if "already" not in msg and "not exists" not in msg and "not found" not in msg:
-                    print(f"  [POSITION_CLOSE] cancel SL {symbol} fail: {e}")
-
-        # Trage PnL real.
+        # Position size = 0 → trade closed pe Bybit. Cu set_position_sl,
+        # SL-ul era atribut al poziției — dispare automat la close, nu mai
+        # avem orphan orders de cancel. Trage doar PnL real.
         entry_ts_ms = int(pos.opened_ts.timestamp() * 1000)
         exit_ts_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
         pnl_data = await self.client.fetch_pnl_for_trade(
