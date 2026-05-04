@@ -348,11 +348,39 @@ class SubaccountRunner:
             "volume": bar.get("volume", 0.0),
         }
 
+        # 0. Defense-in-depth: state desync detection. Dacă state intern crede
+        # că avem poziție dar Bybit nu mai are una (SL hit cu WS event lost,
+        # manual close UI, liquidare), reconcil close-ul ACUM înainte de
+        # strategy processing. Altfel partea 1 ar face trailing pe poziție
+        # inexistentă și ar SARI evaluarea signal-ului nou.
+        pos = self.positions.get(bar["symbol"])
+        if pos is not None:
+            try:
+                bybit_pos = await self.client.fetch_position(bar["symbol"])
+                bybit_qty = float(bybit_pos.get("contracts") or 0) if bybit_pos else 0
+            except Exception as e:
+                bybit_qty = -1.0   # eroare fetch — skip check, păstrează state
+                print(f"  [SYNC_CHECK] {bar['symbol']} fetch_position failed: {e}")
+            if bybit_qty == 0:
+                print(
+                    f"  [SYNC_CHECK] {bar['symbol']}: state local are poziție dar "
+                    f"Bybit nu — close finalize din defense-in-depth"
+                )
+                log_event(
+                    self.cfg.operational.log_dir, self.sub_cfg.name,
+                    "STATE_DESYNC_CLOSE_DETECTED",
+                    symbol=bar["symbol"], local_qty=pos.qty, bybit_qty=0,
+                )
+                # Synthesize position event size=0 → reconciliază close
+                await self.on_bybit_position_event({"symbol": bar["symbol"], "size": 0})
+                pos = None  # local refresh
+
         # 1. Pe pozițiile deschise pentru acest pair:
         #    a) execute OPP exit planificat (din bara anterioară) la NEXT bar open
         #    b) update trailing stop SuperTrend
         #    c) detectează OPP signal pe bara curentă → planifică exit
-        pos = self.positions.get(bar["symbol"])
+        if pos is None:
+            pos = self.positions.get(bar["symbol"])
         if pos is not None:
             # 1a. Execute planned OPP exit (signaled la close anterioară)
             if pos.opp_exit_planned:
