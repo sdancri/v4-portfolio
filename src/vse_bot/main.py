@@ -364,15 +364,28 @@ class SubaccountRunner:
             if bybit_qty == 0:
                 print(
                     f"  [SYNC_CHECK] {bar['symbol']}: state local are poziție dar "
-                    f"Bybit nu — close finalize din defense-in-depth"
+                    f"Bybit nu — close finalize cu reason=EXTERNAL"
                 )
                 log_event(
                     self.cfg.operational.log_dir, self.sub_cfg.name,
                     "STATE_DESYNC_CLOSE_DETECTED",
                     symbol=bar["symbol"], local_qty=pos.qty, bybit_qty=0,
                 )
-                # Synthesize position event size=0 → reconciliază close
-                await self.on_bybit_position_event({"symbol": bar["symbol"], "size": 0})
+                # Reciclează pipeline-ul standard close cu reason EXTERNAL —
+                # nu derivăm TS/MANUAL speculativ (close-ul a venit de la altă
+                # sursă; etichetare onestă vs guess din avg_exit).
+                entry_ts_ms = int(pos.opened_ts.timestamp() * 1000)
+                exit_ts_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+                pnl_data = await self.client.fetch_pnl_for_trade(
+                    bar["symbol"], entry_ts_ms, exit_ts_ms
+                )
+                await self._on_trade_closed_finalize(
+                    symbol=bar["symbol"], pos=pos,
+                    exit_price=pnl_data["avg_exit"] or pos.sl_price,
+                    pnl_net=pnl_data["pnl"],
+                    fees=pnl_data["fees"],
+                    reason="EXTERNAL",
+                )
                 pos = None  # local refresh
 
         # 1. Pe pozițiile deschise pentru acest pair:
