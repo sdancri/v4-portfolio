@@ -157,7 +157,10 @@ class IchimokuRunner:
         pct = abs(drift) / max(self.bot.account, 1.0) * 100
         print(f"  [SYNC {source}] local=${self.bot.account:.2f} bybit=${real:.2f} "
               f"drift=${drift:+.2f} ({pct:.2f}%)")
-        if abs(drift) > self.bot.account * 0.01:  # >1% drift = real anomalie
+        if abs(drift) > self.bot.account * 0.03:  # >3% drift = real anomalie
+            # Sub 3% = zgomot normal (funding fees ~0.3-1% zilnic, slippage,
+            # rounding closedPnl). Peste 3% = manual deposit/withdraw, liquidare
+            # partiala, multi-bot interference, sau bug care necesita atentie.
             await tg.send(
                 f"⚠️ EQUITY DRIFT — {source}",
                 f"Local: <code>${self.bot.account:.2f}</code>\n"
