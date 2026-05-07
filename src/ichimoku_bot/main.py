@@ -483,10 +483,14 @@ class IchimokuRunner:
 
     async def _close_trade(self, sym: str, pos: LivePosition,
                             exit_price: float, reason: str, bar: dict) -> None:
-        """Inchide pozitie pe Bybit (market order opus). Reason: SL|TP|SIGNAL|EXTERNAL."""
+        """Inchide pozitie pe Bybit (market order opus). Reason: SL|TP|SIGNAL|EXTERNAL.
+
+        IMPORTANT: ccxt cere side="buy"/"sell", NU "long"/"short". Pentru
+        a inchide LONG (pos.side="long") trimitem SELL; pentru SHORT trimitem BUY.
+        """
         try:
-            opp_side = "short" if pos.side == "long" else "long"
-            order = await self.client.create_market_order(sym, opp_side, pos.qty, reduce_only=True)
+            ccxt_close_side = "sell" if pos.side == "long" else "buy"
+            order = await self.client.create_market_order(sym, ccxt_close_side, pos.qty, reduce_only=True)
             avg_exit = float(order.get("price") or exit_price)
             # Trage PnL real de pe Bybit
             entry_ts_ms = int(pos.opened_ts.timestamp() * 1000)
