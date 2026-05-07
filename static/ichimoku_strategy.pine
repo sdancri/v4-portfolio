@@ -80,10 +80,10 @@ tp_default = switch preset
 // Pine v6 nu lasa input.int(defval=...) cu valoare runtime — daca vrei
 // override pe alt preset, schimba la CUSTOM si seteaza manual mai jos.
 g_ind = "Indicatori (CUSTOM only)"
-hull_custom    = input.int(8,  "Hull Length", minval=2, group=g_ind)
+hull_custom    = input.int(10, "Hull Length", minval=2, group=g_ind)
 tenkan_periods = input.int(9,  "Tenkan",      minval=2, group=g_ind)
 kijun_custom   = input.int(48, "Kijun",       minval=2, group=g_ind)
-snkb_custom    = input.int(40, "Senkou B",    minval=2, group=g_ind)
+snkb_custom    = input.int(52, "Senkou B",    minval=2, group=g_ind)
 displacement   = input.int(24, "Displacement", minval=2, group=g_ind)
 
 // Final values: switch fix daca preset != CUSTOM
@@ -98,7 +98,7 @@ max_kj_dist     = input.float(6.0, "Max close-Kijun %", minval=0.0, step=0.1, gr
 g_risk = "Sizing & Exit"
 risk_pct   = input.float(7.0,  "Risk per trade %",   minval=0.1, step=0.1, group=g_risk)
 sl_custom  = input.float(4.0,  "SL % (CUSTOM only)", minval=0.1, step=0.1, group=g_risk)
-tp_custom  = input.float(0.0,  "TP % (CUSTOM only, 0=off)", minval=0.0, step=0.1, group=g_risk)
+tp_custom  = input.float(5.0,  "TP % (CUSTOM only, 0=off)", minval=0.0, step=0.1, group=g_risk)
 leverage   = input.int(12,     "Leverage_max (cap)", minval=1, group=g_risk)
 cap_pct    = input.float(0.95, "Cap pct of max",     minval=0.1, step=0.05, group=g_risk)
 
