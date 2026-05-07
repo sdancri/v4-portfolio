@@ -219,15 +219,10 @@ if show_debug and (long_entry or short_entry)
 
 // ── DEBUG LABEL: valori active (pe ultima bara) ──────────────────────────
 if barstate.islast
-    info_txt = "Preset: " + preset +
-       "\nHull/Kj/SnkB: " + str.tostring(hull_length) + "/" +
-                            str.tostring(kijun_periods) + "/" +
-                            str.tostring(senkou_b_len) +
-       "\nSL/TP %: " + str.tostring(sl_pct, "#.#") + "/" +
-                       str.tostring(tp_pct, "#.#") +
-       "\nRisk %: " + str.tostring(risk_pct, "#.#") +
-       "\nHull half/sqn: " + str.tostring(hull_half) + "/" +
-                              str.tostring(hull_sqn)
-    label.new(bar_index, high, text=info_txt,
-              color=color.new(color.blue, 20), textcolor=color.white,
-              style=label.style_label_down, size=size.normal, yloc=yloc.abovebar)
+    line1 = "Preset: " + preset
+    line2 = "Hull/Kj/SnkB: " + str.tostring(hull_length) + "/" + str.tostring(kijun_periods) + "/" + str.tostring(senkou_b_len)
+    line3 = "SL/TP: " + str.tostring(sl_pct, "#.#") + "% / " + str.tostring(tp_pct, "#.#") + "%"
+    line4 = "Risk: " + str.tostring(risk_pct, "#.#") + "%"
+    line5 = "Hull half/sqn: " + str.tostring(hull_half) + "/" + str.tostring(hull_sqn)
+    info_txt = line1 + "\n" + line2 + "\n" + line3 + "\n" + line4 + "\n" + line5
+    label.new(bar_index, high, text=info_txt, color=color.new(color.blue, 20), textcolor=color.white, style=label.style_label_down, size=size.normal, yloc=yloc.abovebar)
