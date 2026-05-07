@@ -180,19 +180,15 @@ can_enter_short = short_entry and filt_ok and flat and not sizing_skip and qty_c
 
 if can_enter_long
     sl_l = close * (1 - sl_pct / 100.0)
+    tp_l = tp_pct > 0 ? close * (1 + tp_pct / 100.0) : na
     strategy.entry("L", strategy.long, qty=qty_calc)
-    strategy.exit("L_SL", "L", stop=sl_l)
-    if tp_pct > 0
-        tp_l = close * (1 + tp_pct / 100.0)
-        strategy.exit("L_TP", "L", limit=tp_l)
+    strategy.exit("L_X", "L", stop=sl_l, limit=tp_l)
 
 if can_enter_short
     sl_s = close * (1 + sl_pct / 100.0)
+    tp_s = tp_pct > 0 ? close * (1 - tp_pct / 100.0) : na
     strategy.entry("S", strategy.short, qty=qty_calc)
-    strategy.exit("S_SL", "S", stop=sl_s)
-    if tp_pct > 0
-        tp_s = close * (1 - tp_pct / 100.0)
-        strategy.exit("S_TP", "S", limit=tp_s)
+    strategy.exit("S_X", "S", stop=sl_s, limit=tp_s)
 
 // ── PLOTS ─────────────────────────────────────────────────────────────────
 plot(show_hull   ? n1 : na, "Hull n1",  color=color.new(color.orange, 0), linewidth=2)
