@@ -24,8 +24,8 @@ strategy(
    commission_value     = 0.055,
    slippage             = 0,
    pyramiding           = 0,
-   margin_long          = 5,            // 20× leverage simulation
-   margin_short         = 5,
+   margin_long          = 8.33,         // 12× leverage simulation (100/12)
+   margin_short         = 8.33,
    calc_on_every_tick   = false,
    calc_on_order_fills  = false,
    process_orders_on_close = true,      // entry/exit la close-ul barei (match live)
