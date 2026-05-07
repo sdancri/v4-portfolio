@@ -38,31 +38,43 @@ preset = input.string("MNT", "Pair preset",
    group="Preset")
 
 // Settings per pereche (bot live identic — vezi config_ichi1/2.yaml)
-hull_default = preset == "MNT"  ? 10 :
-               preset == "SUN"  ? 8  :
-               preset == "ILV"  ? 8  :
-               preset == "AERO" ? 10 :
-               preset == "RSR"  ? 10 :
-               preset == "AKT"  ? 8  : 8
-kijun_default = preset == "MNT"  ? 48 :
-                preset == "SUN"  ? 24 :
-                preset == "ILV"  ? 36 :
-                preset == "AERO" ? 60 :
-                preset == "RSR"  ? 60 :
-                preset == "AKT"  ? 60 : 48
-snkb_default = preset == "MNT"  ? 52 :
-               preset == "SUN"  ? 52 :
-               preset == "ILV"  ? 40 :
-               preset == "AERO" ? 26 :
-               preset == "RSR"  ? 52 :
-               preset == "AKT"  ? 52 : 40
+hull_default = switch preset
+    "MNT"  => 10
+    "SUN"  => 8
+    "ILV"  => 8
+    "AERO" => 10
+    "RSR"  => 10
+    "AKT"  => 8
+    => 8
+
+kijun_default = switch preset
+    "MNT"  => 48
+    "SUN"  => 24
+    "ILV"  => 36
+    "AERO" => 60
+    "RSR"  => 60
+    "AKT"  => 60
+    => 48
+
+snkb_default = switch preset
+    "MNT"  => 52
+    "SUN"  => 52
+    "ILV"  => 40
+    "AERO" => 26
+    "RSR"  => 52
+    "AKT"  => 52
+    => 40
+
 sl_default = 4.0   // toate Ichi1/Ichi2 au SL=4%
-tp_default = preset == "MNT"  ? 5.0  :
-             preset == "SUN"  ? 50.0 :
-             preset == "ILV"  ? 12.0 :
-             preset == "AERO" ? 20.0 :
-             preset == "RSR"  ? 5.0  :
-             preset == "AKT"  ? 8.0  : 0.0
+
+tp_default = switch preset
+    "MNT"  => 5.0
+    "SUN"  => 50.0
+    "ILV"  => 12.0
+    "AERO" => 20.0
+    "RSR"  => 5.0
+    "AKT"  => 8.0
+    => 0.0
 
 // ── INPUTS (override-uibile, dar default = preset) ─────────────────────────
 g_ind = "Indicatori"
