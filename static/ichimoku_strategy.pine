@@ -1,17 +1,16 @@
 //@version=6
 // =============================================================================
-// ICHIMOKU bot — Hull+Ichimoku 4h Strategy (port direct din Python)
+// ICHIMOKU bot — Hull+Ichimoku 4h Strategy (port direct din Python live)
 // -----------------------------------------------------------------------------
-// Scop: validare side-by-side a tradeurilor Python (live + backtest)
-//       contra TradingView Pine. Toate componentele identice cu
-//       src/ichimoku_bot/ichimoku_signal.py.
+// Scop: validare side-by-side a tradeurilor LIVE bot contra TradingView.
+// Identic la indicatori si timing exit cu src/ichimoku_bot/ichimoku_signal.py.
 //
-// PRESET DEFAULT = MNTUSDT (4h, AGGRESSIVE).
-// Pentru DOTUSDT, schimba inputs:
-//   Hull Length: 10  | Kijun: 36  | Senkou B: 52
-//   Risk %: 5  | SL %: 8  | TP %: 12  | Leverage: 7
+// PRESET selector — alege perechea, settings auto-fill:
+//   ICHI1: SUN, MNT, ILV
+//   ICHI2: AERO, RSR, AKT
 //
-// Atasare: BYBIT:MNTUSDT.P (sau BYBIT:DOTUSDT.P) pe TF 4h.
+// Atasare: BYBIT:<SYMBOL>.P pe TF 4h. Sizing irelevant (bot foloseste Python
+// risk/sl/leverage; Pine doar valideaza tradeuri & timing).
 // =============================================================================
 
 strategy(
@@ -25,79 +24,98 @@ strategy(
    commission_value     = 0.055,
    slippage             = 0,
    pyramiding           = 0,
-   // CRITICAL: margin = 5% → simuleaza leverage 20x (acopera MNT 2.33x equity).
-   // Fara asta, Pine default e margin=100% (fara leverage) → rejecteaza silent
-   // toate trade-urile cu notional > equity. Pentru DOT (0.625x equity) si MNT
-   // (2.33x), 20x e suficient. Daca rulezi pereche cu leverage > 20x, modifica.
-   margin_long          = 5,
+   margin_long          = 5,            // 20× leverage simulation
    margin_short         = 5,
    calc_on_every_tick   = false,
    calc_on_order_fills  = false,
-   process_orders_on_close = true,
+   process_orders_on_close = true,      // entry/exit la close-ul barei (match live)
    close_entries_rule   = "ANY"
 )
 
-// ── INPUTS ──────────────────────────────────────────────────────────────────
+// ── PRESET selector ────────────────────────────────────────────────────────
+preset = input.string("MNT", "Pair preset",
+   options=["MNT","SUN","ILV","AERO","RSR","AKT","CUSTOM"],
+   group="Preset")
+
+// Settings per pereche (bot live identic — vezi config_ichi1/2.yaml)
+hull_default = preset == "MNT"  ? 10 :
+               preset == "SUN"  ? 8  :
+               preset == "ILV"  ? 8  :
+               preset == "AERO" ? 10 :
+               preset == "RSR"  ? 10 :
+               preset == "AKT"  ? 8  : 8
+kijun_default = preset == "MNT"  ? 48 :
+                preset == "SUN"  ? 24 :
+                preset == "ILV"  ? 36 :
+                preset == "AERO" ? 60 :
+                preset == "RSR"  ? 60 :
+                preset == "AKT"  ? 60 : 48
+snkb_default = preset == "MNT"  ? 52 :
+               preset == "SUN"  ? 52 :
+               preset == "ILV"  ? 40 :
+               preset == "AERO" ? 26 :
+               preset == "RSR"  ? 52 :
+               preset == "AKT"  ? 52 : 40
+sl_default = 4.0   // toate Ichi1/Ichi2 au SL=4%
+tp_default = preset == "MNT"  ? 5.0  :
+             preset == "SUN"  ? 50.0 :
+             preset == "ILV"  ? 12.0 :
+             preset == "AERO" ? 20.0 :
+             preset == "RSR"  ? 5.0  :
+             preset == "AKT"  ? 8.0  : 0.0
+
+// ── INPUTS (override-uibile, dar default = preset) ─────────────────────────
 g_ind = "Indicatori"
-hull_length    = input.int(8,   "Hull Length",        minval=2, group=g_ind)
-tenkan_periods = input.int(9,   "Tenkan",             minval=2, group=g_ind)
-kijun_periods  = input.int(48,  "Kijun",              minval=2, group=g_ind)
-senkou_b_len   = input.int(40,  "Senkou B",           minval=2, group=g_ind)
-displacement   = input.int(24,  "Displacement",       minval=2, group=g_ind)
+hull_length    = input.int(hull_default,  "Hull Length", minval=2, group=g_ind)
+tenkan_periods = input.int(9,             "Tenkan",      minval=2, group=g_ind)
+kijun_periods  = input.int(kijun_default, "Kijun",       minval=2, group=g_ind)
+senkou_b_len   = input.int(snkb_default,  "Senkou B",    minval=2, group=g_ind)
+displacement   = input.int(24,            "Displacement", minval=2, group=g_ind)
 
 g_filter = "Filtre Setup G"
-max_hull_spread = input.float(2.0, "Max Hull spread %",  minval=0.0, step=0.1, group=g_filter)
-max_kj_dist     = input.float(6.0, "Max close-Kijun %",  minval=0.0, step=0.1, group=g_filter)
+max_hull_spread = input.float(2.0, "Max Hull spread %", minval=0.0, step=0.1, group=g_filter)
+max_kj_dist     = input.float(6.0, "Max close-Kijun %", minval=0.0, step=0.1, group=g_filter)
 
 g_risk = "Sizing & Exit"
-risk_pct  = input.float(7.0,  "Risk per trade %",     minval=0.1, step=0.1, group=g_risk)
-sl_pct    = input.float(3.0,  "SL %",                 minval=0.1, step=0.1, group=g_risk)
-tp_pct    = input.float(0.0,  "TP %  (0 = off)",      minval=0.0, step=0.1, group=g_risk)
-leverage  = input.int(20,     "Leverage",             minval=1,  group=g_risk)
-cap_pct   = input.float(0.95, "Cap pct of max",       minval=0.1, step=0.05, group=g_risk)
+risk_pct = input.float(7.0,        "Risk per trade %", minval=0.1, step=0.1, group=g_risk)
+sl_pct   = input.float(sl_default, "SL %",             minval=0.1, step=0.1, group=g_risk)
+tp_pct   = input.float(tp_default, "TP % (0 = off)",   minval=0.0, step=0.1, group=g_risk)
+leverage = input.int(12,           "Leverage_max (cap)", minval=1, group=g_risk)
+cap_pct  = input.float(0.95,       "Cap pct of max",   minval=0.1, step=0.05, group=g_risk)
 
 g_plot = "Plot"
-show_cloud  = input.bool(true, "Cloud (Senkou A/B forward)", group=g_plot)
-show_chikou = input.bool(true, "Chikou (lagging close)",     group=g_plot)
-show_hull   = input.bool(true, "Hull n1",                    group=g_plot)
-show_tk_kj  = input.bool(true, "Tenkan / Kijun",             group=g_plot)
+show_cloud  = input.bool(true, "Cloud (Senkou A/B)", group=g_plot)
+show_chikou = input.bool(true, "Chikou",             group=g_plot)
+show_hull   = input.bool(true, "Hull n1",            group=g_plot)
+show_tk_kj  = input.bool(true, "Tenkan / Kijun",     group=g_plot)
 
 g_debug = "Debug"
-show_debug = input.bool(true, "Show debug labels at entries/skips", group=g_debug)
+show_debug = input.bool(false, "Debug entry/skip labels", group=g_debug)
 
-// ── INDICATORS ──────────────────────────────────────────────────────────────
-// 1. Hull MA double — INLINE (avoids user-function qualifier issues with ta.wma).
-//    Match Python: int(L/2) si int(sqrt(L)) cu trunchiere.
-//    Pine: int / int returneaza int truncat → echivalent cu Python //.
-//    int(math.sqrt(...)) trunchiaza → echivalent cu Python int().
+// ── INDICATORS (identic cu Python: int(L/2) si int(sqrt(L)) trunchiere) ───
 hull_half = math.max(1, hull_length / 2)
 hull_sqn  = math.max(1, int(math.sqrt(hull_length)))
-
 n1 = ta.wma(2 * ta.wma(close, hull_half) - ta.wma(close, hull_length), hull_sqn)
-n2 = n1[1]                                              // HMA pe close[1] = n1 lagged 1
+n2 = n1[1]                                          // HMA pe close[1] = n1 lagged 1
 
-// 2. Tenkan / Kijun (Donchian midpoint)
 tk = (ta.highest(high, tenkan_periods) + ta.lowest(low, tenkan_periods)) / 2
 kj = (ta.highest(high, kijun_periods)  + ta.lowest(low, kijun_periods))  / 2
 
-// 3. Senkou A / B (computed from current data; "current cloud" reads SHIFT bars back)
 sa = (tk + kj) / 2
 sb = (ta.highest(high, senkou_b_len) + ta.lowest(low, senkou_b_len)) / 2
 
-// 4. shift = displacement - 1 (matches Python ichimoku_signal.py:118)
+// shift = displacement - 1 (match Python ichimoku_signal.py:118)
 shift = displacement - 1
 senkou_h = math.max(sa[shift], sb[shift])
 senkou_l = math.min(sa[shift], sb[shift])
+chikou   = close[shift]
 
-// 5. Chikou — close[displacement-1] (Python uses same shift as senkou)
-chikou = close[shift]
-
-// ── FILTERS Setup G ─────────────────────────────────────────────────────────
+// ── FILTERS Setup G (identic Python passes_filters()) ─────────────────────
 hull_spread_pct = math.abs(n1 - n2) / close * 100
 kj_dist_pct     = math.abs(close - kj) / close * 100
 filt_ok         = hull_spread_pct <= max_hull_spread and kj_dist_pct <= max_kj_dist
 
-// ── ENTRY / EXIT SIGNALS (match Python _long_entry / _short_entry / _close_*)
+// ── ENTRY / CLOSE SIGNALS (identic Python _long/_short_entry, _close_*) ──
 indicators_ready = not na(n1) and not na(n2) and not na(tk) and not na(kj) and not na(senkou_h) and not na(senkou_l) and not na(chikou)
 
 long_entry  = indicators_ready and n1 > n2 and close > n2 and close > chikou and close > senkou_h and (tk >= kj or close > kj)
@@ -106,48 +124,47 @@ short_entry = indicators_ready and n1 < n2 and close < n2 and close < chikou and
 close_long  = indicators_ready and n1 < n2 and (close < n2 or tk < kj or close < tk or close < kj or close < senkou_h or close < chikou)
 close_short = indicators_ready and n1 > n2 and (close > n2 or tk > kj or close > tk or close > kj or close > senkou_l or close > chikou)
 
-// ── STRATEGY ────────────────────────────────────────────────────────────────
+// ── STRATEGY ──────────────────────────────────────────────────────────────
 in_long  = strategy.position_size > 0
 in_short = strategy.position_size < 0
 flat     = strategy.position_size == 0
 
-// Sizing — match Python: pos_usd = (risk% × equity) / sl%
-//                        cap_usd = cap_pct × equity × leverage
-//                        skip if pos_usd > cap_usd
-risk_usd      = strategy.equity * risk_pct / 100.0
-pos_usd_raw   = risk_usd / (sl_pct / 100.0)
-cap_usd       = cap_pct * strategy.equity * leverage
-sizing_skip   = pos_usd_raw > cap_usd
-qty_calc      = math.max(0.0, pos_usd_raw / close)
+risk_usd     = strategy.equity * risk_pct / 100.0
+pos_usd_raw  = risk_usd / (sl_pct / 100.0)
+cap_usd      = cap_pct * strategy.equity * leverage   // leverage_max=12
+sizing_skip  = pos_usd_raw > cap_usd
+qty_calc     = math.max(0.0, pos_usd_raw / close)
 
-// EXITS pe pozitia deschisa (signal-flip → market close at bar close)
+// EXITS pe pozitia deschisa (signal-flip → market close at bar close).
+// SL/TP delegated la strategy.exit() — Pine nativ verifica intra-bar high/low
+// (echivalent cu Bybit setTradingStop intra-bar trigger pe live).
 if in_long and close_long
     strategy.close("L", comment="SIG")
 
 if in_short and close_short
     strategy.close("S", comment="SIG")
 
-// ENTRIES — confirmed bar, filtre OK, no pos active, sizing OK, qty > 0
+// ENTRIES — confirmed bar, filtre OK, no pos, sizing OK
 can_enter_long  = long_entry  and filt_ok and flat and not sizing_skip and qty_calc > 0
 can_enter_short = short_entry and filt_ok and flat and not sizing_skip and qty_calc > 0
 
 if can_enter_long
-    sl_price_l = close * (1 - sl_pct / 100.0)
+    sl_l = close * (1 - sl_pct / 100.0)
     strategy.entry("L", strategy.long, qty=qty_calc)
-    strategy.exit("L_SL", "L", stop=sl_price_l)
+    strategy.exit("L_SL", "L", stop=sl_l)
     if tp_pct > 0
-        tp_price_l = close * (1 + tp_pct / 100.0)
-        strategy.exit("L_TP", "L", limit=tp_price_l)
+        tp_l = close * (1 + tp_pct / 100.0)
+        strategy.exit("L_TP", "L", limit=tp_l)
 
 if can_enter_short
-    sl_price_s = close * (1 + sl_pct / 100.0)
+    sl_s = close * (1 + sl_pct / 100.0)
     strategy.entry("S", strategy.short, qty=qty_calc)
-    strategy.exit("S_SL", "S", stop=sl_price_s)
+    strategy.exit("S_SL", "S", stop=sl_s)
     if tp_pct > 0
-        tp_price_s = close * (1 - tp_pct / 100.0)
-        strategy.exit("S_TP", "S", limit=tp_price_s)
+        tp_s = close * (1 - tp_pct / 100.0)
+        strategy.exit("S_TP", "S", limit=tp_s)
 
-// ── PLOTS ───────────────────────────────────────────────────────────────────
+// ── PLOTS ─────────────────────────────────────────────────────────────────
 plot(show_hull   ? n1 : na, "Hull n1",  color=color.new(color.orange, 0), linewidth=2)
 plot(show_tk_kj  ? tk : na, "Tenkan",   color=color.new(color.blue,   0))
 plot(show_tk_kj  ? kj : na, "Kijun",    color=color.new(color.red,    0))
@@ -158,7 +175,7 @@ fill(sa_plot, sb_plot, color = sa > sb ? color.new(color.green, 85) : color.new(
 
 plot(show_chikou ? close : na, "Chikou", color=color.new(color.purple, 0), offset=-shift)
 
-// ── DEBUG: label la fiecare semnal entry (chiar si daca filtrele resping) ──
+// ── DEBUG labels (optional) ───────────────────────────────────────────────
 if show_debug and (long_entry or short_entry)
     side_str = long_entry ? "L" : "S"
     reasons = ""
@@ -171,28 +188,21 @@ if show_debug and (long_entry or short_entry)
     label.new(bar_index, low, text=label_txt, color=label_color, textcolor=color.white,
               style=label.style_label_up, size=size.tiny, yloc=yloc.belowbar)
 
-// ── DASHBOARD (top-right corner) ────────────────────────────────────────────
-var table dash = table.new(position.top_right, 2, 11, border_width=1)
+// ── DASHBOARD ─────────────────────────────────────────────────────────────
+var table dash = table.new(position.top_right, 2, 7, border_width=1)
 if barstate.islast
-    table.cell(dash, 0, 0,  "Param",     bgcolor=color.new(color.gray, 70))
-    table.cell(dash, 1, 0,  "Value",     bgcolor=color.new(color.gray, 70))
-    table.cell(dash, 0, 1,  "Hull / Kj / SnkB")
-    table.cell(dash, 1, 1,  str.format("{0} / {1} / {2}", hull_length, kijun_periods, senkou_b_len))
-    table.cell(dash, 0, 2,  "Hull half / sqn")
-    table.cell(dash, 1, 2,  str.format("{0} / {1}", hull_half, hull_sqn))
-    table.cell(dash, 0, 3,  "Risk / SL / TP %")
-    table.cell(dash, 1, 3,  str.format("{0,number,#.#} / {1,number,#.#} / {2,number,#.#}", risk_pct, sl_pct, tp_pct))
-    table.cell(dash, 0, 4,  "Leverage")
-    table.cell(dash, 1, 4,  str.tostring(leverage) + "×")
-    table.cell(dash, 0, 5,  "Hull spread %")
-    table.cell(dash, 1, 5,  str.format("{0,number,#.##}", hull_spread_pct))
-    table.cell(dash, 0, 6,  "Kijun dist %")
-    table.cell(dash, 1, 6,  str.format("{0,number,#.##}", kj_dist_pct))
-    table.cell(dash, 0, 7,  "Filt OK")
-    table.cell(dash, 1, 7,  filt_ok ? "✓" : "✗", text_color = filt_ok ? color.green : color.red)
-    table.cell(dash, 0, 8,  "Indicators ready")
-    table.cell(dash, 1, 8,  indicators_ready ? "✓" : "✗", text_color = indicators_ready ? color.green : color.red)
-    table.cell(dash, 0, 9,  "Pos USD / Cap")
-    table.cell(dash, 1, 9,  str.format("${0,number,#} / ${1,number,#}", pos_usd_raw, cap_usd))
-    table.cell(dash, 0, 10, "Qty / Equity")
-    table.cell(dash, 1, 10, str.format("{0,number,#.##} / ${1,number,#.##}", qty_calc, strategy.equity))
+    table.cell(dash, 0, 0, "Param",  bgcolor=color.new(color.gray, 70))
+    table.cell(dash, 1, 0, "Value",  bgcolor=color.new(color.gray, 70))
+    table.cell(dash, 0, 1, "Preset")
+    table.cell(dash, 1, 1, preset)
+    table.cell(dash, 0, 2, "Hull/Kj/SnkB")
+    table.cell(dash, 1, 2, str.format("{0}/{1}/{2}", hull_length, kijun_periods, senkou_b_len))
+    table.cell(dash, 0, 3, "SL / TP %")
+    table.cell(dash, 1, 3, str.format("{0,number,#.#} / {1,number,#.#}", sl_pct, tp_pct))
+    table.cell(dash, 0, 4, "Hull half / sqn")
+    table.cell(dash, 1, 4, str.format("{0} / {1}", hull_half, hull_sqn))
+    table.cell(dash, 0, 5, "Filt OK")
+    table.cell(dash, 1, 5, filt_ok ? "✓" : "✗", text_color = filt_ok ? color.green : color.red)
+    table.cell(dash, 0, 6, "Indic ready")
+    table.cell(dash, 1, 6, indicators_ready ? "✓" : "✗",
+               text_color = indicators_ready ? color.green : color.red)
