@@ -1,17 +1,48 @@
+# Build artifacts & caches
 .venv
 __pycache__
 *.pyc
 *.pyo
+*.egg-info
 .pytest_cache
+
+# VCS & editor
 .git
 .gitignore
-.env
-.env.example
-logs/
-state/
-trades_setup_target5k.csv
-replay_trades.csv
-*.parquet
+.github
 .claude
 .vscode
 *.code-workspace
+
+# Secrets — NU urca .env in image (se trec via Portainer/compose env)
+.env
+.env.example
+
+# Docs (nu sunt necesare in container)
+*.md
+
+# Local data nu e necesara in image
+logs/
+state/
+*.parquet
+*.csv
+
+# Dev-only scripts (nu ruleaza in container)
+scripts/backtest.py
+scripts/smoke_test.py
+scripts/compare_pine_python.py
+scripts/diag_bybit.py
+scripts/preflight_check.py
+scripts/export_replay_trades.py
+scripts/run_replay.py
+scripts/test_ont_live.py
+scripts/test_ont_replicate_container.py
+
+# Tests
+tests/
+
+# Pine artifacts (nu ruleaza in container)
+static/*.pine
+
+# Lock files
+uv.lock

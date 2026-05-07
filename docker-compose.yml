@@ -1,5 +1,14 @@
 # ICHIMOKU bot — 1 portfolio (MNT+DOT pe acelasi subaccount Bybit).
-# Single-stack deploy. Pentru Portainer foloseste acest fisier ca stack content.
+# Single-stack deploy. Pentru Portainer: Stacks → Add stack → Web editor /
+# Git repository, lipeste continutul si seteaza Environment variables.
+#
+# Variabile OBLIGATORII (din .env sau Portainer Environment):
+#   BYBIT_API_KEY, BYBIT_API_SECRET
+# Variabile OPTIONALE (default-uri sunt OK):
+#   TRADING_MODE  (live | testnet, default: testnet pentru siguranta)
+#   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID  (gol = dezactivat)
+#   BOT_NAME, CHART_PORT, CHART_TZ, STRATEGY_NAME
+#   RATE_LIMIT_PER_SEC, RATE_LIMIT_BURST, MAKER_ENTRY_TIMEOUT_SEC
 
 services:
   ichimoku:
@@ -8,20 +17,37 @@ services:
     container_name: ichimoku
     restart: unless-stopped
     environment:
-      - TZ=Europe/Bucharest
-      - BOT_NAME=ichimoku_mnt_dot
-      - CHART_PORT=8103
-      - TRADING_MODE=${TRADING_MODE:-live}
+      # ── Required ────────────────────────────────────────────────
+      - TRADING_MODE=${TRADING_MODE:-testnet}      # ⚠️ default testnet (paper) — schimba la 'live' EXPLICIT
       - BYBIT_API_KEY=${BYBIT_API_KEY}
       - BYBIT_API_SECRET=${BYBIT_API_SECRET}
+
+      # ── Telegram (optional) ─────────────────────────────────────
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+
+      # ── Branding & display ──────────────────────────────────────
+      - TZ=Europe/Bucharest                         # container OS timezone (logs)
+      - CHART_TZ=${CHART_TZ:-Europe/Bucharest}      # chart + Telegram fmt_time
+      - BOT_NAME=${BOT_NAME:-ichimoku_mnt_dot}      # apare in Telegram header
+      - STRATEGY_NAME=${STRATEGY_NAME:-Hull+Ichimoku}  # chart strategy label
+      - CHART_PORT=${CHART_PORT:-8103}              # port pentru chart UI
+
+      # ── Rate limiter (REST throttle, default conservativ) ──────
+      - RATE_LIMIT_PER_SEC=${RATE_LIMIT_PER_SEC:-5}
+      - RATE_LIMIT_BURST=${RATE_LIMIT_BURST:-10}
+
+      # ── Maker entry pattern (PostOnly timeout) ─────────────────
+      - MAKER_ENTRY_TIMEOUT_SEC=${MAKER_ENTRY_TIMEOUT_SEC:-5}
+
     ports:
-      - "8103:8103"
+      - "${CHART_PORT:-8103}:${CHART_PORT:-8103}"   # chart UI (read-only)
+
     volumes:
-      - ./logs:/app/logs
+      - ./logs:/app/logs                            # JSONL events persistent
+
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8103/api/status"]
+      test: ["CMD-SHELL", "curl -sf http://localhost:${CHART_PORT:-8103}/api/status || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 3

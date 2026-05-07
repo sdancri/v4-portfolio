@@ -23,11 +23,11 @@ COPY . .
 RUN mkdir -p /app/logs
 VOLUME ["/app/logs"]
 
-# Default chart port — overridabil prin CHART_PORT env (8101 sub1, 8102 sub2)
-EXPOSE 8101
+# Default chart port — overridabil prin CHART_PORT env (compose maps 8103:8103)
+EXPOSE 8103
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
-    CMD curl -sf http://localhost:${CHART_PORT:-8101}/api/status || exit 1
+    CMD curl -sf http://localhost:${CHART_PORT:-8103}/api/status || exit 1
 
 # `-u` unbuffered stdout (regula 14: dublu insurance peste PYTHONUNBUFFERED + line_buffering)
 CMD ["python", "-u", "scripts/run_live.py"]

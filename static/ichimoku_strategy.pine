@@ -25,6 +25,12 @@ strategy(
    commission_value     = 0.055,
    slippage             = 0,
    pyramiding           = 0,
+   // CRITICAL: margin = 5% → simuleaza leverage 20x (acopera MNT 2.33x equity).
+   // Fara asta, Pine default e margin=100% (fara leverage) → rejecteaza silent
+   // toate trade-urile cu notional > equity. Pentru DOT (0.625x equity) si MNT
+   // (2.33x), 20x e suficient. Daca rulezi pereche cu leverage > 20x, modifica.
+   margin_long          = 5,
+   margin_short         = 5,
    calc_on_every_tick   = false,
    calc_on_order_fills  = false,
    process_orders_on_close = true,
