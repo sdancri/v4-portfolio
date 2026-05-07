@@ -90,10 +90,8 @@ show_hull   = input.bool(true, "Hull n1",            group=g_plot)
 show_tk_kj  = input.bool(true, "Tenkan / Kijun",     group=g_plot)
 
 g_date = "Date Range"
-start_date = input.time(timestamp("2024-01-01 00:00 +0000"), "Start Date",
-   group=g_date, tooltip="Backtest doar de la aceasta data inainte")
-end_date   = input.time(timestamp("2030-01-01 00:00 +0000"), "End Date",
-   group=g_date, tooltip="Backtest doar pana la aceasta data")
+start_date = input.time(timestamp("2024-01-01 00:00 +0000"), "Start Date", group=g_date)
+end_date   = input.time(timestamp("2030-01-01 00:00 +0000"), "End Date",   group=g_date)
 
 g_debug = "Debug"
 show_debug = input.bool(false, "Debug entry/skip labels", group=g_debug)
