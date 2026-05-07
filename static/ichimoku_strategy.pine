@@ -76,24 +76,34 @@ tp_default = switch preset
     "AKT"  => 8.0
     => 0.0
 
-// ── INPUTS (override-uibile, dar default = preset) ─────────────────────────
-g_ind = "Indicatori"
-hull_length    = input.int(hull_default,  "Hull Length", minval=2, group=g_ind)
-tenkan_periods = input.int(9,             "Tenkan",      minval=2, group=g_ind)
-kijun_periods  = input.int(kijun_default, "Kijun",       minval=2, group=g_ind)
-senkou_b_len   = input.int(snkb_default,  "Senkou B",    minval=2, group=g_ind)
-displacement   = input.int(24,            "Displacement", minval=2, group=g_ind)
+// ── INPUTS (CUSTOM-only override-uibile; presetate auto-fill prin switch) ─
+// Pine v6 nu lasa input.int(defval=...) cu valoare runtime — daca vrei
+// override pe alt preset, schimba la CUSTOM si seteaza manual mai jos.
+g_ind = "Indicatori (CUSTOM only)"
+hull_custom    = input.int(8,  "Hull Length", minval=2, group=g_ind)
+tenkan_periods = input.int(9,  "Tenkan",      minval=2, group=g_ind)
+kijun_custom   = input.int(48, "Kijun",       minval=2, group=g_ind)
+snkb_custom    = input.int(40, "Senkou B",    minval=2, group=g_ind)
+displacement   = input.int(24, "Displacement", minval=2, group=g_ind)
+
+// Final values: switch fix daca preset != CUSTOM
+hull_length  = preset == "CUSTOM" ? hull_custom  : hull_default
+kijun_periods = preset == "CUSTOM" ? kijun_custom : kijun_default
+senkou_b_len = preset == "CUSTOM" ? snkb_custom  : snkb_default
 
 g_filter = "Filtre Setup G"
 max_hull_spread = input.float(2.0, "Max Hull spread %", minval=0.0, step=0.1, group=g_filter)
 max_kj_dist     = input.float(6.0, "Max close-Kijun %", minval=0.0, step=0.1, group=g_filter)
 
 g_risk = "Sizing & Exit"
-risk_pct = input.float(7.0,        "Risk per trade %", minval=0.1, step=0.1, group=g_risk)
-sl_pct   = input.float(sl_default, "SL %",             minval=0.1, step=0.1, group=g_risk)
-tp_pct   = input.float(tp_default, "TP % (0 = off)",   minval=0.0, step=0.1, group=g_risk)
-leverage = input.int(12,           "Leverage_max (cap)", minval=1, group=g_risk)
-cap_pct  = input.float(0.95,       "Cap pct of max",   minval=0.1, step=0.05, group=g_risk)
+risk_pct   = input.float(7.0,  "Risk per trade %",   minval=0.1, step=0.1, group=g_risk)
+sl_custom  = input.float(4.0,  "SL % (CUSTOM only)", minval=0.1, step=0.1, group=g_risk)
+tp_custom  = input.float(0.0,  "TP % (CUSTOM only, 0=off)", minval=0.0, step=0.1, group=g_risk)
+leverage   = input.int(12,     "Leverage_max (cap)", minval=1, group=g_risk)
+cap_pct    = input.float(0.95, "Cap pct of max",     minval=0.1, step=0.05, group=g_risk)
+
+sl_pct = preset == "CUSTOM" ? sl_custom : sl_default
+tp_pct = preset == "CUSTOM" ? tp_custom : tp_default
 
 g_plot = "Plot"
 show_cloud  = input.bool(true, "Cloud (Senkou A/B)", group=g_plot)
