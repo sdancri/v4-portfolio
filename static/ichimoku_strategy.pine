@@ -117,6 +117,7 @@ end_date   = input.time(timestamp("2030-01-01 00:00 +0000"), "End Date",   group
 
 g_debug = "Debug"
 show_debug = input.bool(false, "Debug entry/skip labels", group=g_debug)
+show_info  = input.bool(true,  "Info label (active settings)", group=g_debug)
 
 // In date range pe bara curenta?
 in_date_range = time >= start_date and time <= end_date
@@ -217,12 +218,15 @@ if show_debug and (long_entry or short_entry)
     label.new(bar_index, low, text=label_txt, color=label_color, textcolor=color.white,
               style=label.style_label_up, size=size.tiny, yloc=yloc.belowbar)
 
-// ── DEBUG LABEL: valori active (pe ultima bara) ──────────────────────────
-if barstate.islast
+// ── INFO LABEL: valori active (pe fiecare bara, var-managed) ─────────────
+var label info_lbl = na
+if show_info
     line1 = "Preset: " + preset
     line2 = "Hull/Kj/SnkB: " + str.tostring(hull_length) + "/" + str.tostring(kijun_periods) + "/" + str.tostring(senkou_b_len)
     line3 = "SL/TP: " + str.tostring(sl_pct, "#.#") + "% / " + str.tostring(tp_pct, "#.#") + "%"
     line4 = "Risk: " + str.tostring(risk_pct, "#.#") + "%"
     line5 = "Hull half/sqn: " + str.tostring(hull_half) + "/" + str.tostring(hull_sqn)
     info_txt = line1 + "\n" + line2 + "\n" + line3 + "\n" + line4 + "\n" + line5
-    label.new(bar_index, high, text=info_txt, color=color.new(color.blue, 20), textcolor=color.white, style=label.style_label_down, size=size.normal, yloc=yloc.abovebar)
+    if not na(info_lbl)
+        label.delete(info_lbl)
+    info_lbl := label.new(bar_index, high, text=info_txt, color=color.new(color.blue, 20), textcolor=color.white, style=label.style_label_left, size=size.normal)
