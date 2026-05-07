@@ -146,17 +146,21 @@ class BybitClient:
             symbol=symbol, type="market", side=side, amount=qty, params=params
         )
 
-    async def set_position_sl(self, symbol: str, sl_price: float) -> dict[str, Any]:
-        """Setează SL pe POZIȚIE (Bybit V5 ``setTradingStop``) — atomic.
+    async def set_position_sl(
+        self, symbol: str, sl_price: float, tp_price: float | None = None,
+    ) -> dict[str, Any]:
+        """Setează SL (si optional TP) pe POZIȚIE (Bybit V5 ``setTradingStop``).
 
-        SL-ul devine atribut al poziției, NU order separat. Avantaje:
-          - La close (orice motiv), SL dispare singur — fără orphan.
-          - Trailing modify: single call atomic — fără race cancel→create.
-          - Reconcile simplu: verific position.stopLoss, NU separate orders.
+        SL/TP devin atribute ale poziției, NU ordine separate. Avantaje:
+          - Trigger INTRA-BAR (server-side, instant la atingere)
+          - La close (orice motiv), SL/TP dispar singure — fara orphan
+          - Trailing modify: single call atomic — fara race cancel→create
+          - Reconcile simplu: verific position.stopLoss + takeProfit
 
         Args:
-            symbol: simbol Bybit ("KAIAUSDT")
+            symbol: simbol Bybit ("MNTUSDT")
             sl_price: noul stop-loss. Folosește 0 pentru a clear SL.
+            tp_price: optional take-profit. None / 0 = no TP.
 
         Bybit V5 endpoint: POST /v5/position/trading-stop
         """
@@ -165,10 +169,13 @@ class BybitClient:
             "category": "linear",
             "symbol": market_id,
             "stopLoss": str(sl_price),
-            "tpslMode": "Full",       # SL pe poziția completă
-            "slOrderType": "Market",  # market exit la trigger
+            "tpslMode": "Full",       # SL/TP pe poziția completă
+            "slOrderType": "Market",  # market exit la trigger SL
             "positionIdx": 0,         # one-way mode (n-avem hedge)
         }
+        if tp_price is not None and tp_price > 0:
+            params["takeProfit"] = str(tp_price)
+            params["tpOrderType"] = "Market"  # market exit la trigger TP
         await wait_token()
         return await self.exchange.private_post_v5_position_trading_stop(params)
 

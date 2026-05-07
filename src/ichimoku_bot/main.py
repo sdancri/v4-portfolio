@@ -170,17 +170,41 @@ class IchimokuRunner:
             )
         self.bot.account = real
 
-    # ── Heartbeat task — periodic equity sync (60s default) ─────────────
+    # ── Heartbeat task — equity sync ALIGNED la bar close (60s inainte) ─
     async def heartbeat_loop(self) -> None:
-        interval = self.cfg.operational.heartbeat_interval_seconds
+        """Sync equity la fiecare bara confirmed minus 60s.
+
+        Pe TF 4h: 6 sync-uri/zi (la 23:59, 03:59, 07:59, ... UTC) vs 1,440
+        cu polling continuu. Astfel:
+          - account FRESH cand bot evalueaza semnale la bar close
+          - captureaza funding fees aplicate intra-bar (Bybit la 00/08/16 UTC)
+          - 99.6% reduction in API calls vs sleep(60)
+        """
+        # Detecta TF-ul cel mai mic dintre perechi (cele Ichi1/2 sunt 4h)
+        tf_seconds_map = {"1m": 60, "3m": 180, "5m": 300, "15m": 900, "30m": 1800,
+                           "1h": 3600, "2h": 7200, "4h": 14400, "1d": 86400}
+        tfs = [tf_seconds_map.get(p.timeframe, 14400)
+               for p in self.cfg.pairs if p.enabled]
+        bar_seconds = min(tfs) if tfs else 14400
+        SYNC_OFFSET_SEC = 60   # cu cat inainte de bar close
+
         while True:
             try:
-                await asyncio.sleep(interval)
+                # Calculeaza urmatorul bar close UTC (aligned)
+                now_ts = pd.Timestamp.utcnow().timestamp()
+                next_bar_close = ((int(now_ts) // bar_seconds) + 1) * bar_seconds
+                sync_at = next_bar_close - SYNC_OFFSET_SEC
+                sleep_sec = sync_at - now_ts
+                # Daca e in trecut (rar — drift), sari la urmatorul bar
+                if sleep_sec <= 0:
+                    sleep_sec += bar_seconds
+                await asyncio.sleep(sleep_sec)
                 await self._sync_equity("HEARTBEAT")
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 print(f"  [HEARTBEAT] error: {e}")
+                await asyncio.sleep(60)  # short backoff pe eroare
 
     # ── Setup ────────────────────────────────────────────────────────────
     async def setup(self) -> None:
@@ -415,9 +439,15 @@ class IchimokuRunner:
         if pos is None:
             return  # nothing to close
         if dec.action in ("SL_LONG", "SL_SHORT"):
+            # SL e DELEGAT la Bybit (setTradingStop) — daca ajunge aici,
+            # inseamna ca evaluatorul intern a detectat SL hit dar Bybit n-a
+            # trigger-at inca. Ramane fallback (rareori).
             await self._close_trade(sym, pos, dec.price, "SL", bar)
         elif dec.action in ("TP_LONG", "TP_SHORT"):
-            await self._close_trade(sym, pos, dec.price, "TP", bar)
+            # TP e DELEGAT la Bybit — bot-ul NU forteaza close pe TP_signal.
+            # Bybit triggereaza intra-bar; private WS event ne notifica.
+            # Skip silent — evita race cu Bybit-side close.
+            return
         elif dec.action in ("CLOSE_LONG", "CLOSE_SHORT"):
             await self._close_trade(sym, pos, dec.price, "SIGNAL", bar)
 
@@ -443,6 +473,12 @@ class IchimokuRunner:
         sl_price = (dec.price * (1 - pair_cfg.sl_initial_pct)
                     if side == "long"
                     else dec.price * (1 + pair_cfg.sl_initial_pct))
+        # TP setat pe Bybit (intra-bar trigger like SL).
+        tp_price: float | None = None
+        if pair_cfg.tp_pct is not None and pair_cfg.tp_pct > 0:
+            tp_price = (dec.price * (1 + pair_cfg.tp_pct)
+                        if side == "long"
+                        else dec.price * (1 - pair_cfg.tp_pct))
 
         # ENTRY ca MAKER cu fallback Market (pattern 80/20):
         # plaseaza Limit PostOnly la best bid/ask, asteapta `timeout_sec`,
@@ -467,7 +503,9 @@ class IchimokuRunner:
             order_id = ""  # maker_entry_or_market doesn't return single order_id
             print(f"  [OPEN] {sym} {side} entry={result['result']} "
                   f"filled={result['filled_qty']} avg={entry_filled}")
-            await self.client.set_position_sl(sym, sl_price)
+            # Set SL + TP atomic la Bybit (intra-bar trigger native).
+            # TP-ul e DELEGAT la Bybit, NU mai e gestionat de bot.
+            await self.client.set_position_sl(sym, sl_price, tp_price=tp_price)
         except Exception as e:
             print(f"  [OPEN_TRADE FAILED] {sym} {side}: {e!r}")
             log_event(self.cfg.operational.log_dir, self.cfg.portfolio.name,
@@ -605,10 +643,13 @@ class IchimokuRunner:
             account=self.bot.account,
         )
 
-        # Icon: ⚠️ pe EXTERNAL/BYBIT_SL (defense-in-depth a sintetizat close-ul);
-        # 📈 win / 📉 loss pe close clean.
-        if reason in ("EXTERNAL", "BYBIT_SL"):
+        # Icon: ⚠️ pe EXTERNAL (close neasteptat, defense-in-depth).
+        # 🎯 pe BYBIT_TP / BYBIT_SL (Bybit a triggerat conform plan).
+        # 📈 win / 📉 loss pe SIGNAL close (bot decision).
+        if reason == "EXTERNAL":
             sign_icon = "⚠️"
+        elif reason in ("BYBIT_SL", "BYBIT_TP"):
+            sign_icon = "🎯"
         else:
             sign_icon = "📈" if pnl >= 0 else "📉"
         ret_pct = (self.bot.account / self.bot.initial_account - 1) * 100
@@ -623,7 +664,14 @@ class IchimokuRunner:
 
     # ── Bybit private WS event ───────────────────────────────────────────
     async def on_bybit_position_event(self, event: dict) -> None:
-        """Position update event de pe private WS (e.g. SL hit by Bybit)."""
+        """Position update event de pe private WS.
+
+        Bybit triggereaza SL/TP intra-bar (setTradingStop), bot e notificat.
+        Detecteaza SL vs TP pe baza prețului avg_exit:
+          - aproape de pos.sl_price → BYBIT_SL
+          - aproape de pos.tp_price → BYBIT_TP
+          - alt preț → EXTERNAL (close manual sau alt event)
+        """
         sym = event.get("symbol", "")
         if sym not in self.positions:
             return
@@ -631,15 +679,38 @@ class IchimokuRunner:
         if pos is None:
             return
         size = float(event.get("size") or 0)
-        if size == 0:
-            print(f"  [WS_POS_EVENT] {sym}: size=0 — Bybit a inchis pozitia")
-            entry_ts_ms = int(pos.opened_ts.timestamp() * 1000)
-            exit_ts_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
-            pnl_data = await self.client.fetch_pnl_for_trade(sym, entry_ts_ms, exit_ts_ms)
-            await self._on_trade_closed(
-                sym, pos, pnl_data.get("avg_exit") or pos.sl_price,
-                pnl_data.get("pnl", 0.0), pnl_data.get("fees", 0.0), "BYBIT_SL"
-            )
+        if size != 0:
+            return  # not a close event
+
+        print(f"  [WS_POS_EVENT] {sym}: size=0 — Bybit a inchis pozitia")
+        entry_ts_ms = int(pos.opened_ts.timestamp() * 1000)
+        exit_ts_ms = int(pd.Timestamp.utcnow().timestamp() * 1000)
+        pnl_data = await self.client.fetch_pnl_for_trade(sym, entry_ts_ms, exit_ts_ms)
+        avg_exit = pnl_data.get("avg_exit") or pos.sl_price
+
+        # Detect SL vs TP pe baza distantei avg_exit fata de SL/TP setate.
+        # Tolerance 0.5% (slippage typical pe trigger).
+        pair_cfg = next((p for p in self.cfg.pairs if p.symbol == sym), None)
+        tp_price = None
+        if pair_cfg and pair_cfg.tp_pct is not None and pair_cfg.tp_pct > 0:
+            tp_price = (pos.entry_price * (1 + pair_cfg.tp_pct)
+                        if pos.side == "long"
+                        else pos.entry_price * (1 - pair_cfg.tp_pct))
+
+        def _close_to(target: float) -> bool:
+            return abs(avg_exit - target) / max(target, 1e-9) < 0.005  # 0.5%
+
+        if _close_to(pos.sl_price):
+            reason = "BYBIT_SL"
+        elif tp_price and _close_to(tp_price):
+            reason = "BYBIT_TP"
+        else:
+            reason = "EXTERNAL"  # manual close sau alt event
+
+        await self._on_trade_closed(
+            sym, pos, avg_exit,
+            pnl_data.get("pnl", 0.0), pnl_data.get("fees", 0.0), reason
+        )
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
