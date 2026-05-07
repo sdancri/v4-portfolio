@@ -217,21 +217,17 @@ if show_debug and (long_entry or short_entry)
     label.new(bar_index, low, text=label_txt, color=label_color, textcolor=color.white,
               style=label.style_label_up, size=size.tiny, yloc=yloc.belowbar)
 
-// ── DASHBOARD ─────────────────────────────────────────────────────────────
-var table dash = table.new(position.top_right, 2, 7, border_width=1)
+// ── DEBUG LABEL: valori active (pe ultima bara) ──────────────────────────
 if barstate.islast
-    table.cell(dash, 0, 0, "Param",  bgcolor=color.new(color.gray, 70))
-    table.cell(dash, 1, 0, "Value",  bgcolor=color.new(color.gray, 70))
-    table.cell(dash, 0, 1, "Preset")
-    table.cell(dash, 1, 1, preset)
-    table.cell(dash, 0, 2, "Hull/Kj/SnkB")
-    table.cell(dash, 1, 2, str.format("{0}/{1}/{2}", hull_length, kijun_periods, senkou_b_len))
-    table.cell(dash, 0, 3, "SL / TP %")
-    table.cell(dash, 1, 3, str.format("{0,number,#.#} / {1,number,#.#}", sl_pct, tp_pct))
-    table.cell(dash, 0, 4, "Hull half / sqn")
-    table.cell(dash, 1, 4, str.format("{0} / {1}", hull_half, hull_sqn))
-    table.cell(dash, 0, 5, "Filt OK")
-    table.cell(dash, 1, 5, filt_ok ? "✓" : "✗", text_color = filt_ok ? color.green : color.red)
-    table.cell(dash, 0, 6, "Indic ready")
-    table.cell(dash, 1, 6, indicators_ready ? "✓" : "✗",
-               text_color = indicators_ready ? color.green : color.red)
+    info_txt = "Preset: " + preset +
+       "\nHull/Kj/SnkB: " + str.tostring(hull_length) + "/" +
+                            str.tostring(kijun_periods) + "/" +
+                            str.tostring(senkou_b_len) +
+       "\nSL/TP %: " + str.tostring(sl_pct, "#.#") + "/" +
+                       str.tostring(tp_pct, "#.#") +
+       "\nRisk %: " + str.tostring(risk_pct, "#.#") +
+       "\nHull half/sqn: " + str.tostring(hull_half) + "/" +
+                              str.tostring(hull_sqn)
+    label.new(bar_index, high, text=info_txt,
+              color=color.new(color.blue, 20), textcolor=color.white,
+              style=label.style_label_down, size=size.normal, yloc=yloc.abovebar)
