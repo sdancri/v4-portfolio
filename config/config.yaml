@@ -1,96 +1,48 @@
-# VSE bot — config validat (vezi CONFIG.md / strategy.md)
+# ICHIMOKU bot — config validat (Hull+Ichimoku 4h, MNT+DOT, OOS-tested)
 
-strategy:
-  name: VSE_Nou1_NoKill
-
-  # Capital management (per subaccount)
-  pool_total: 100.0
-  equity_start: 50.0
-  risk_pct_equity: 0.20
-
-  # Reset cycle
-  reset_trigger: 15.0
-  reset_target: 50.0
-  max_resets: null            # NO KILL SWITCH
-
-  # Withdraw target
-  withdraw_target: 10000.0    # ridicat la $10k (vs $5k spec) → wealth 2.3y ~$31k
-                              # vs ~$16k la $5k. 0 pool_low events pe subacc 1.
-
-  # Stop loss bounds
-  sl_min_pct: 0.005
-  sl_max_pct: 0.035
-
-  # Cooldown post-exit (per pereche, în bare)
-  cooldown_bars: 3
-
-  # Bybit
-  leverage: 15
+portfolio:
+  name: ichimoku_mnt_dot
+  pool_total: 100.0           # capital initial USDT (compound de aici)
+  leverage: 15                # default Bybit isolated (fallback daca pereche n-are override)
   cap_pct_of_max: 0.95
-  taker_fee: 0.00055
-  slippage_bps: 0.0           # mărește pentru sanity-check pe replay
+  taker_fee: 0.00055          # 0.055% taker
+  slippage_bps: 0.0
 
-  # Stil semnal VSE
-  style: Balanced             # Strict | Balanced | Scalper
-
-  # Mod OPP exit:
-  #   pure         — close-only la opposite signal, cooldown 3 bars normal.
-  #   with_reverse — close + REOPEN pe direcție opusă pe aceeași bară.
-  #
-  # La withdraw_target $10k, pure produce wealth MAI MARE decât with_reverse
-  # ($31k vs $22k) pentru că reversele fragmentează fat-tail-ul KAIA.
-  opp_exit_mode: pure
-
-  # Când verificăm cycle SUCCESS (balance >= withdraw_target):
-  #   on_close — la fiecare close (cap strict, withdraw imediat). Conservator,
-  #              dar pierde optionality dacă următoarele close-uri ar duce
-  #              balance la peak >> $5k.
-  #   on_entry — verifică DOAR la deschiderea unui trade nou. Lasă cycle să
-  #              acumuleze profit din close-uri intermediare. Match cu numerele
-  #              din strategy.md ($13k/subacc, $24k portfolio). Risc: balance
-  #              > $5k stă expus între close și next entry.
-  withdraw_check_mode: on_close
-
-vse_indicator:
-  mcginley_length: 14
-  whiteline_length: 20
-  ttms_length: 20
-  ttms_bb_mult: 2.0
-  ttms_kc_mult_widest: 2.0
-  tether_fast: 13
-  tether_slow: 55
-  vortex_length: 14
-  vortex_threshold: 0.05
-  st_atr_length: 22
-  st_atr_mult: 3.0
-
-subaccounts:
-  - name: subacc_1_kaia_aave
+pairs:
+  # MNTUSDT — best pair (PF 1.83 standalone, OOS validated)
+  - symbol: MNTUSDT
+    timeframe: 4h
     enabled: true
-    pairs:
-      - symbol: KAIAUSDT
-        timeframe: 1h
-      - symbol: AAVEUSDT
-        timeframe: 1h
-    expected_wealth_2_3y: 13364
+    leverage: 20              # MNT-specific leverage (notional 2.33× equity la risc 7%/SL 3%)
+    hull_length: 8            # OOS-tunat (vs 10 din sweep full-data)
+    tenkan_periods: 9
+    kijun_periods: 48
+    senkou_b_periods: 40
+    displacement: 24
+    risk_pct_per_trade: 0.07  # 7% din shared equity
+    sl_initial_pct: 0.03      # SL 3% — Aggressive (MNT signal-quality permite SL strans)
+    tp_pct: null              # NO TP — signal exit only (let trends run)
+    max_hull_spread_pct: 2.0
+    max_close_kijun_dist_pct: 6.0
 
-  - name: subacc_2_ont_eth
+  # DOTUSDT — robust contributor (PF 1.34 OOS, validated 4 ani)
+  - symbol: DOTUSDT
+    timeframe: 4h
     enabled: true
-    pairs:
-      - symbol: ONTUSDT
-        timeframe: 1h
-      - symbol: ETHUSDT
-        timeframe: 2h
-    expected_wealth_2_3y: 11485
-
-# Doar pentru replay (backtest validation)
-replay:
-  data_dir: /home/dan/Python/Test_Python/data/ohlcv
-  start: "2024-01-01"
-  end: "2026-04-25"
+    leverage: 7               # DOT-specific (notional 0.625× equity la risc 5%/SL 8%)
+    hull_length: 10
+    tenkan_periods: 9
+    kijun_periods: 36         # diferit fata de MNT (tunat per pair)
+    senkou_b_periods: 52
+    displacement: 24
+    risk_pct_per_trade: 0.05  # 5% din shared equity
+    sl_initial_pct: 0.08      # SL 8% — DOT noisier, evita false-out
+    tp_pct: 0.12              # TP 12% (asymmetric per pair, lock in earlier)
+    max_hull_spread_pct: 2.0
+    max_close_kijun_dist_pct: 6.0
 
 operational:
-  max_concurrent_positions_per_subacc: 2
+  max_concurrent_positions: 2
   max_consecutive_api_errors: 5
   heartbeat_interval_seconds: 60
   save_state_interval_seconds: 300

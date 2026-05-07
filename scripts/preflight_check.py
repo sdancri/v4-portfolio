@@ -25,8 +25,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from dotenv import load_dotenv
 
-from vse_bot.config import load_config
-from vse_bot.exchange.bybit_client import BybitClient
+from ichimoku_bot.config import load_config
+from ichimoku_bot.exchange.bybit_client import BybitClient
 
 
 def _ok(msg: str) -> None:
@@ -172,7 +172,7 @@ def check_replay_smoke(cfg) -> bool:
     print("\n[6/6] Replay smoke (last 30 days only)")
     import pandas as pd
 
-    from vse_bot.replay import run_replay
+    from ichimoku_bot.replay import run_replay
 
     # Test rapid pe ultima lună
     cfg.replay.start = (pd.Timestamp(cfg.replay.end) - pd.Timedelta(days=30)).strftime("%Y-%m-%d")

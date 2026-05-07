@@ -13,8 +13,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import ccxt.async_support as ccxt
 import pandas as pd
 
-from vse_bot.config import load_config
-from vse_bot.vse_signal_live import VSESignalLive
+from ichimoku_bot.config import load_config
+from ichimoku_bot.vse_signal_live import VSESignalLive
 
 
 async def main() -> int:
@@ -71,7 +71,7 @@ async def main() -> int:
                       f"sl_pct={sig.sl_pct * 100:.3f}%")
 
         # Inspect last bar with raw signals (chiar dacă FILTER respinge)
-        from vse_bot.indicator import compute_indicators, build_signals
+        from ichimoku_bot.indicator import compute_indicators, build_signals
         all_buf = sig_engine._buffer.copy()  # type: ignore
         ind = compute_indicators(all_buf, sig_engine._vse_cfg)  # type: ignore
         sig = build_signals(ind, sig_engine._vse_cfg)  # type: ignore

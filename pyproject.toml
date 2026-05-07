@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vse_bot"
+name = "ichimoku_bot"
 version = "0.1.0"
-description = "VSE multi-subaccount trading bot for Bybit perpetuals"
+description = "Hull+Ichimoku 2-pair trading bot for Bybit perpetuals (MNT+DOT)"
 requires-python = ">=3.10"
 authors = [{name = "Dan"}]
 

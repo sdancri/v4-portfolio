@@ -29,7 +29,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 if TYPE_CHECKING:
-    from vse_bot.main import SubaccountRunner
+    from ichimoku_bot.main import SubaccountRunner
 
 
 def create_app(runner: "SubaccountRunner") -> FastAPI:
@@ -43,7 +43,7 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
         yield
 
     app = FastAPI(
-        title=f"VSE chart — {runner.sub_cfg.name}",
+        title=f"ICHIMOKU chart — {runner.cfg.portfolio.name}",
         lifespan=lifespan,
     )
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
@@ -58,15 +58,16 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
         primary = runner.primary_pair_key()
         symbol = primary[0] if primary else ""
         timeframe = primary[1] if primary else ""
-        bot_name = os.getenv("BOT_NAME", runner.sub_cfg.name)
+        bot_name = os.getenv("BOT_NAME", runner.cfg.portfolio.name)
+        strategy_name = os.getenv("STRATEGY_NAME", "Hull+Ichimoku")
         bp = runner.bot.init_payload()
         return JSONResponse({
             # Schema match chart_live.html
             "symbol": symbol,
             "timeframe": timeframe,
-            "timezone": "Europe/Bucharest",
+            "timezone": os.getenv("CHART_TZ", "Europe/Bucharest"),
             "bot_name": bot_name,
-            "strategy": "VSE_Nou1",
+            "strategy": strategy_name,
             "candles": runner.candles_live,
             "trades": bp["trades"],
             "equity": bp["equity_curve"],
@@ -79,7 +80,7 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
             "indicators": [],
             "indicator_meta": [],
             # Extra fields pentru debug / API consumers
-            "subaccount": runner.sub_cfg.name,
+            "portfolio": runner.cfg.portfolio.name,
             "primary_pair": symbol,
         })
 
@@ -93,7 +94,7 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
         Folosit de Docker healthcheck (interval 30s, retries 3).
         """
         import time as _t
-        from vse_bot.exchange.bybit_ws import _tf_to_seconds   # type: ignore
+        from ichimoku_bot.exchange.bybit_ws import _tf_to_seconds   # type: ignore
 
         last = runner.candles_live[-1] if runner.candles_live else None
         primary = runner.primary_pair_key()
@@ -114,22 +115,22 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
                 warnings.append(f"bar_stale_{int(age_s)}s")
 
         body = {
-            "bot_name": os.getenv("BOT_NAME", runner.sub_cfg.name),
-            "subaccount": runner.sub_cfg.name,
+            "bot_name": os.getenv("BOT_NAME", runner.cfg.portfolio.name),
+            "portfolio": runner.cfg.portfolio.name,
             "healthy": len(warnings) == 0,
             "warnings": warnings,
             "candles_total": len(runner.candles_live),
             "last_candle_ts": last[0] if last else None,
             "connected_clients": len(runner.clients),
-            "paused": runner.paused,                         # backward-compat
+            "paused": runner.paused,
             "paused_symbols": sorted(runner.paused_symbols),
             "summary": runner.bot.summary(),
             "state": {
-                "equity": runner.state.equity,
-                "balance_broker": runner.state.balance_broker,
-                "pool_used": runner.state.pool_used,
-                "cycle_num": runner.state.cycle_num,
-                "reset_count": runner.state.reset_count,
+                "account": runner.bot.account,
+                "initial_account": runner.bot.initial_account,
+                "pool_total": runner.cfg.portfolio.pool_total,
+                "shared_equity": runner.shared_equity,
+                "n_open_positions": sum(1 for p in runner.positions.values() if p is not None),
             },
         }
         # 503 dacă bot e degraded (Docker healthcheck va marca unhealthy)
@@ -160,19 +161,19 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
         Per-symbol granularity: dacă o pereche are rezidu pe Bybit, blocăm
         doar acel symbol; cealaltă continuă să tradeze normal.
         """
-        from vse_bot.event_log import log_event
-        from vse_bot import telegram_bot as tg
+        from ichimoku_bot.event_log import log_event
+        from ichimoku_bot import telegram_bot as tg
         if symbol:
             was_paused = symbol in runner.paused_symbols
             runner.paused_symbols.add(symbol)
             log_event(
-                runner.cfg.operational.log_dir, runner.sub_cfg.name,
+                runner.cfg.operational.log_dir, runner.cfg.portfolio.name,
                 "MANUAL_PAUSE", source="/api/pause", symbol=symbol,
             )
             if not was_paused:
                 await tg.send(
                     f"🛑 PAUSED — {symbol}",
-                    f"Subaccount: <code>{runner.sub_cfg.name}</code>\n"
+                    f"Subaccount: <code>{runner.cfg.portfolio.name}</code>\n"
                     f"Symbol: <code>{symbol}</code>\n"
                     f"Bot nu intră trade-uri noi pe acest symbol. "
                     f"Trimite <code>POST /api/resume?symbol={symbol}</code> ca să continue."
@@ -180,43 +181,45 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
         else:
             # Pause toate perechile
             paused_now = []
-            for p in runner.sub_cfg.pairs:
+            for p in runner.cfg.pairs:
+                if not p.enabled:
+                    continue
                 if p.symbol not in runner.paused_symbols:
                     runner.paused_symbols.add(p.symbol)
                     paused_now.append(p.symbol)
             log_event(
-                runner.cfg.operational.log_dir, runner.sub_cfg.name,
+                runner.cfg.operational.log_dir, runner.cfg.portfolio.name,
                 "MANUAL_PAUSE", source="/api/pause", scope="all",
             )
             if paused_now:
                 await tg.send(
                     "🛑 BOT PAUSED (toate perechile)",
-                    f"Subaccount: <code>{runner.sub_cfg.name}</code>\n"
+                    f"Subaccount: <code>{runner.cfg.portfolio.name}</code>\n"
                     f"Pairs paused: <code>{', '.join(paused_now)}</code>\n"
                     f"Trimite <code>POST /api/resume</code> ca să continue."
                 )
         return {
             "paused_symbols": sorted(runner.paused_symbols),
-            "subaccount": runner.sub_cfg.name,
+            "subaccount": runner.cfg.portfolio.name,
         }
 
     @app.post("/api/resume")
     async def api_resume(symbol: str | None = None) -> dict[str, Any]:
         """Resume symbol specific (?symbol=KAIAUSDT) sau toate (default)."""
-        from vse_bot.event_log import log_event
-        from vse_bot import telegram_bot as tg
+        from ichimoku_bot.event_log import log_event
+        from ichimoku_bot import telegram_bot as tg
         if symbol:
             was_paused = symbol in runner.paused_symbols
             runner.paused_symbols.discard(symbol)
             log_event(
-                runner.cfg.operational.log_dir, runner.sub_cfg.name,
+                runner.cfg.operational.log_dir, runner.cfg.portfolio.name,
                 "MANUAL_RESUME", source="/api/resume", symbol=symbol,
                 was_paused=was_paused,
             )
             if was_paused:
                 await tg.send(
                     f"▶️ RESUMED — {symbol}",
-                    f"Subaccount: <code>{runner.sub_cfg.name}</code>\n"
+                    f"Subaccount: <code>{runner.cfg.portfolio.name}</code>\n"
                     f"Symbol: <code>{symbol}</code> procesează din nou semnale."
                 )
         else:
@@ -224,34 +227,33 @@ def create_app(runner: "SubaccountRunner") -> FastAPI:
             resumed = sorted(runner.paused_symbols)
             runner.paused_symbols.clear()
             log_event(
-                runner.cfg.operational.log_dir, runner.sub_cfg.name,
+                runner.cfg.operational.log_dir, runner.cfg.portfolio.name,
                 "MANUAL_RESUME", source="/api/resume", scope="all",
                 was_paused=had_paused,
             )
             if had_paused:
                 await tg.send(
                     "▶️ BOT RESUMED (toate perechile)",
-                    f"Subaccount: <code>{runner.sub_cfg.name}</code>\n"
+                    f"Subaccount: <code>{runner.cfg.portfolio.name}</code>\n"
                     f"Pairs resumed: <code>{', '.join(resumed)}</code>"
                 )
         return {
             "paused_symbols": sorted(runner.paused_symbols),
-            "subaccount": runner.sub_cfg.name,
+            "subaccount": runner.cfg.portfolio.name,
         }
 
     @app.get("/api/state")
     async def api_state() -> dict[str, Any]:
         """Diagnostic snapshot pentru debug."""
         return {
-            "subaccount": runner.sub_cfg.name,
+            "subaccount": runner.cfg.portfolio.name,
             "paused": runner.paused,                         # backward-compat
             "paused_symbols": sorted(runner.paused_symbols),
             "state": {
-                "equity": runner.state.equity,
-                "balance_broker": runner.state.balance_broker,
-                "pool_used": runner.state.pool_used,
-                "cycle_num": runner.state.cycle_num,
-                "reset_count": runner.state.reset_count,
+                "account": runner.bot.account,
+                "initial_account": runner.bot.initial_account,
+                "shared_equity": runner.shared_equity,
+                "pool_total": runner.cfg.portfolio.pool_total,
             },
             "positions": {
                 sym: (

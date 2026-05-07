@@ -15,9 +15,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import ccxt.async_support as ccxt
 import pandas as pd
 
-from vse_bot.config import load_config
-from vse_bot.vse_signal_live import VSESignalLive
-from vse_bot.indicator import compute_indicators, build_signals
+from ichimoku_bot.config import load_config
+from ichimoku_bot.vse_signal_live import VSESignalLive
+from ichimoku_bot.indicator import compute_indicators, build_signals
 
 
 async def main() -> int:

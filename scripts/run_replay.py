@@ -19,8 +19,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from vse_bot.config import load_config
-from vse_bot.replay import run_replay
+from ichimoku_bot.config import load_config
+from ichimoku_bot.replay import run_replay
 
 
 def main() -> int:

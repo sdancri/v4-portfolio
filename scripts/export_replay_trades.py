@@ -12,8 +12,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 import pandas as pd
 
-from vse_bot.config import load_config
-from vse_bot.replay import run_replay
+from ichimoku_bot.config import load_config
+from ichimoku_bot.replay import run_replay
 
 
 _EXIT_REASON_MAP = {

@@ -1,56 +1,27 @@
-# Convenience: pornește ambii boți într-un singur stack (deploy local rapid).
-# Pentru Portainer recomandat: 2 stack-uri separate (compose.vse1.yml + compose.vse2.yml).
-#
-# Security: fiecare service primește DOAR credentials subaccount-ului lui.
+# ICHIMOKU bot — 1 portfolio (MNT+DOT pe acelasi subaccount Bybit).
+# Single-stack deploy. Pentru Portainer foloseste acest fisier ca stack content.
 
 services:
-  VSE_1:
-    image: sdancri/vse_1:latest
+  ichimoku:
+    image: sdancri/ichimoku:latest
     pull_policy: always
-    container_name: VSE_1
+    container_name: ichimoku
     restart: unless-stopped
     environment:
       - TZ=Europe/Bucharest
-      - SUBACCOUNT_NAME=subacc_1_kaia_aave
-      - BOT_NAME=VSE_1
-      - CHART_PORT=8101
+      - BOT_NAME=ichimoku_mnt_dot
+      - CHART_PORT=8103
       - TRADING_MODE=${TRADING_MODE:-live}
-      - BYBIT_API_KEY=${SUB1_API_KEY}
-      - BYBIT_API_SECRET=${SUB1_API_SECRET}
+      - BYBIT_API_KEY=${BYBIT_API_KEY}
+      - BYBIT_API_SECRET=${BYBIT_API_SECRET}
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
     ports:
-      - "8101:8101"
+      - "8103:8103"
     volumes:
-      - ./logs/sub1:/app/logs
+      - ./logs:/app/logs
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8101/api/status"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-      start_period: 45s
-
-  VSE_2:
-    image: sdancri/vse_2:latest
-    pull_policy: always
-    container_name: VSE_2
-    restart: unless-stopped
-    environment:
-      - TZ=Europe/Bucharest
-      - SUBACCOUNT_NAME=subacc_2_ont_eth
-      - BOT_NAME=VSE_2
-      - CHART_PORT=8102
-      - TRADING_MODE=${TRADING_MODE:-live}
-      - BYBIT_API_KEY=${SUB2_API_KEY}
-      - BYBIT_API_SECRET=${SUB2_API_SECRET}
-      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
-      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
-    ports:
-      - "8102:8102"
-    volumes:
-      - ./logs/sub2:/app/logs
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://localhost:8102/api/status"]
+      test: ["CMD", "curl", "-sf", "http://localhost:8103/api/status"]
       interval: 30s
       timeout: 5s
       retries: 3

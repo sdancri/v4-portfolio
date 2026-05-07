@@ -34,7 +34,7 @@ def _get_logger(log_dir: Path, subacc_name: str) -> logging.Logger:
     if subacc_name in _loggers:
         return _loggers[subacc_name]
     log_dir.mkdir(parents=True, exist_ok=True)
-    logger = logging.getLogger(f"vse_bot.{subacc_name}")
+    logger = logging.getLogger(f"ichimoku_bot.{subacc_name}")
     logger.setLevel(logging.INFO)
     logger.propagate = False    # nu trimite la root logger
     # Evită handler dublu dacă _get_logger e apelat din nou (caz rar)

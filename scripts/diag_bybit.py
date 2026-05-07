@@ -14,8 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from vse_bot.config import load_config
-from vse_bot.exchange.bybit_client import BybitClient
+from ichimoku_bot.config import load_config
+from ichimoku_bot.exchange.bybit_client import BybitClient
 
 
 async def main() -> int:
