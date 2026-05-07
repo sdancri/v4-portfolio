@@ -30,4 +30,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
     CMD curl -sf http://localhost:${CHART_PORT:-8103}/api/status || exit 1
 
 # `-u` unbuffered stdout (regula 14: dublu insurance peste PYTHONUNBUFFERED + line_buffering)
-CMD ["python", "-u", "scripts/run_live.py"]
+# CONFIG_FILE env var override (default config/config.yaml).
+# Pentru deploy multi-bot pe acelasi VPS, fiecare stack seteaza CONFIG_FILE
+# in env (ex CONFIG_FILE=config/config_ichi1.yaml pentru Ichi1).
+CMD ["sh", "-c", "python -u scripts/run_live.py --config ${CONFIG_FILE:-config/config.yaml}"]

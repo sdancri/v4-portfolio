@@ -20,7 +20,9 @@ class PortfolioConfig:
     """Setari globale portfolio (subaccount)."""
     name: str
     pool_total: float                   # capital initial pe subaccount (USDT)
-    leverage: int = 15
+    leverage: int = 15                  # default per-pair fallback
+    leverage_max: int = 12              # SAFETY cap pentru cap_usd calculation
+                                        # (cap pos notional la min(per_pair_lev, leverage_max))
     cap_pct_of_max: float = 0.95
     taker_fee: float = 0.00055
     slippage_bps: float = 0.0
@@ -84,6 +86,7 @@ def load_config(path: str | Path = "config/config.yaml") -> AppConfig:
         name=pf["name"],
         pool_total=float(pf["pool_total"]),
         leverage=int(pf.get("leverage", 15)),
+        leverage_max=int(pf.get("leverage_max", 12)),
         cap_pct_of_max=float(pf.get("cap_pct_of_max", 0.95)),
         taker_fee=float(pf.get("taker_fee", 0.00055)),
         slippage_bps=float(pf.get("slippage_bps", 0.0)),

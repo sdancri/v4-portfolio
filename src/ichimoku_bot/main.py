@@ -135,6 +135,50 @@ class IchimokuRunner:
     def shared_equity(self) -> float:
         return self.bot.account
 
+    # ── Equity sync cu Bybit (truth source) ──────────────────────────────
+    async def _sync_equity(self, source: str) -> None:
+        """Sync ``bot.account`` cu balance-ul real Bybit.
+
+        Bybit este TRUTH SOURCE; local e cache. Always override.
+        Telegram alert doar la drift > 1% din current equity (ignora fees mici).
+
+        Args:
+            source: "INIT" | "CLOSE" | "HEARTBEAT" — pentru log.
+        """
+        try:
+            real = await self.client.fetch_balance_usdt()
+        except Exception as e:
+            print(f"  [SYNC {source}] fetch_balance failed: {e}")
+            return
+        if real <= 0:
+            print(f"  [SYNC {source}] invalid balance ({real}), skip")
+            return
+        drift = real - self.bot.account
+        pct = abs(drift) / max(self.bot.account, 1.0) * 100
+        print(f"  [SYNC {source}] local=${self.bot.account:.2f} bybit=${real:.2f} "
+              f"drift=${drift:+.2f} ({pct:.2f}%)")
+        if abs(drift) > self.bot.account * 0.01:  # >1% drift = real anomalie
+            await tg.send(
+                f"⚠️ EQUITY DRIFT — {source}",
+                f"Local: <code>${self.bot.account:.2f}</code>\n"
+                f"Bybit: <code>${real:.2f}</code>\n"
+                f"Diff:  <code>${drift:+.2f}</code> ({pct:.2f}%)\n"
+                f"Local override → Bybit (truth source)",
+            )
+        self.bot.account = real
+
+    # ── Heartbeat task — periodic equity sync (60s default) ─────────────
+    async def heartbeat_loop(self) -> None:
+        interval = self.cfg.operational.heartbeat_interval_seconds
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                await self._sync_equity("HEARTBEAT")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"  [HEARTBEAT] error: {e}")
+
     # ── Setup ────────────────────────────────────────────────────────────
     async def setup(self) -> None:
         log_event(
@@ -180,6 +224,10 @@ class IchimokuRunner:
                 sig.warm_up(df)
             self.signals[pair_cfg.symbol] = sig
             self.positions[pair_cfg.symbol] = None
+
+        # STARTUP equity sync — Bybit balance e truth source.
+        # NU porni cu account = pool_total hardcoded; ia balance-ul real.
+        await self._sync_equity("INIT")
 
         # Telegram READY notice
         pairs_str = ", ".join(
@@ -525,6 +573,12 @@ class IchimokuRunner:
         self.bot.add_closed_trade(trade)
         self.positions[sym] = None
 
+        # Equity sync POST-CLOSE — Bybit e truth source.
+        # 1.5s delay: Bybit are lag intre fill execution si balance settlement.
+        # Fara delay, uneori prinzi balance-ul dinainte de creditarea PnL-ului.
+        await asyncio.sleep(1.5)
+        await self._sync_equity("CLOSE")
+
         # Broadcast position_close + trade_closed la chart — DOAR pe primary
         # pair (chart-ul afiseaza o singura pereche). trade_closed actualizeaza
         # panel-ul de trade-uri + equity curve in real-time.
@@ -676,6 +730,7 @@ async def run_live(config_path: str = "config/config.yaml") -> None:
             public_ws.run(),
             private_ws.run(),
             serve_chart(app, chart_port),
+            runner.heartbeat_loop(),       # B — periodic equity sync (60s)
         )
     finally:
         try:

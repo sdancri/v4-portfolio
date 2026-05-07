@@ -1,0 +1,74 @@
+# ICHI1 — Aggressive bot (SL=4% uniform, lev 20× per pair)
+# Triple: SUN + MNT + ILV — max PnL pe perioada lunga (30+ luni date)
+#
+# Backtest 2023-10-01 → 2026-04-25 (30.8 luni):
+#   Final $100 → $5.5M (Ann +6,930%/an), PF 1.50, DD -54%, n=1,178
+# 2026YTD (3.8 luni):
+#   $100 → $420 (+320%, PF 1.45, DD -35%)
+
+portfolio:
+  name: ichi1
+  pool_total: 100.0           # capital initial USDT (compound)
+  leverage: 15                # default fallback (perechile au override per-pair)
+  leverage_max: 12            # SAFETY cap pt cap_usd (notional max = 12× equity)
+                              # peste asta, botul refuza ordinul (skip signal)
+  cap_pct_of_max: 0.95
+  taker_fee: 0.00055
+  slippage_bps: 0.0
+
+pairs:
+  # SUN — discovery #1, edge dominant (Ann +1,082%/an solo)
+  - symbol: SUNUSDT
+    timeframe: 4h
+    enabled: true
+    leverage: 12              # SAFETY uniform (set_leverage 12× pe Bybit)
+    hull_length: 8            # short cycle (best individual)
+    tenkan_periods: 9
+    kijun_periods: 24         # ⚡ scurt (cycle rapid pe meme/volatile)
+    senkou_b_periods: 52
+    displacement: 24
+    risk_pct_per_trade: 0.07  # 7% × shared_equity
+    sl_initial_pct: 0.04      # ⚡ SL 4% uniform Ichi1
+    tp_pct: 0.50              # TP 50% — captures pump retracement (n=3 hits, asimetric favorabil)
+    max_hull_spread_pct: 2.0
+    max_close_kijun_dist_pct: 6.0
+
+  # MNT — sweep optim Return (din sweep complet 30.8mo, era SL=3% no TP)
+  - symbol: MNTUSDT
+    timeframe: 4h
+    enabled: true
+    leverage: 12              # SAFETY uniform (set_leverage 12× pe Bybit)
+    hull_length: 10           # ⚡ NEW vs current live (era 8)
+    tenkan_periods: 9
+    kijun_periods: 48
+    senkou_b_periods: 52      # ⚡ NEW (era 40)
+    displacement: 24
+    risk_pct_per_trade: 0.07
+    sl_initial_pct: 0.04      # ⚡ NEW (era 3%)
+    tp_pct: 0.05              # ⚡ NEW (era none) — n=99 hits, HIGH confidence edge
+    max_hull_spread_pct: 2.0
+    max_close_kijun_dist_pct: 6.0
+
+  # ILV — robust + high return (PF 1.60 standalone, +511% în 30 luni)
+  - symbol: ILVUSDT
+    timeframe: 4h
+    enabled: true
+    leverage: 12              # SAFETY uniform (max 20× pe Bybit dar folosim 12)
+    hull_length: 8
+    tenkan_periods: 9
+    kijun_periods: 36         # ⚡ scurt (cycle ILV intermediate)
+    senkou_b_periods: 40
+    displacement: 24
+    risk_pct_per_trade: 0.07
+    sl_initial_pct: 0.04
+    tp_pct: 0.12              # n=35 hits, 66% better than no-TP
+    max_hull_spread_pct: 2.0
+    max_close_kijun_dist_pct: 6.0
+
+operational:
+  max_concurrent_positions: 3 # 3 perechi pot fi open simultan
+  max_consecutive_api_errors: 5
+  heartbeat_interval_seconds: 60
+  save_state_interval_seconds: 300
+  state_dir: ./state
+  log_dir: ./logs

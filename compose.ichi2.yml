@@ -1,0 +1,34 @@
+# Stack ICHI2 — Aggressive-Limited bot (AERO + RSR + AKT @ SL=4%)
+# Port 8104. Subaccount Bybit: ichi2 (separate API key).
+
+services:
+  ichi2:
+    image: sdancri/ichimoku:latest
+    pull_policy: always
+    container_name: ichi2
+    restart: unless-stopped
+    environment:
+      - CONFIG_FILE=config/config_ichi2.yaml
+      - TRADING_MODE=${TRADING_MODE:-live}
+      - BYBIT_API_KEY=${BYBIT_API_KEY}
+      - BYBIT_API_SECRET=${BYBIT_API_SECRET}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TZ=Europe/Bucharest
+      - CHART_TZ=${CHART_TZ:-Europe/Bucharest}
+      - BOT_NAME=ichi2
+      - STRATEGY_NAME=Hull+Ichimoku
+      - CHART_PORT=8104
+      - RATE_LIMIT_PER_SEC=${RATE_LIMIT_PER_SEC:-5}
+      - RATE_LIMIT_BURST=${RATE_LIMIT_BURST:-10}
+      - MAKER_ENTRY_TIMEOUT_SEC=${MAKER_ENTRY_TIMEOUT_SEC:-5}
+    ports:
+      - "8104:8104"
+    volumes:
+      - ./logs/ichi2:/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8104/api/status || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s

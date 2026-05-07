@@ -352,7 +352,7 @@ if cfg:
             assert r.leverage == eff_lev
             assert r.risk_usd == p.risk_pct_per_trade * equity
             assert abs(r.pos_usd - r.risk_usd / p.sl_initial_pct) < 0.01
-            assert r.cap_usd == cfg.portfolio.cap_pct_of_max * equity * eff_lev
+            assert r.cap_usd == cfg.portfolio.cap_pct_of_max * equity * cfg.portfolio.leverage_max
             ok(f"{p.symbol}: lev={r.leverage}× risk=${r.risk_usd:.2f} "
                f"pos=${r.pos_usd:.2f} ({r.pos_usd/equity:.2f}× eq) cap=${r.cap_usd:.2f}")
             PASSED += 1

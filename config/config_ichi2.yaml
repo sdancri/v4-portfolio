@@ -1,0 +1,73 @@
+# ICHI2 — Aggressive-Limited bot (SL=4% uniform, lev 20× per pair)
+# Triple: AERO + RSR + AKT — best 2026YTD performer cu DD<50%
+#
+# Backtest 2024-07-15 → 2026-04-25 (21.3 luni):
+#   Final $100 → $77,884, PF 1.60, DD -55%, n=442
+# 2026YTD (3.8 luni):
+#   $100 → $408 (+308%, PF 1.59, DD -29%)
+
+portfolio:
+  name: ichi2
+  pool_total: 100.0
+  leverage: 15                # default fallback (per-pair override)
+  leverage_max: 12            # SAFETY cap pt cap_usd (notional max = 12× equity)
+  cap_pct_of_max: 0.95
+  taker_fee: 0.00055
+  slippage_bps: 0.0
+
+pairs:
+  # AERO — high PF stable (1.78 standalone, DD -15-37%)
+  - symbol: AEROUSDT
+    timeframe: 4h
+    enabled: true
+    leverage: 12              # SAFETY uniform (set_leverage 12× pe Bybit)
+    hull_length: 10
+    tenkan_periods: 9
+    kijun_periods: 60         # ⚡ long cycle (best for AERO)
+    senkou_b_periods: 26
+    displacement: 24
+    risk_pct_per_trade: 0.07
+    sl_initial_pct: 0.04
+    tp_pct: 0.20              # n=8 hits, asimetric favorabil
+    max_hull_spread_pct: 2.0
+    max_close_kijun_dist_pct: 6.0
+
+  # RSR — WR 47.5% standalone (cea mai mare!), TP=5% compound boost
+  - symbol: RSRUSDT
+    timeframe: 4h
+    enabled: true
+    leverage: 12              # SAFETY uniform (set_leverage 12× pe Bybit)
+    hull_length: 10
+    tenkan_periods: 9
+    kijun_periods: 60
+    senkou_b_periods: 52
+    displacement: 24
+    risk_pct_per_trade: 0.07
+    sl_initial_pct: 0.04
+    tp_pct: 0.05              # n=78 hits — frecvent (compound benefit in combo)
+    max_hull_spread_pct: 2.0
+    max_close_kijun_dist_pct: 6.0
+
+  # AKT — DD ultra-mic (-13% solo), 81% TP better-than-noTP
+  - symbol: AKTUSDT
+    timeframe: 4h
+    enabled: true
+    leverage: 12              # SAFETY uniform (set_leverage 12× pe Bybit)
+    hull_length: 8
+    tenkan_periods: 9
+    kijun_periods: 60
+    senkou_b_periods: 52
+    displacement: 24
+    risk_pct_per_trade: 0.07
+    sl_initial_pct: 0.04
+    tp_pct: 0.08              # n=31 hits, 81% better than no-TP — HIGH confidence
+    max_hull_spread_pct: 2.0
+    max_close_kijun_dist_pct: 6.0
+
+operational:
+  max_concurrent_positions: 3
+  max_consecutive_api_errors: 5
+  heartbeat_interval_seconds: 60
+  save_state_interval_seconds: 300
+  state_dir: ./state
+  log_dir: ./logs

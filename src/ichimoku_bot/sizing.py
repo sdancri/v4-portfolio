@@ -1,15 +1,20 @@
 """Position sizing pentru ICHIMOKU bot.
 
-Formula (per-pair):
-    risk_usd = risk_pct_per_trade × shared_equity        (ex 7% × $100 = $7)
-    pos_usd  = risk_usd / sl_initial_pct                 (ex $7 / 0.05 = $140)
-    cap_usd  = cap_pct_of_max × balance_broker × leverage  (Bybit max margin)
+Formula:
+    risk_usd = risk_pct_per_trade × shared_equity   (ex 7% × $100 = $7)
+    pos_usd  = risk_usd / sl_initial_pct            (ex $7 / 0.04 = $175)
+    cap_usd  = cap_pct_of_max × balance × leverage_max
+               (ex 0.95 × $100 × 12 = $1,140)
 
-Leverage e PER-PAIR (ex MNT=20x, DOT=7x). Cap-ul Bybit reflecta limita
-notional max acceptata pentru pereche; poate fi sub limita portfolio default.
+DOUA leverage diferite, scopuri DIFERITE:
+  - ``per-pair leverage`` (ex MNT=20×): folosit DOAR la ``set_leverage`` API call
+    pe Bybit (cere broker-ului sa-i aloce X× margin pe acel symbol).
+  - ``leverage_max`` (ex 12×): SAFETY cap intern al botului — limita notional
+    pos in ``cap_usd``. Indiferent ce permite Bybit (20×, 25×), botul NU
+    deschide pozitii cu notional > 12× equity.
 
 Daca ``pos_usd > cap_usd``:
-    Bybit ar refuza ordinul → skip signal complet (returneaza None).
+    Botul forteaza skip signal → returneaza None.
 """
 
 from __future__ import annotations
@@ -48,9 +53,11 @@ def compute_position_size(
         raise ValueError(f"sl_initial_pct must be > 0, got {sl_pct}")
 
     eff_leverage = leverage if leverage is not None else portfolio_cfg.leverage
+    # Cap_usd foloseste DOAR leverage_max (safety cap intern), NU per-pair lev.
+    # per-pair lev se foloseste DOAR la set_leverage API call.
     risk_usd = pair_cfg.risk_pct_per_trade * shared_equity
     pos_usd = risk_usd / sl_pct
-    cap_usd = portfolio_cfg.cap_pct_of_max * balance_broker * eff_leverage
+    cap_usd = portfolio_cfg.cap_pct_of_max * balance_broker * portfolio_cfg.leverage_max
 
     if pos_usd > cap_usd:
         return None

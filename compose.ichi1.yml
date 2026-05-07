@@ -1,0 +1,34 @@
+# Stack ICHI1 — Aggressive bot (SUN + MNT + ILV @ SL=4%)
+# Port 8103. Subaccount Bybit: ichi1 (separate API key).
+
+services:
+  ichi1:
+    image: sdancri/ichimoku:latest
+    pull_policy: always
+    container_name: ichi1
+    restart: unless-stopped
+    environment:
+      - CONFIG_FILE=config/config_ichi1.yaml
+      - TRADING_MODE=${TRADING_MODE:-live}
+      - BYBIT_API_KEY=${BYBIT_API_KEY}
+      - BYBIT_API_SECRET=${BYBIT_API_SECRET}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TZ=Europe/Bucharest
+      - CHART_TZ=${CHART_TZ:-Europe/Bucharest}
+      - BOT_NAME=ichi1
+      - STRATEGY_NAME=Hull+Ichimoku
+      - CHART_PORT=8103
+      - RATE_LIMIT_PER_SEC=${RATE_LIMIT_PER_SEC:-5}
+      - RATE_LIMIT_BURST=${RATE_LIMIT_BURST:-10}
+      - MAKER_ENTRY_TIMEOUT_SEC=${MAKER_ENTRY_TIMEOUT_SEC:-5}
+    ports:
+      - "8103:8103"
+    volumes:
+      - ./logs/ichi1:/app/logs
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8103/api/status || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s
