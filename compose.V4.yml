@@ -26,7 +26,8 @@ services:
       - CHART_TZ=${CHART_TZ:-Europe/Bucharest}
       - BOT_NAME=V4
       - STRATEGY_NAME=BB-MR + Hull+Ichimoku
-      - CHART_PORT=8104
+      - CHART_PORT=8104          # port intern container (FastAPI listen)
+      - CHART_HOST_PORT=8107     # port host (afisat in Telegram, link chart)
       - DATA_DIR=/app/data
       - RESET_TOKEN=${RESET_TOKEN:-}
       - RATE_LIMIT_PER_SEC=${RATE_LIMIT_PER_SEC:-5}

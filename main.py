@@ -82,6 +82,9 @@ CLI = _args.parse_args()
 CONFIG: AppConfig = load_config(CLI.config)
 BOT_NAME = os.getenv("BOT_NAME", CONFIG.portfolio.name)
 CHART_PORT = int(os.getenv("CHART_PORT", "8104"))
+# Port host pentru link Telegram (Docker port mapping host:container poate diferi
+# de portul intern). Default = CHART_PORT cand nu e mapping.
+CHART_HOST_PORT = int(os.getenv("CHART_HOST_PORT", str(CHART_PORT)))
 CHART_TZ = os.getenv("CHART_TZ", "Europe/Bucharest")
 
 # Static files for chart
@@ -974,7 +977,7 @@ async def bootstrap() -> None:
         f"<b>Pairs:</b> {pairs_label}\n"
         f"<b>Account init:</b> ${_state.initial_account:,.2f}\n"
         f"<b>Started:</b> {tg.fmt_time(_state.start_utc)}\n"
-        f"<b>Chart:</b> port {CHART_PORT}",
+        f"<b>Chart:</b> port {CHART_HOST_PORT}",
     )
 
 
