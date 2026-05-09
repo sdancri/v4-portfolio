@@ -1,0 +1,309 @@
+//@version=6
+// =============================================================================
+// V4 Portfolio bot — Multi-Strategy 4h (port direct din Python live)
+// -----------------------------------------------------------------------------
+// Scop: validare side-by-side a tradeurilor LIVE bot contra TradingView.
+//
+// PRESET selector — alege perechea, settings + strategy auto-fill:
+//   BTC  → BB Mean Reversion (bb_mr)
+//   TIA  → Hull+Ichimoku (hi)
+//   NEAR → Hull+Ichimoku (hi)
+//   CUSTOM → override manual
+//
+// Strategie identica cu strategies/{ichimoku,bb_mr}_signal.py.
+// SL/TP delegated la strategy.exit() (intra-bar trigger ca Bybit setTradingStop).
+//
+// Atasare: BYBIT:<SYMBOL>.P pe TF 4h. Sizing irelevant (bot foloseste Python
+// risk/sl/leverage; Pine doar valideaza tradeuri & timing).
+// =============================================================================
+
+strategy(
+   "V4 Portfolio — Multi-Strategy 4h",
+   overlay              = true,
+   initial_capital      = 100,
+   default_qty_type     = strategy.cash,
+   default_qty_value    = 100,
+   currency             = currency.USD,
+   commission_type      = strategy.commission.percent,
+   commission_value     = 0.055,
+   slippage             = 0,
+   pyramiding           = 0,
+   margin_long          = 10.0,         // 10× leverage simulation (100/10)
+   margin_short         = 10.0,
+   calc_on_every_tick   = false,
+   calc_on_order_fills  = false,
+   process_orders_on_close = true,      // entry/exit la close-ul barei (match live)
+   close_entries_rule   = "ANY"
+)
+
+// ── PRESET selector ────────────────────────────────────────────────────────
+preset = input.string("BTC", "Pair preset",
+   options=["BTC","TIA","NEAR","CUSTOM"],
+   group="Preset")
+
+// Derive strategy auto-fill per preset (match config_v4.yaml)
+strategy_auto = switch preset
+    "BTC"  => "bb_mr"
+    "TIA"  => "hi"
+    "NEAR" => "hi"
+    => "hi"
+
+strategy_override = input.string("auto", "Strategy override (CUSTOM)",
+   options=["auto","hi","bb_mr"], group="Preset")
+strategy_use = preset == "CUSTOM" and strategy_override != "auto" ? strategy_override : strategy_auto
+
+// =========================================================================
+// HULL+ICHIMOKU param defaults per preset
+// =========================================================================
+hull_default = switch preset
+    "TIA"  => 12
+    "NEAR" => 24
+    => 12
+
+kijun_default = switch preset
+    "TIA"  => 60
+    "NEAR" => 48
+    => 48
+
+snkb_default = switch preset
+    "TIA"  => 52
+    "NEAR" => 40
+    => 40
+
+hi_sl_default = 5.0   // HI standard la 5% SL
+hi_tp_default = 0.0   // null in YAML → 0% (signal exit only)
+
+// =========================================================================
+// BB MEAN REVERSION param defaults per preset
+// =========================================================================
+bb_len_default = switch preset
+    "BTC" => 26
+    => 26
+
+bb_std_default = switch preset
+    "BTC" => 3.0
+    => 3.0
+
+bb_sl_default = 6.0   // BTC SL larger (BB outliers tolerance)
+bb_tp_rr_default = 1.75
+bb_max_bars_default = 40
+rsi_oversold_default = 20.0
+rsi_overbought_default = 80.0
+
+// ── INPUTS (CUSTOM-only override-uibile) ──────────────────────────────────
+g_hi = "Hull+Ichimoku params (CUSTOM only)"
+hull_custom    = input.int(12, "Hull Length",  minval=2, group=g_hi)
+tenkan_periods = input.int(9,  "Tenkan",       minval=2, group=g_hi)
+kijun_custom   = input.int(48, "Kijun",        minval=2, group=g_hi)
+snkb_custom    = input.int(40, "Senkou B",     minval=2, group=g_hi)
+displacement   = input.int(24, "Displacement", minval=2, group=g_hi)
+
+g_bb = "BB Mean Reversion params (CUSTOM only)"
+bb_len_custom     = input.int(26, "BB Length", minval=5, group=g_bb)
+bb_std_custom     = input.float(3.0, "BB StDev", minval=0.5, step=0.1, group=g_bb)
+rsi_length        = input.int(14, "RSI Length", minval=2, group=g_bb)
+rsi_oversold_in   = input.float(20.0, "RSI Oversold", minval=0, step=1, group=g_bb)
+rsi_overbought_in = input.float(80.0, "RSI Overbought", maxval=100, step=1, group=g_bb)
+bb_tp_rr_custom   = input.float(1.75, "TP R:R (BB MR)", minval=0.1, step=0.1, group=g_bb)
+bb_max_bars_custom = input.int(40, "Max bars in trade (BB MR)", minval=1, group=g_bb)
+
+g_filter = "Filtre Hull+Ichimoku Setup G"
+max_hull_spread = input.float(2.0, "Max Hull spread %", minval=0.0, step=0.1, group=g_filter)
+max_kj_dist     = input.float(6.0, "Max close-Kijun %", minval=0.0, step=0.1, group=g_filter)
+
+g_risk = "Sizing & Exit"
+risk_pct   = input.float(10.0, "Risk per trade %",   minval=0.1, step=0.1, group=g_risk)
+sl_custom_hi = input.float(5.0, "SL HI % (CUSTOM)",  minval=0.1, step=0.1, group=g_risk)
+sl_custom_bb = input.float(6.0, "SL BB MR % (CUSTOM)", minval=0.1, step=0.1, group=g_risk)
+tp_custom_hi = input.float(0.0, "TP HI % (CUSTOM, 0=off)", minval=0.0, step=0.1, group=g_risk)
+leverage   = input.int(10,     "Leverage_max (cap)", minval=1, group=g_risk)
+cap_pct    = input.float(0.95, "Cap pct of max",     minval=0.1, step=0.05, group=g_risk)
+
+g_plot = "Plot"
+show_cloud  = input.bool(true, "HI: Cloud (Senkou A/B)", group=g_plot)
+show_chikou = input.bool(true, "HI: Chikou",             group=g_plot)
+show_hull   = input.bool(true, "HI: Hull n1",            group=g_plot)
+show_tk_kj  = input.bool(true, "HI: Tenkan / Kijun",     group=g_plot)
+show_bb     = input.bool(true, "BB MR: Bollinger Bands", group=g_plot)
+
+g_date = "Date Range"
+start_date = input.time(timestamp("2024-01-01 00:00 +0000"), "Start Date", group=g_date)
+end_date   = input.time(timestamp("2030-01-01 00:00 +0000"), "End Date",   group=g_date)
+
+g_debug = "Debug"
+show_debug = input.bool(false, "Debug entry/skip labels", group=g_debug)
+show_info  = input.bool(true,  "Info label (active settings)", group=g_debug)
+
+// Final values per preset (CUSTOM = override; else auto-fill)
+hull_length   = preset == "CUSTOM" ? hull_custom   : hull_default
+kijun_periods = preset == "CUSTOM" ? kijun_custom  : kijun_default
+senkou_b_len  = preset == "CUSTOM" ? snkb_custom   : snkb_default
+bb_length     = preset == "CUSTOM" ? bb_len_custom : bb_len_default
+bb_std        = preset == "CUSTOM" ? bb_std_custom : bb_std_default
+bb_tp_rr      = preset == "CUSTOM" ? bb_tp_rr_custom : bb_tp_rr_default
+bb_max_bars   = preset == "CUSTOM" ? bb_max_bars_custom : bb_max_bars_default
+rsi_oversold   = preset == "CUSTOM" ? rsi_oversold_in   : rsi_oversold_default
+rsi_overbought = preset == "CUSTOM" ? rsi_overbought_in : rsi_overbought_default
+
+sl_pct_hi   = preset == "CUSTOM" ? sl_custom_hi : hi_sl_default
+sl_pct_bb   = preset == "CUSTOM" ? sl_custom_bb : bb_sl_default
+tp_pct_hi   = preset == "CUSTOM" ? tp_custom_hi : hi_tp_default
+
+// SL effective per strategy (sizing + exit)
+sl_pct = strategy_use == "bb_mr" ? sl_pct_bb : sl_pct_hi
+
+in_date_range = time >= start_date and time <= end_date
+
+// =========================================================================
+// HULL+ICHIMOKU INDICATORS (identic cu Python ichimoku_signal.py)
+// =========================================================================
+hull_half = math.max(1, hull_length / 2)
+hull_sqn  = math.max(1, int(math.sqrt(hull_length)))
+n1 = ta.wma(2 * ta.wma(close, hull_half) - ta.wma(close, hull_length), hull_sqn)
+n2 = n1[1]                                          // HMA pe close[1] = n1 lagged 1
+
+tk = (ta.highest(high, tenkan_periods) + ta.lowest(low, tenkan_periods)) / 2
+kj = (ta.highest(high, kijun_periods)  + ta.lowest(low, kijun_periods))  / 2
+
+sa = (tk + kj) / 2
+sb = (ta.highest(high, senkou_b_len) + ta.lowest(low, senkou_b_len)) / 2
+
+// shift = displacement - 1 (match Python ichimoku_signal.py:118)
+shift = displacement - 1
+senkou_h = math.max(sa[shift], sb[shift])
+senkou_l = math.min(sa[shift], sb[shift])
+chikou   = close[shift]
+
+// HI Filters Setup G (identic Python passes_filters())
+hull_spread_pct = math.abs(n1 - n2) / close * 100
+kj_dist_pct     = math.abs(close - kj) / close * 100
+hi_filt_ok      = hull_spread_pct <= max_hull_spread and kj_dist_pct <= max_kj_dist
+
+// HI Entry/Close signals (identic Python _long/_short_entry, _close_*)
+hi_ready = not na(n1) and not na(n2) and not na(tk) and not na(kj) and not na(senkou_h) and not na(senkou_l) and not na(chikou)
+hi_long_entry  = hi_ready and n1 > n2 and close > n2 and close > chikou and close > senkou_h and (tk >= kj or close > kj)
+hi_short_entry = hi_ready and n1 < n2 and close < n2 and close < chikou and close < senkou_l and (tk <= kj or close < kj)
+hi_close_long  = hi_ready and n1 < n2 and (close < n2 or tk < kj or close < tk or close < kj or close < senkou_h or close < chikou)
+hi_close_short = hi_ready and n1 > n2 and (close > n2 or tk > kj or close > tk or close > kj or close > senkou_l or close > chikou)
+
+// =========================================================================
+// BB MEAN REVERSION INDICATORS (identic Python bb_mr_signal.py)
+// =========================================================================
+bb_mid   = ta.sma(close, bb_length)
+bb_sd    = ta.stdev(close, bb_length)
+bb_upper = bb_mid + bb_sd * bb_std
+bb_lower = bb_mid - bb_sd * bb_std
+rsi_v    = ta.rsi(close, rsi_length)
+
+bb_ready = not na(bb_mid) and not na(rsi_v)
+
+// BB MR Entry: cross-back through outer band + RSI extrem
+cross_up_lower = bb_ready and close[1] < bb_lower[1] and close >= bb_lower
+cross_dn_upper = bb_ready and close[1] > bb_upper[1] and close <= bb_upper
+bb_long_entry  = cross_up_lower and rsi_v < (rsi_oversold + 10)
+bb_short_entry = cross_dn_upper and rsi_v > (rsi_overbought - 10)
+
+// =========================================================================
+// STRATEGY DISPATCH per pereche
+// =========================================================================
+in_long  = strategy.position_size > 0
+in_short = strategy.position_size < 0
+flat     = strategy.position_size == 0
+
+// Sizing common: risk_pct × equity / sl_pct
+risk_usd     = strategy.equity * risk_pct / 100.0
+pos_usd_raw  = risk_usd / (sl_pct / 100.0)
+cap_usd      = cap_pct * strategy.equity * leverage
+sizing_skip  = pos_usd_raw > cap_usd
+qty_calc     = math.max(0.0, pos_usd_raw / close)
+
+// Bars-in-trade counter (BB MR time exit)
+var int bars_held = 0
+if flat
+    bars_held := 0
+else
+    bars_held += 1
+
+// Final entry/exit signals dispatched by strategy
+is_hi  = strategy_use == "hi"
+is_bb  = strategy_use == "bb_mr"
+
+long_entry  = (is_hi  and hi_long_entry  and hi_filt_ok) or (is_bb and bb_long_entry)
+short_entry = (is_hi  and hi_short_entry and hi_filt_ok) or (is_bb and bb_short_entry)
+
+// HI: signal exit. BB MR: time exit on max_bars (SL/TP via strategy.exit native intra-bar).
+close_long_sig  = (is_hi and hi_close_long)  or (is_bb and bars_held >= bb_max_bars)
+close_short_sig = (is_hi and hi_close_short) or (is_bb and bars_held >= bb_max_bars)
+
+// EXITS pe pozitia deschisa (signal-flip / time-exit → market close at bar close)
+if in_long and close_long_sig
+    strategy.close("L", comment="SIG")
+
+if in_short and close_short_sig
+    strategy.close("S", comment="SIG")
+
+// ENTRIES — confirmed bar, signal, no pos, sizing OK, in date range
+can_enter_long  = long_entry  and flat and not sizing_skip and qty_calc > 0 and in_date_range
+can_enter_short = short_entry and flat and not sizing_skip and qty_calc > 0 and in_date_range
+
+if can_enter_long
+    sl_l = close * (1 - sl_pct / 100.0)
+    // TP: BB MR at sl × tp_rr; HI at tp_pct (na if 0)
+    tp_l = is_bb ? close * (1 + (sl_pct / 100.0) * bb_tp_rr) : (tp_pct_hi > 0 ? close * (1 + tp_pct_hi / 100.0) : na)
+    strategy.entry("L", strategy.long, qty=qty_calc)
+    strategy.exit("L_X", "L", stop=sl_l, limit=tp_l)
+
+if can_enter_short
+    sl_s = close * (1 + sl_pct / 100.0)
+    tp_s = is_bb ? close * (1 - (sl_pct / 100.0) * bb_tp_rr) : (tp_pct_hi > 0 ? close * (1 - tp_pct_hi / 100.0) : na)
+    strategy.entry("S", strategy.short, qty=qty_calc)
+    strategy.exit("S_X", "S", stop=sl_s, limit=tp_s)
+
+// =========================================================================
+// PLOTS — branched per strategy
+// =========================================================================
+// HI plots
+plot(is_hi and show_hull   ? n1 : na, "Hull n1",  color=color.new(color.orange, 0), linewidth=2)
+plot(is_hi and show_tk_kj  ? tk : na, "Tenkan",   color=color.new(color.blue,   0))
+plot(is_hi and show_tk_kj  ? kj : na, "Kijun",    color=color.new(color.red,    0))
+
+sa_plot = plot(is_hi and show_cloud ? sa : na, "Senkou A", color=color.new(color.green, 70), offset=shift)
+sb_plot = plot(is_hi and show_cloud ? sb : na, "Senkou B", color=color.new(color.red,   70), offset=shift)
+fill(sa_plot, sb_plot, color = sa > sb ? color.new(color.green, 85) : color.new(color.red, 85))
+
+plot(is_hi and show_chikou ? close : na, "Chikou", color=color.new(color.purple, 0), offset=-shift)
+
+// BB MR plots
+plot(is_bb and show_bb ? bb_mid   : na, "BB Mid",   color=color.new(color.purple, 0), linewidth=1)
+plot(is_bb and show_bb ? bb_upper : na, "BB Upper", color=color.new(color.gray, 0),   linewidth=1)
+plot(is_bb and show_bb ? bb_lower : na, "BB Lower", color=color.new(color.gray, 0),   linewidth=1)
+
+// =========================================================================
+// DEBUG labels (optional)
+// =========================================================================
+if show_debug and (long_entry or short_entry)
+    side_str = long_entry ? "L" : "S"
+    reasons = ""
+    reasons := flat              ? reasons : reasons + "in_pos "
+    reasons := not sizing_skip   ? reasons : reasons + "cap "
+    reasons := qty_calc > 0      ? reasons : reasons + "qty0 "
+    if is_hi
+        reasons := hi_filt_ok    ? reasons : reasons + "hi_filt "
+    label_color = reasons == "" ? (long_entry ? color.green : color.red) : color.gray
+    label_txt = reasons == "" ? side_str + " ENTRY" : side_str + " skip: " + reasons
+    label.new(bar_index, low, text=label_txt, color=label_color, textcolor=color.white,
+              style=label.style_label_up, size=size.tiny, yloc=yloc.belowbar)
+
+// =========================================================================
+// INFO LABEL: valori active per strategie
+// =========================================================================
+var label info_lbl = na
+if show_info
+    line1 = "Preset: " + preset + "  |  Strategy: " + strategy_use
+    line2 = is_hi  ? "Hull/Kj/SnkB: " + str.tostring(hull_length) + "/" + str.tostring(kijun_periods) + "/" + str.tostring(senkou_b_len) : "BB(" + str.tostring(bb_length) + "," + str.tostring(bb_std, "#.#") + ")  RSI(" + str.tostring(rsi_oversold, "#.#") + "/" + str.tostring(rsi_overbought, "#.#") + ")"
+    line3 = is_bb ? "SL/TP_RR: " + str.tostring(sl_pct, "#.#") + "% / " + str.tostring(bb_tp_rr, "#.##") + "R  (max_bars " + str.tostring(bb_max_bars) + ")" : "SL/TP: " + str.tostring(sl_pct, "#.#") + "% / " + str.tostring(tp_pct_hi, "#.#") + "%"
+    line4 = "Risk: " + str.tostring(risk_pct, "#.#") + "%  Lev: " + str.tostring(leverage) + "x"
+    info_txt = line1 + "\n" + line2 + "\n" + line3 + "\n" + line4
+    if not na(info_lbl)
+        label.delete(info_lbl)
+    info_lbl := label.new(bar_index, high, text=info_txt, color=color.new(color.blue, 20), textcolor=color.white, style=label.style_label_left, size=size.normal)

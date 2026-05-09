@@ -1,0 +1,37 @@
+# V4 portfolio bot — multi-strategy (BB MR + Hull+Ichimoku, 4h)
+# Port 8104. Subaccount Bybit: V4 (separate API key).
+# Reset profit MANUAL la $5K (user marcheaza profitul + reset).
+
+services:
+  V4:
+    image: sdancri/v4_portfolio:latest
+    pull_policy: always
+    container_name: V4
+    restart: unless-stopped
+    environment:
+      - CONFIG_FILE=config/config_v4.yaml
+      - BYBIT_API_KEY=${BYBIT_API_KEY}
+      - BYBIT_API_SECRET=${BYBIT_API_SECRET}
+      - BYBIT_TESTNET=${BYBIT_TESTNET:-0}
+      - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+      - TZ=Europe/Bucharest
+      - CHART_TZ=${CHART_TZ:-Europe/Bucharest}
+      - BOT_NAME=V4
+      - STRATEGY_NAME=BB-MR + Hull+Ichimoku
+      - CHART_PORT=8104
+      - DATA_DIR=/app/data
+      - RESET_TOKEN=${RESET_TOKEN:-}
+      - RATE_LIMIT_PER_SEC=${RATE_LIMIT_PER_SEC:-5}
+      - RATE_LIMIT_BURST=${RATE_LIMIT_BURST:-10}
+    ports:
+      - "8104:8104"
+    volumes:
+      - ./logs/V4:/app/logs
+      - ./data/V4:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8104/api/status || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 45s

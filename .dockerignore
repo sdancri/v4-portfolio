@@ -28,15 +28,10 @@ state/
 *.csv
 
 # Dev-only scripts (nu ruleaza in container)
-scripts/backtest.py
+scripts/backtest_v4.py
+scripts/backtest_v4_multi.py
 scripts/smoke_test.py
-scripts/compare_pine_python.py
-scripts/diag_bybit.py
-scripts/preflight_check.py
-scripts/export_replay_trades.py
-scripts/run_replay.py
-scripts/test_ont_live.py
-scripts/test_ont_replicate_container.py
+results/
 
 # Tests
 tests/

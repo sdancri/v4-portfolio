@@ -2,7 +2,7 @@
 <html lang="ro">
 <head>
 <meta charset="UTF-8">
-<title>Trading Bot — Live Chart</title>
+<title>Ichimoku2 — Live Chart</title>
 <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 <style>
   :root {
@@ -15,6 +15,7 @@
     --red:       #ff3352;
     --yellow:    #ffd700;
     --blue:      #3399ff;
+    --orange:    #ff8c00;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -84,6 +85,20 @@
   }
   .tbtn.on { background: #1a3a6b; border-color: var(--blue); color: #fff; }
 
+  /* Symbol pills - more prominent than dropdown */
+  .sym-pills { display: flex; gap: 4px; }
+  .sym-pill {
+    padding: 3px 10px; border-radius: 4px; border: 1px solid var(--border);
+    background: var(--surface); color: var(--dim); font-size: 11px;
+    cursor: pointer; user-select: none; font-family: inherit; font-weight: 600;
+  }
+  .sym-pill.active { background: var(--orange); border-color: var(--orange);
+                     color: #0b0e17; }
+  .sym-pill .has-pos {
+    display: inline-block; width: 6px; height: 6px; border-radius: 50%;
+    background: var(--green); margin-left: 5px; vertical-align: middle;
+  }
+
   /* --- Layout ------------------------------------------------------ */
   #main { display: flex; flex: 1; overflow: hidden; min-height: 0; }
   #charts-col { flex: 1; display: flex; flex-direction: column;
@@ -96,7 +111,7 @@
     color: var(--dim); z-index: 5; pointer-events: none;
   }
 
-  /* --- uPnL badge (live during active position) -------------------- */
+  /* --- uPnL badge -------------------------------------------------- */
   #upnl-badge {
     position: absolute; top: 6px; left: 50%; transform: translateX(-50%);
     z-index: 10; padding: 6px 14px; border-radius: 5px;
@@ -123,7 +138,7 @@
 
   /* --- Sidebar ----------------------------------------------------- */
   #side-panel {
-    width: 300px; flex-shrink: 0; background: var(--surface);
+    width: 320px; flex-shrink: 0; background: var(--surface);
     border-left: 1px solid var(--border);
     display: flex; flex-direction: column; overflow: hidden;
   }
@@ -178,27 +193,30 @@
 </head>
 <body>
 
-<!-- Loading overlay (ascuns dupa loadInit) -->
+<!-- Loading overlay -->
 <div id="loading">
   <div class="spinner"></div>
-  <p>Se incarca datele istorice...</p>
+  <p>Se incarca datele...</p>
   <span id="load-status"></span>
 </div>
 
 <div id="header-bar">
   <div id="chart-title"><span id="title-text">loading…</span></div>
   <div class="kv-group">
-    <div class="kv"><span class="k">Account</span><span class="v yel" id="hdr-account">—</span></div>
+    <div class="kv"><span class="k">Equity</span><span class="v yel" id="hdr-account">—</span></div>
     <div class="kv"><span class="k">Return</span> <span class="v"     id="hdr-return">—</span></div>
     <div class="kv"><span class="k">uPnL</span>   <span class="v"     id="hdr-upnl">—</span></div>
-    <div class="kv"><span class="k">Lista trade-uri</span> <span class="v"     id="hdr-trades">—</span></div>
+    <div class="kv"><span class="k">Trades</span> <span class="v"     id="hdr-trades">—</span></div>
     <div class="kv"><span class="k">Win %</span>  <span class="v"     id="hdr-wr">—</span></div>
+    <div class="kv"><span class="k">Open</span>   <span class="v yel" id="hdr-open">—</span></div>
     <div class="kv"><span class="k">Price</span>  <span class="v yel" id="hdr-price">—</span></div>
   </div>
   <span id="live-badge">● OFFLINE</span>
 </div>
 
 <div id="controls">
+  <span class="sym-pills" id="sym-pills"></span>
+  <span style="width:1px;height:20px;background:var(--border);margin:0 6px"></span>
   <label>Dir: <select id="selDir">
     <option value="all">Toate</option>
     <option value="L">Long</option>
@@ -206,15 +224,16 @@
   </select></label>
   <label>Motiv: <select id="selReason">
     <option value="all">Toate</option>
-    <option value="TP">TP</option>
-    <option value="SL">SL</option>
-    <option value="EOD">EOD</option>
-    <option value="MANUAL">Manual</option>
+    <option value="BYBIT_TP">Bybit TP</option>
+    <option value="BYBIT_SL">Bybit SL</option>
+    <option value="SIGNAL">Signal flip</option>
+    <option value="EXTERNAL">External</option>
   </select></label>
   <button class="tbtn on" id="bEntry">Entries</button>
   <button class="tbtn on" id="bExit" >Exits</button>
   <button class="tbtn on" id="bSL"   >SL lines</button>
   <button class="tbtn on" id="bTP"   >TP lines</button>
+  <button class="tbtn on" id="bInd"  >Indicators</button>
 </div>
 
 <div id="main">
@@ -225,7 +244,7 @@
       <div id="chart"></div>
     </div>
     <div id="wrap-equity">
-      <div class="chart-lbl">Equity ($)</div>
+      <div class="chart-lbl">Equity portofoliu ($)</div>
       <div id="echart"></div>
     </div>
   </div>
@@ -240,7 +259,7 @@
     <div id="trades-list">
       <table class="trade-table">
         <thead>
-          <tr><th>Data</th><th>Dir</th><th>PnL $</th></tr>
+          <tr><th>Data</th><th>Sym</th><th>Dir</th><th>PnL $</th></tr>
         </thead>
         <tbody id="tbl-body"></tbody>
       </table>
@@ -261,13 +280,25 @@
 // Config primit prin /api/init
 // ============================================================================
 let CHART_TZ  = "Europe/Bucharest";
-let BOT_NAME  = "bot";
-let STRATEGY  = "";
-let SYMBOL    = "BTCUSDT";
-let TIMEFRAME = "";
-let INITIAL_ACCOUNT = 100.0;
-let FIRST_TS = null;        // s UTC — afisam doar lumanari >= asta
+let BOT_NAME  = "ichimoku2";
+let STRATEGY  = "Hull+Ichimoku";
+let TIMEFRAME = "4h";
+let PAIRS     = [];          // [SUNUSDT, MNTUSDT, ILVUSDT]
+let CURRENT_SYMBOL = null;
 let initDone = false;
+
+// Per-symbol state
+let CANDLES        = {};      // {symbol: [{time,open,high,low,close}]}
+let INDICATORS     = {};      // {symbol: {name: [points]}}
+let FIRST_TS       = {};      // {symbol: int sec}
+let activePositions = {};     // {symbol: {direction, entry, sl, tp, qty?, risk_usd?}}
+let lastPrices     = {};      // {symbol: float}
+
+// Trades — single global list, each has .symbol field
+const trades = [];
+let selectedTradeId = null;
+
+let indicatorMeta = {};
 
 // ============================================================================
 // Bucharest formatters
@@ -293,30 +324,23 @@ function fmtTimeTZ(tsSec) {
   const m = {}; parts.forEach(p => m[p.type] = p.value);
   return `${m.hour}:${m.minute}`;
 }
-function fmtShortDateTZ(tsSec) {
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: CHART_TZ, day: "2-digit", month: "2-digit", year: "numeric",
-  }).formatToParts(new Date(tsSec * 1000));
-  const m = {}; parts.forEach(p => m[p.type] = p.value);
-  return `${m.day}.${m.month}.${m.year}`;
-}
 
 // ============================================================================
-// Price precision (auto, ~5 cifre semnificative)
+// Price precision (per symbol — adapts to magnitudine)
 // ============================================================================
-let pricePrecision = 2;
+let pricePrecision = 4;
 function fmtPx(p) {
   if (p === null || p === undefined || !isFinite(p)) return "—";
   return Number(p).toFixed(pricePrecision);
 }
 function detectPrecision(refPrice) {
-  if (!refPrice || !isFinite(refPrice) || refPrice <= 0) return 2;
+  if (!refPrice || !isFinite(refPrice) || refPrice <= 0) return 4;
   const mag = Math.floor(Math.log10(refPrice));
   return Math.max(2, Math.min(8, 4 - mag));
 }
 function applyPricePrecision(refPrice) {
   const prec = detectPrecision(refPrice);
-  if (prec <= pricePrecision) return;
+  if (prec === pricePrecision) return;
   pricePrecision = prec;
   const minMove = Math.pow(10, -prec);
   candleSeries.applyOptions({
@@ -382,10 +406,9 @@ _ro.observe(wrapChart);
 _ro.observe(wrapEquity);
 
 // ============================================================================
-// Indicator series
+// Indicator series (per current symbol — recreate on symbol switch)
 // ============================================================================
 const indicatorSeries = new Map();
-let indicatorMeta = {};
 
 function getOrCreateIndicator(name) {
   let s = indicatorSeries.get(name);
@@ -407,38 +430,39 @@ function setIndicatorData(name, points) {
 function updateIndicator(name, time, value) {
   getOrCreateIndicator(name).update({ time: time, value: value });
 }
+function clearAllIndicators() {
+  for (const [name, s] of indicatorSeries.entries()) {
+    try { chart.removeSeries(s); } catch(e){}
+  }
+  indicatorSeries.clear();
+}
 
 // ============================================================================
-// State local
+// Live position lines (Entry / SL / TP) — for current symbol only
 // ============================================================================
-let CANDLES = [];               // [{time,open,high,low,close}]
-const trades = [];              // toate trade-urile (init + live)
-let activePosition = null;      // {direction, entry, sl, tp, qty?, risk_usd?}
-let selectedTradeId = null;
-let lastPrice = 0;
-
-// Price lines pentru pozitia ACTIVA (live, in timpul trade-ului)
 let liveSlLine = null, liveTpLine = null, liveEntryLine = null;
-// Price lines pentru trade-ul SELECTAT din istoric (pe click)
-let slLine = null, tpLine = null, entryLine = null;
-// Bounded line series (SL/TP pe durata trade-urilor istorice)
-let slBoundedSer = null, tpBoundedSer = null;
 
-// ============================================================================
-// Live position lines (Entry / SL / TP) — bounded de la entry pana la candle-ul curent
-// ============================================================================
 function clearLiveLines() {
   for (const s of [liveEntryLine, liveSlLine, liveTpLine]) {
     if (s) { try { chart.removeSeries(s); } catch(e){} }
   }
   liveEntryLine = liveSlLine = liveTpLine = null;
 }
+// Bar duration in seconds (4h fix pentru Ichimoku2). Folosit cand entry_ms
+// e mai recent decat ultima bara cunoscuta (line series are nevoie de 2 puncte
+// distincte ca sa randeze — extindem in zona rightOffset pana la urmatorul tick).
+const BAR_DURATION_S = 4 * 3600;
+
 function showLiveLines(p) {
   clearLiveLines();
-  if (!p.entry_ms || !CANDLES.length) return;
+  if (!p || !p.entry_ms) return;
+  const candles = CANDLES[CURRENT_SYMBOL] || [];
   const startTs = Math.floor(p.entry_ms / 1000);
-  const endTs   = CANDLES[CANDLES.length - 1].time;
-  if (endTs < startTs) return;
+  // endTs = max(lastCandle, startTs + 1 bar) — garanteaza 2 puncte distincte
+  // si linia e vizibila imediat din momentul deschiderii. extendLiveLines va
+  // ajusta endTs la fiecare candle confirmed nou.
+  const lastCandleTs = candles.length ? candles[candles.length - 1].time : startTs;
+  const endTs = Math.max(lastCandleTs, startTs + BAR_DURATION_S);
 
   const entryColor = p.direction === "LONG" ? "#00e676" : "#ff3352";
   const mkSer = (color, title) => chart.addLineSeries({
@@ -448,24 +472,30 @@ function showLiveLines(p) {
   });
   liveEntryLine = mkSer(entryColor, `LIVE ${p.direction}`);
   liveSlLine    = mkSer("#ff3352",  "LIVE SL");
-  liveTpLine    = mkSer("#00e676",  "LIVE TP");
   liveEntryLine.setData([{time: startTs, value: p.entry}, {time: endTs, value: p.entry}]);
   liveSlLine   .setData([{time: startTs, value: p.sl},    {time: endTs, value: p.sl}]);
-  liveTpLine   .setData([{time: startTs, value: p.tp},    {time: endTs, value: p.tp}]);
+  if (p.tp) {
+    liveTpLine = mkSer("#00e676",  "LIVE TP");
+    liveTpLine.setData([{time: startTs, value: p.tp}, {time: endTs, value: p.tp}]);
+  }
 }
 function extendLiveLines(latestTs) {
-  if (!activePosition || !liveEntryLine || !activePosition.entry_ms) return;
-  const startTs = Math.floor(activePosition.entry_ms / 1000);
+  const p = activePositions[CURRENT_SYMBOL];
+  if (!p || !liveEntryLine || !p.entry_ms) return;
+  const startTs = Math.floor(p.entry_ms / 1000);
   if (latestTs < startTs) return;
-  const p = activePosition;
   liveEntryLine.setData([{time: startTs, value: p.entry}, {time: latestTs, value: p.entry}]);
   liveSlLine   .setData([{time: startTs, value: p.sl},    {time: latestTs, value: p.sl}]);
-  liveTpLine   .setData([{time: startTs, value: p.tp},    {time: latestTs, value: p.tp}]);
+  if (liveTpLine && p.tp) {
+    liveTpLine.setData([{time: startTs, value: p.tp}, {time: latestTs, value: p.tp}]);
+  }
 }
 
 // ============================================================================
 // Selected trade lines (Entry / SL / TP — pe click in lista)
 // ============================================================================
+let slLine = null, tpLine = null, entryLine = null;
+
 function clearSelLines() {
   if (slLine)    { candleSeries.removePriceLine(slLine);    slLine = null; }
   if (tpLine)    { candleSeries.removePriceLine(tpLine);    tpLine = null; }
@@ -490,6 +520,8 @@ function showSelLines(t) {
 // ============================================================================
 // Bounded SL/TP series (linii afisate doar in intervalul fiecarui trade)
 // ============================================================================
+let slBoundedSer = null, tpBoundedSer = null;
+
 function makeBoundedLine(color) {
   return chart.addLineSeries({
     color, lineWidth: 1, lineStyle: 2,
@@ -499,20 +531,21 @@ function makeBoundedLine(color) {
 function buildBounded(filteredTrades) {
   if (slBoundedSer) { try { chart.removeSeries(slBoundedSer); } catch(e){} slBoundedSer = null; }
   if (tpBoundedSer) { try { chart.removeSeries(tpBoundedSer); } catch(e){} tpBoundedSer = null; }
-  if (!filteredTrades.length || !CANDLES.length) return;
+  const candles = CANDLES[CURRENT_SYMBOL] || [];
+  if (!filteredTrades.length || !candles.length) return;
   const showSL = document.getElementById("bSL").classList.contains("on");
   const showTP = document.getElementById("bTP").classList.contains("on");
   if (!showSL && !showTP) return;
 
   const srt = filteredTrades
-    .filter(t => t.entry_ms && t.exit_ms && (t.sl || t.tp))
+    .filter(t => t.symbol === CURRENT_SYMBOL && t.entry_ms && t.exit_ms && (t.sl || t.tp))
     .sort((a, b) => a.entry_ms - b.entry_ms);
   if (!srt.length) return;
 
   const slD = [], tpD = [];
   let ti = 0;
-  for (let i = 0; i < CANDLES.length; i++) {
-    const ts = CANDLES[i].time, tsMs = ts * 1000;
+  for (let i = 0; i < candles.length; i++) {
+    const ts = candles[i].time, tsMs = ts * 1000;
     while (ti < srt.length - 1 && srt[ti].exit_ms < tsMs) ti++;
     const t = srt[ti];
     const inside = tsMs >= t.entry_ms && tsMs <= t.exit_ms;
@@ -524,13 +557,14 @@ function buildBounded(filteredTrades) {
 }
 
 // ============================================================================
-// Markers (entries + exits)
+// Markers (entries + exits) for current symbol
 // ============================================================================
 function buildMarkers(filteredTrades) {
   const showE = document.getElementById("bEntry").classList.contains("on");
   const showX = document.getElementById("bExit").classList.contains("on");
   const mk = [];
   filteredTrades.forEach(t => {
+    if (t.symbol !== CURRENT_SYMBOL) return;
     if (showE && t.entry_ms) {
       mk.push({
         time: Math.floor(t.entry_ms / 1000),
@@ -541,24 +575,25 @@ function buildMarkers(filteredTrades) {
       });
     }
     if (showX && t.exit_ms) {
-      // VSE: strategy trailing-only fără TP → marker bazat pe pnl, nu pe exit_reason.
-      const isTP = t.pnl >= 0;
+      const isTP = t.exit_reason === "BYBIT_TP";
+      const isExternal = t.exit_reason === "EXTERNAL";
       mk.push({
         time: Math.floor(t.exit_ms / 1000),
         position: isTP ? "aboveBar" : "belowBar",
-        color:    isTP ? "#3399ff"  : "#888888",
+        color:    isTP ? "#3399ff"  : (isExternal ? "#ffaa00" : "#888888"),
         shape:    "circle", size: 2,
-        text: isTP ? "✔" : "✘",
+        text: isTP ? "✔" : (isExternal ? "⚠" : "✘"),
       });
     }
   });
-  // Active position — sageata live pe bara de entry
-  if (showE && activePosition && activePosition.entry_ms) {
-    const isL = activePosition.direction === "LONG";
-    const sizeUsd = (activePosition.qty || 0) * (activePosition.entry || 0);
+  // Active position pe simbolul curent
+  const ap = activePositions[CURRENT_SYMBOL];
+  if (showE && ap && ap.entry_ms) {
+    const isL = ap.direction === "LONG";
+    const sizeUsd = (ap.qty || 0) * (ap.entry || 0);
     const letter = isL ? "L" : "S";
     mk.push({
-      time: Math.floor(activePosition.entry_ms / 1000),
+      time: Math.floor(ap.entry_ms / 1000),
       position: isL ? "belowBar" : "aboveBar",
       color:    isL ? "#00e676"  : "#ff3352",
       shape:    isL ? "arrowUp"  : "arrowDown",
@@ -599,18 +634,27 @@ function renderList(filteredTrades) {
   tbody.innerHTML = "";
   document.getElementById("trade-count").textContent = filteredTrades.length;
   document.getElementById("total-count").textContent = filteredTrades.length;
+  let pnlSum = 0;
+  filteredTrades.forEach(t => pnlSum += t.pnl);
+  const totEl = document.getElementById("total-pnl");
+  totEl.textContent = (pnlSum >= 0 ? "+" : "") + "$" + pnlSum.toFixed(2);
+  totEl.style.color = pnlSum >= 0 ? "#00e676" : "#ff3352";
+
   [...filteredTrades].reverse().forEach(t => {
     const ts = Math.floor(t.entry_ms / 1000);
     const dateStr = fmtDateTZ(ts);
     const pnlClass = t.pnl >= 0 ? "win" : "loss";
     const dirClass = t.side === "L" ? "dir-l" : "dir-s";
     const pnlSign  = t.pnl >= 0 ? "+" : "";
-    const exMark   = t.exit_reason === "TP" ? " ✓"
-                  : t.exit_reason === "SL" ? " ✗" : "";
+    const exMark   = t.exit_reason === "BYBIT_TP" ? " ✓"
+                  : t.exit_reason === "BYBIT_SL" ? " ✗"
+                  : t.exit_reason === "EXTERNAL" ? " ⚠" : "";
+    const symShort = (t.symbol || "").replace("USDT", "");
     const tr = document.createElement("tr");
     if (selectedTradeId === t.id) tr.classList.add("selected");
     tr.innerHTML =
       `<td style="font-size:11px;color:#8899aa">${dateStr}</td>` +
+      `<td style="color:#aabbcc">${symShort}</td>` +
       `<td class="${dirClass}">${t.side}</td>` +
       `<td class="${pnlClass}">${pnlSign}${t.pnl.toFixed(2)}${exMark}</td>`;
     tr.onclick = () => selectTrade(t);
@@ -619,13 +663,17 @@ function renderList(filteredTrades) {
 }
 function selectTrade(t) {
   selectedTradeId = t.id;
+  // Switch to that symbol if different
+  if (t.symbol && t.symbol !== CURRENT_SYMBOL) {
+    switchSymbol(t.symbol);
+  }
   renderList(filteredTrades());
   showSelLines(t);
   renderDetail(t, false);
   const entryS = Math.floor(t.entry_ms / 1000);
   const exitS  = t.exit_ms ? Math.floor(t.exit_ms / 1000) : entryS;
   chart.timeScale().setVisibleRange({
-    from: entryS - 3600, to: exitS + 3600,
+    from: entryS - 14400, to: exitS + 14400,
   });
 }
 
@@ -637,7 +685,7 @@ function renderDetail(t, isActive) {
     el.innerHTML = '<div style="color:var(--dim);font-size:11px;padding:6px 0">Click pe un trade din lista</div>';
     return;
   }
-  hdr.textContent = isActive ? "Pozitie ACTIVA" : `Trade Selectat #${t.id}`;
+  hdr.textContent = isActive ? `Pozitie ACTIVA — ${t.symbol || ''}` : `Trade #${t.id} — ${t.symbol || ''}`;
   const dir = isActive ? t.direction : (t.side === "L" ? "LONG" : "SHORT");
   const badge = `<span class="badge badge-${dir}">${dir}</span>`;
   let rows = `<div class="trow"><span class="lbl">Dir</span>${badge}</div>`;
@@ -645,7 +693,7 @@ function renderDetail(t, isActive) {
     rows +=
       `<div class="trow"><span class="lbl">Entry</span><span>${fmtPx(t.entry)}</span></div>` +
       `<div class="trow"><span class="lbl">SL</span><span class="loss">${fmtPx(t.sl)}</span></div>` +
-      `<div class="trow"><span class="lbl">TP</span><span class="win">${fmtPx(t.tp)}</span></div>`;
+      `<div class="trow"><span class="lbl">TP</span><span class="win">${t.tp ? fmtPx(t.tp) : '—'}</span></div>`;
     if (t.qty)      rows += `<div class="trow"><span class="lbl">Qty</span><span>${t.qty}</span></div>`;
     if (t.risk_usd) rows += `<div class="trow"><span class="lbl">Risk</span><span>${t.risk_usd.toFixed(2)}$</span></div>`;
   } else {
@@ -660,42 +708,43 @@ function renderDetail(t, isActive) {
       `<div class="trow"><span class="lbl">Size</span><span>${t.size_usdt.toFixed(2)}$</span></div>` +
       `<div class="trow"><span class="lbl">Open</span><span>${entryDt}</span></div>` +
       `<div class="trow"><span class="lbl">Exit (${t.exit_reason})</span><span>${fmtPx(t.exit_price)} @ ${exitDt}</span></div>` +
+      `<div class="trow"><span class="lbl">Slippage</span><span>${(t.slippage || 0).toFixed(6)}</span></div>` +
+      `<div class="trow"><span class="lbl">Fees</span><span>${(t.fees || 0).toFixed(4)}$</span></div>` +
       `<div class="trow"><span class="lbl">PnL</span><span class="${pnlCls}">${pnlSig}${t.pnl.toFixed(2)}$</span></div>`;
   }
   el.innerHTML = rows;
 }
 
 // ============================================================================
-// Live unrealized PnL (badge + header)
+// Live unrealized PnL (badge + header) — pentru simbolul curent
 // ============================================================================
-function updateOpenPnl(price) {
+function updateOpenPnl() {
   const el = document.getElementById("hdr-upnl");
   const badge = document.getElementById("upnl-badge");
-  if (!activePosition || !price) {
+  const ap = activePositions[CURRENT_SYMBOL];
+  const price = lastPrices[CURRENT_SYMBOL];
+  if (!ap || !price) {
     el.textContent = "—"; el.className = "v neu";
     badge.className = "";
     return;
   }
-  const p = activePosition;
-  const diff = p.direction === "LONG" ? (price - p.entry) : (p.entry - price);
-  // uPnL in $ — necesita qty (size in coin); altfel afisam doar % din entry
+  const diff = ap.direction === "LONG" ? (price - ap.entry) : (ap.entry - price);
   let pnlUsd = null;
-  if (p.qty) {
-    pnlUsd = diff * p.qty;
-  } else if (p.entry) {
-    // Fallback fara qty: afiseaza PnL ca % din entry, nu ca $.
-    pnlUsd = (diff / p.entry) * 100;
+  if (ap.qty) {
+    pnlUsd = diff * ap.qty;
+  } else if (ap.entry) {
+    pnlUsd = (diff / ap.entry) * 100;
   }
   if (pnlUsd === null) { el.textContent = "—"; el.className = "v neu"; badge.className = ""; return; }
   const cls  = pnlUsd >= 0 ? "pos" : "neg";
   const sign = pnlUsd >= 0 ? "+" : "";
   el.className = "v " + cls;
-  if (p.qty) {
-    el.textContent = sign + pnlUsd.toFixed(4) + "$";
+  if (ap.qty) {
+    el.textContent = sign + pnlUsd.toFixed(2) + "$";
     badge.className = "on " + cls;
-    let badgeHtml = "<small>uPnL</small>" + sign + pnlUsd.toFixed(4) + "$";
-    if (p.risk_usd) {
-      const rMul = pnlUsd / p.risk_usd;
+    let badgeHtml = "<small>uPnL</small>" + sign + pnlUsd.toFixed(2) + "$";
+    if (ap.risk_usd) {
+      const rMul = pnlUsd / ap.risk_usd;
       badgeHtml += "<span class=\"r-mul\">(" + (rMul >= 0 ? "+" : "") + rMul.toFixed(2) + "R)</span>";
     }
     badge.innerHTML = badgeHtml;
@@ -716,12 +765,71 @@ function updateSummary(s) {
   retEl.className = "v " + (s.return_pct >= 0 ? "pos" : "neg");
   document.getElementById("hdr-trades").textContent = s.n_trades;
   document.getElementById("hdr-wr").textContent     = s.win_rate.toFixed(1) + "%";
+  document.getElementById("hdr-open").textContent   = (s.n_open_positions || 0) + "/" + (PAIRS.length || 0);
+}
 
-  const totEl = document.getElementById("total-pnl");
-  const pnl   = s.pnl_total;
-  totEl.textContent = (pnl >= 0 ? "+" : "") + "$" + pnl.toFixed(2) +
-                      " (" + (s.return_pct >= 0 ? "+" : "") + s.return_pct.toFixed(2) + "%)";
-  totEl.style.color = pnl >= 0 ? "#00e676" : "#ff3352";
+// ============================================================================
+// Symbol pills
+// ============================================================================
+function renderSymPills() {
+  const c = document.getElementById("sym-pills");
+  c.innerHTML = "";
+  PAIRS.forEach(sym => {
+    const short = sym.replace("USDT", "");
+    const pill = document.createElement("span");
+    pill.className = "sym-pill" + (sym === CURRENT_SYMBOL ? " active" : "");
+    pill.innerHTML = short + (activePositions[sym] ? '<span class="has-pos"></span>' : '');
+    pill.onclick = () => switchSymbol(sym);
+    c.appendChild(pill);
+  });
+}
+
+function switchSymbol(sym) {
+  if (!PAIRS.includes(sym)) return;
+  CURRENT_SYMBOL = sym;
+  // Update title + label
+  document.getElementById("sym-lbl").textContent = `${sym} · ${TIMEFRAME} · ${CHART_TZ}`;
+  // Repaint pills
+  renderSymPills();
+  // Reload candles for this symbol
+  const candles = CANDLES[sym] || [];
+  if (candles.length) {
+    let minPx = Infinity;
+    for (const c of candles) if (c.low > 0 && c.low < minPx) minPx = c.low;
+    if (isFinite(minPx)) {
+      pricePrecision = detectPrecision(minPx);
+      candleSeries.applyOptions({
+        priceFormat: { type: "price", precision: pricePrecision,
+                       minMove: Math.pow(10, -pricePrecision) },
+      });
+    }
+    candleSeries.setData(candles);
+    document.getElementById("hdr-price").textContent = fmtPx(candles[candles.length - 1].close);
+  } else {
+    candleSeries.setData([]);
+  }
+  // Indicators
+  clearAllIndicators();
+  const indShown = document.getElementById("bInd").classList.contains("on");
+  if (indShown) {
+    const indMap = INDICATORS[sym] || {};
+    for (const [name, points] of Object.entries(indMap)) {
+      if (points && points.length) setIndicatorData(name, points);
+    }
+  }
+  // Live position
+  clearLiveLines();
+  const ap = activePositions[sym];
+  if (ap) {
+    showLiveLines(ap);
+    renderDetail(ap, true);
+  } else {
+    renderDetail(null, false);
+  }
+  updateOpenPnl();
+  // Markers + sidebar list (sidebar lists ALL trades but markers are filtered by symbol)
+  render();
+  chart.timeScale().scrollToRealTime();
 }
 
 // ============================================================================
@@ -733,9 +841,9 @@ chart.subscribeCrosshairMove(p => {
   const d = p.seriesData.get(candleSeries);
   if (!d) { tip.style.display = "none"; return; }
   const ts = p.time;
-  const tr = trades.find(t =>
+  const tr = trades.find(t => t.symbol === CURRENT_SYMBOL && (
     Math.floor(t.entry_ms / 1000) === ts ||
-    (t.exit_ms && Math.floor(t.exit_ms / 1000) === ts));
+    (t.exit_ms && Math.floor(t.exit_ms / 1000) === ts)));
   let extra = "";
   if (tr) {
     const win = tr.pnl >= 0;
@@ -772,6 +880,17 @@ chart.subscribeCrosshairMove(p => {
     this.classList.toggle("on");
     render();
   }));
+document.getElementById("bInd").addEventListener("click", function() {
+  this.classList.toggle("on");
+  // Re-paint indicators for current symbol
+  clearAllIndicators();
+  if (this.classList.contains("on") && CURRENT_SYMBOL) {
+    const indMap = INDICATORS[CURRENT_SYMBOL] || {};
+    for (const [name, points] of Object.entries(indMap)) {
+      if (points && points.length) setIndicatorData(name, points);
+    }
+  }
+});
 
 // ============================================================================
 // /api/init
@@ -783,62 +902,55 @@ async function loadInit() {
   const data = await r.json();
 
   CHART_TZ        = data.timezone || "Europe/Bucharest";
-  BOT_NAME        = data.bot_name || "bot";
-  STRATEGY        = data.strategy || "";
-  SYMBOL          = data.symbol   || "BTCUSDT";
-  TIMEFRAME       = data.timeframe || "";
-  INITIAL_ACCOUNT = data.summary.initial_account;
-  FIRST_TS        = data.first_ts;
+  BOT_NAME        = data.bot_name || "ichimoku2";
+  STRATEGY        = data.strategy || "Hull+Ichimoku";
+  TIMEFRAME       = data.timeframe || "4h";
+  PAIRS           = data.pairs || [];
+  FIRST_TS        = data.first_ts || {};
 
   const titleLabel = STRATEGY ? `[${BOT_NAME} · ${STRATEGY}]` : `[${BOT_NAME}]`;
-  document.title = `${titleLabel} ${SYMBOL}`;
-  document.getElementById("title-text").textContent = `${titleLabel} ${SYMBOL} — live`;
-  const tfLabel = TIMEFRAME || "live";
-  document.getElementById("sym-lbl").textContent    = `${SYMBOL} · ${tfLabel} · ${CHART_TZ}`;
+  document.title = `${titleLabel} ${PAIRS.join("/")}`;
+  document.getElementById("title-text").textContent = `${titleLabel} ${PAIRS.join(" • ")} — live`;
 
-  // Candles
-  CANDLES = (data.candles || []).map(c => ({
-    time: c[0], open: c[1], high: c[2], low: c[3], close: c[4]
-  }));
-  if (CANDLES.length) {
-    let minPx = Infinity;
-    for (const c of CANDLES) {
-      if (c.low > 0 && c.low < minPx) minPx = c.low;
+  // Candles per symbol — payload arrives as {symbol: [[ts,o,h,l,c], ...]}
+  const rawCandles = data.candles || {};
+  for (const [sym, arr] of Object.entries(rawCandles)) {
+    CANDLES[sym] = arr.map(c => ({
+      time: c[0], open: c[1], high: c[2], low: c[3], close: c[4]
+    }));
+    if (CANDLES[sym].length) {
+      lastPrices[sym] = CANDLES[sym][CANDLES[sym].length - 1].close;
     }
-    if (isFinite(minPx)) applyPricePrecision(minPx);
-    candleSeries.setData(CANDLES);
-    lastPrice = CANDLES[CANDLES.length - 1].close;
-    document.getElementById("hdr-price").textContent = fmtPx(lastPrice);
   }
 
-  // Equity
+  // Equity (single curve, portfolio total)
   if ((data.equity || []).length) {
     equitySeries.setData(data.equity);
   }
 
-  // Indicators
+  // Indicators per symbol
   indicatorMeta = data.indicator_meta || {};
-  for (const [name, points] of Object.entries(data.indicators || {})) {
-    if (points && points.length) setIndicatorData(name, points);
-  }
+  INDICATORS = data.indicators || {};
 
-  // Trades
+  // Trades — single global list
   (data.trades || []).forEach(t => trades.push(t));
   updateSummary(data.summary);
 
-  // Active position (linii LIVE + uPnL)
-  if (data.active_position) {
-    activePosition = data.active_position;
-    showLiveLines(activePosition);
-    renderDetail(activePosition, true);
-    updateOpenPnl(lastPrice);
+  // Active positions per symbol (from main.py state snapshot)
+  if (data.active_positions) {
+    activePositions = data.active_positions;
   }
 
-  // Build markers + bounded series + sidebar list
-  render();
-  initDone = true;
-  chart.timeScale().scrollToRealTime();
+  // Default selected symbol = first pair (or first one with active position)
+  let initialSym = PAIRS[0];
+  for (const sym of PAIRS) {
+    if (activePositions[sym]) { initialSym = sym; break; }
+  }
+  if (initialSym) {
+    switchSymbol(initialSym);
+  }
 
+  initDone = true;
   document.getElementById("loading").style.display = "none";
 }
 
@@ -864,39 +976,57 @@ function connectWS() {
 
   ws.onmessage = ev => {
     const msg = JSON.parse(ev.data);
+    const sym = msg.symbol;
 
-    if (msg.type === "candle") {
-      const c = msg.data;
-      if (FIRST_TS === null) FIRST_TS = c.time;
-      if (c.time < FIRST_TS) return;
+    if (msg.type === "candle" && msg.candle) {
+      const c = msg.candle;
+      // Init FIRST_TS pe simbol daca nu setat
+      if (!FIRST_TS[sym]) FIRST_TS[sym] = c.time;
+      if (c.time < FIRST_TS[sym]) return;
 
-      candleSeries.update({
-        time: c.time, open: c.open, high: c.high, low: c.low, close: c.close
-      });
-      // Mentine CANDLES sincronizat (pentru bounded SL/TP la urmatoarele
-      // re-render-uri)
-      if (CANDLES.length && CANDLES[CANDLES.length - 1].time === c.time) {
-        CANDLES[CANDLES.length - 1] = c;
+      // Update CANDLES[sym]
+      const ring = CANDLES[sym] || (CANDLES[sym] = []);
+      if (ring.length && ring[ring.length - 1].time === c.time) {
+        ring[ring.length - 1] = c;
       } else {
-        CANDLES.push(c);
-        if (CANDLES.length > 20000) CANDLES.shift();
+        ring.push(c);
+        if (ring.length > 20000) ring.shift();
       }
-      lastPrice = c.close;
-      if (c.low > 0) applyPricePrecision(c.low);
-      document.getElementById("hdr-price").textContent = fmtPx(c.close);
-      updateOpenPnl(c.close);
-      extendLiveLines(c.time);
+      lastPrices[sym] = c.close;
+
+      // Daca e simbolul curent — update chart
+      if (sym === CURRENT_SYMBOL) {
+        candleSeries.update({
+          time: c.time, open: c.open, high: c.high, low: c.low, close: c.close
+        });
+        if (c.low > 0) applyPricePrecision(c.low);
+        document.getElementById("hdr-price").textContent = fmtPx(c.close);
+        updateOpenPnl();
+        // Daca pozitie activa fara linii live (race-condition la deschidere
+        // cand position_open ajunge inainte de candle), recreeaza-le.
+        if (activePositions[sym] && !liveEntryLine) {
+          showLiveLines(activePositions[sym]);
+        } else {
+          extendLiveLines(c.time);
+        }
+      }
 
     } else if (msg.type === "trade_closed") {
       trades.push(msg.trade);
-      // Live position dispare la close
-      activePosition = null;
-      clearLiveLines();
-      renderDetail(null, false);
-      updateOpenPnl(0);
-      // Equity
-      if (msg.equity) equitySeries.update(msg.equity);
-      updateSummary(msg.summary);
+      // Active position pe acel simbol se inchide
+      delete activePositions[sym];
+      if (sym === CURRENT_SYMBOL) {
+        clearLiveLines();
+        renderDetail(null, false);
+        updateOpenPnl();
+      }
+      // Equity update
+      if (msg.summary) {
+        updateSummary(msg.summary);
+        // Optional: equity update — main.py poate trimite punct nou
+        if (msg.equity_point) equitySeries.update(msg.equity_point);
+      }
+      renderSymPills();
       render();
       // Highlight ultimul rand
       const lastRow = document.querySelector("#tbl-body tr:first-child");
@@ -907,24 +1037,37 @@ function connectWS() {
       }
 
     } else if (msg.type === "indicator") {
-      updateIndicator(msg.name, msg.time, msg.value);
+      // Per-symbol indicator update
+      if (!INDICATORS[sym]) INDICATORS[sym] = {};
+      if (!INDICATORS[sym][msg.name]) INDICATORS[sym][msg.name] = [];
+      INDICATORS[sym][msg.name].push({ time: msg.time, value: msg.value });
+      if (INDICATORS[sym][msg.name].length > 20000) INDICATORS[sym][msg.name].shift();
+      if (sym === CURRENT_SYMBOL && document.getElementById("bInd").classList.contains("on")) {
+        updateIndicator(msg.name, msg.time, msg.value);
+      }
 
     } else if (msg.type === "position_open") {
-      activePosition = {
+      activePositions[sym] = {
         direction: msg.direction, entry: msg.entry, sl: msg.sl, tp: msg.tp,
         qty: msg.qty, risk_usd: msg.risk_usd, entry_ms: msg.entry_ms,
       };
-      showLiveLines(activePosition);
-      renderDetail(activePosition, true);
-      updateOpenPnl(lastPrice);
-      buildMarkers(filteredTrades());
+      renderSymPills();
+      if (sym === CURRENT_SYMBOL) {
+        showLiveLines(activePositions[sym]);
+        renderDetail(activePositions[sym], true);
+        updateOpenPnl();
+        buildMarkers(filteredTrades());
+      }
 
     } else if (msg.type === "position_close") {
-      activePosition = null;
-      clearLiveLines();
-      renderDetail(null, false);
-      updateOpenPnl(0);
-      buildMarkers(filteredTrades());
+      delete activePositions[sym];
+      renderSymPills();
+      if (sym === CURRENT_SYMBOL) {
+        clearLiveLines();
+        renderDetail(null, false);
+        updateOpenPnl();
+        buildMarkers(filteredTrades());
+      }
     }
   };
 }

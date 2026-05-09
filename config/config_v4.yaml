@@ -1,0 +1,82 @@
+# V4 portfolio bot — multi-strategy validat (BB MR + Hull+Ichimoku 4h, OOS-tested)
+#
+# Backtest 2022-2026 ($100 init, 10% sizing, NO auto-cycling):
+#   PnL paper: +$592K (PF 1.33, DD -53%, CAGR 616%/an)
+#   Cycle istoric $100→$5K: 31.7 luni (cycle 1) si 11.5 luni (cycle 2)
+#   TIA = 86% din profit (concentration risk — monitor)
+#
+# Reset profit MANUAL la $5K (user marcheaza profitul + reseteaza bot la $100).
+
+portfolio:
+  name: v4_portfolio
+  pool_total: 100.0           # capital initial USDT (compound de aici)
+  leverage: 10                # default Bybit isolated (fallback daca pereche n-are override)
+  leverage_max: 10            # SAFETY cap intern: pos_notional ≤ 10× equity
+  cap_pct_of_max: 0.95
+  taker_fee: 0.00055          # 0.055% taker
+  slippage_bps: 0.0
+
+pairs:
+  # === BTCUSDT — Bollinger Bands Mean Reversion ===
+  # Backtest full: PF 2.62, WR 58.5%, +$124K contribution la 10% sizing.
+  # Logica: extreme BB cross-back + RSI extrem → reversal trade scurt cu fix R:R.
+  - symbol: BTCUSDT
+    timeframe: 4h
+    enabled: true
+    strategy: bb_mr
+    leverage: 10
+    bb_length: 26
+    bb_std: 3.0
+    rsi_length: 14
+    rsi_oversold: 20.0
+    rsi_overbought: 80.0
+    sl_pct: 0.06              # SL 6% (BTC rezistent la BB outliers)
+    tp_rr: 1.75               # TP la 1.75R = 10.5% notional (Bybit-set, intra-bar)
+    max_bars_in_trade: 40     # Time exit ~6.6 zile la 4h
+    risk_pct_per_trade: 0.10  # 10% din shared equity
+
+  # === TIAUSDT — Hull+Ichimoku (motor portfolio) ===
+  # Backtest full: PF 1.53-1.61, WR 41.1%, +$510K contribution.
+  # Trend follow cu signal exit (no TP — let trends run).
+  - symbol: TIAUSDT
+    timeframe: 4h
+    enabled: true
+    strategy: hi
+    leverage: 10
+    hull_length: 12
+    tenkan_periods: 9
+    kijun_periods: 60         # OOS-validated 4 ani
+    senkou_b_periods: 52
+    displacement: 24
+    risk_pct_per_trade: 0.10  # 10% din shared equity
+    sl_initial_pct: 0.05      # SL 5% (HI standard)
+    tp_pct: null              # NO TP — signal exit only (let trends run)
+    max_hull_spread_pct: 2.0
+    max_close_kijun_dist_pct: 6.0
+
+  # === NEARUSDT — Hull+Ichimoku (diversifier) ===
+  # Backtest full: PF 1.03-1.20, WR 40.3%, +$29K contribution la 10%.
+  # Marginal la 10% sizing — monitor; daca PF scade <1.0 OOS, deconnect.
+  - symbol: NEARUSDT
+    timeframe: 4h
+    enabled: true
+    strategy: hi
+    leverage: 10
+    hull_length: 24           # diferit fata de TIA (tunat per pair)
+    tenkan_periods: 9
+    kijun_periods: 48
+    senkou_b_periods: 40
+    displacement: 24
+    risk_pct_per_trade: 0.10
+    sl_initial_pct: 0.05
+    tp_pct: null
+    max_hull_spread_pct: 2.0
+    max_close_kijun_dist_pct: 6.0
+
+operational:
+  max_concurrent_positions: 3  # 3 perechi pot fi simultan in pozitie
+  max_consecutive_api_errors: 5
+  heartbeat_interval_seconds: 60
+  save_state_interval_seconds: 300
+  state_dir: ./state
+  log_dir: ./logs
