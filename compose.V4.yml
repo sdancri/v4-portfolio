@@ -43,3 +43,10 @@ services:
       timeout: 5s
       retries: 3
       start_period: 45s
+    # VPS resource hygiene
+    mem_limit: 512m              # cap defensiv (V4 tipic 150-300MB)
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"          # 10MB per fisier log
+        max-file: "3"            # max 30MB total (rotation 3×)
