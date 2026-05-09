@@ -1,4 +1,10 @@
 # V4 portfolio bot — multi-strategy (BB MR + Hull+Ichimoku, 4h)
+#
+# Perechi (3, shared equity pool, compound):
+#   BTCUSDT  — strategy: bb_mr  (Bollinger Bands Mean Reversion)
+#   TIAUSDT  — strategy: hi     (Hull MA + Ichimoku Cloud, trend follow)
+#   NEARUSDT — strategy: hi     (Hull MA + Ichimoku Cloud, trend follow)
+#
 # Host port 8107 → container 8104 (8104-8106 ocupate pe VPS).
 # Subaccount Bybit: V4 (separate API key).
 # Reset profit MANUAL la $5K (user marcheaza profitul + reset).
