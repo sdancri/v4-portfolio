@@ -1,5 +1,6 @@
 # V4 portfolio bot — multi-strategy (BB MR + Hull+Ichimoku, 4h)
-# Port 8104. Subaccount Bybit: V4 (separate API key).
+# Host port 8107 → container 8104 (8104-8106 ocupate pe VPS).
+# Subaccount Bybit: V4 (separate API key).
 # Reset profit MANUAL la $5K (user marcheaza profitul + reset).
 
 services:
@@ -25,7 +26,7 @@ services:
       - RATE_LIMIT_PER_SEC=${RATE_LIMIT_PER_SEC:-5}
       - RATE_LIMIT_BURST=${RATE_LIMIT_BURST:-10}
     ports:
-      - "8104:8104"
+      - "8107:8104"
     volumes:
       - ./logs/V4:/app/logs
       - ./data/V4:/app/data

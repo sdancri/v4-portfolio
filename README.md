@@ -59,7 +59,9 @@ Click **Deploy the stack**. Portainer pull image automat din DockerHub.
 
 ### 3. Acces chart
 
-`http://<vps-ip>:8104/` — chart Lightweight Charts cu candles, indicators, trades, equity curve.
+`http://<vps-ip>:8107/` — chart Lightweight Charts cu candles, indicators, trades, equity curve.
+
+> **Note port:** host expune `8107` mapat la containerul intern `8104` (8104-8106 ocupate de alti boti pe VPS). Container-ul intern raman pe 8104, deci `CHART_PORT=8104` in env si healthcheck-ul intern functioneaza neschimbat.
 
 ### 4. Update bot
 
