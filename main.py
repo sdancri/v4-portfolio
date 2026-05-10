@@ -115,6 +115,24 @@ _RECONCILE_QTY_EPS = 1e-9       # toleranta float pe comparatii de qty
 _RECONCILE_RETRIES = 3          # iteratii pt stop-not-triggered branch
 _RECONCILE_RETRY_SLEEP = 1.0    # secunde intre check-uri (~3s total wait)
 
+# Per-symbol close lock — previne race intre close_position (signal exit din
+# public WS task) si close_pipeline_external (private WS position event +
+# defense-in-depth check_external_close). Ambele pot fi observate aproape
+# simultan cand Bybit fileaza SL/TP atomic in timp ce strategia genereaza
+# CLOSE_LONG/SHORT pe aceeasi bara — fara lock + dedup, acelasi trade s-ar
+# inregistra de doua ori in _state.trades.
+_close_locks: dict[str, asyncio.Lock] = {}
+
+
+def _get_close_lock(symbol: str) -> asyncio.Lock:
+    """Creeaza lazy un Lock per simbol."""
+    lock = _close_locks.get(symbol)
+    if lock is None:
+        lock = asyncio.Lock()
+        _close_locks[symbol] = lock
+    return lock
+
+
 _TF_INTERVAL = "240"  # 4h fix (toate perechile)
 _TF_MS = 4 * 60 * 60 * 1000
 
@@ -459,12 +477,30 @@ async def close_position(symbol: str, exit_reason: str,
     Apelat din: signal flip (CLOSE_LONG/CLOSE_SHORT). NU din private WS sau
     check_external_close — acelea folosesc close_pipeline_external (qty=0
     deja confirmat, reconciliere redundanta).
-    """
-    pos = _state.get_position(symbol)
-    if pos is None:
-        print(f"  [CLOSE {symbol}] no position — skip")
-        return
 
+    Concurrent safety: lock + dedup pe entry_ts_ms previn double-record cand
+    Bybit fileaza SL/TP atomic in paralel (private WS task triggereaza si
+    close_pipeline_external pentru acelasi trade).
+    """
+    async with _get_close_lock(symbol):
+        pos = _state.get_position(symbol)
+        if pos is None:
+            # Inchis deja de un alt coroutine (private WS / defense-in-depth).
+            print(f"  [CLOSE {symbol}] no position — skip (already closed by other coroutine)")
+            return
+        # Dedup explicit: daca un trade cu acelasi entry_ts deja inregistrat.
+        for existing in reversed(_state.trades):
+            if (existing.symbol == symbol
+                    and existing.entry_ts_ms == pos.opened_ts_ms):
+                print(f"  [CLOSE {symbol}] dedup: trade entry_ts={pos.opened_ts_ms} "
+                      f"deja inregistrat (id={existing.id}) — skip duplicate")
+                return
+        await _close_position_locked(symbol, exit_reason, target_price, pos)
+
+
+async def _close_position_locked(symbol: str, exit_reason: str,
+                                  target_price: float, pos) -> None:
+    """Body close_position, executat sub _close_locks[symbol]."""
     side = _close_side(pos.direction)
     try:
         order_id = await ex.place_market(symbol, side, pos.qty, reduce_only=True)
@@ -609,11 +645,28 @@ async def close_pipeline_external(symbol: str, exit_reason: str,
     """
     Variant a close_position pt cazul cand pozitia NU mai e pe Bybit (deja
     inchisa extern). Skip place_market, doar fetch PnL + record + notify.
-    """
-    pos = _state.get_position(symbol)
-    if pos is None:
-        return
 
+    Concurrent safety: lock + dedup pe entry_ts_ms (acelasi mecanism ca
+    close_position) — apelat din private WS si din check_external_close
+    (defense-in-depth public WS); ambele pot observa qty=0 simultan.
+    """
+    async with _get_close_lock(symbol):
+        pos = _state.get_position(symbol)
+        if pos is None:
+            print(f"  [CLOSE-EXT {symbol}] no position — skip (already closed)")
+            return
+        for existing in reversed(_state.trades):
+            if (existing.symbol == symbol
+                    and existing.entry_ts_ms == pos.opened_ts_ms):
+                print(f"  [CLOSE-EXT {symbol}] dedup: trade entry_ts="
+                      f"{pos.opened_ts_ms} deja inregistrat (id={existing.id}) — skip")
+                return
+        await _close_pipeline_external_locked(symbol, exit_reason, target_price, pos)
+
+
+async def _close_pipeline_external_locked(symbol: str, exit_reason: str,
+                                            target_price: float, pos) -> None:
+    """Body close_pipeline_external, executat sub _close_locks[symbol]."""
     await asyncio.sleep(1.5)  # let closed-pnl index
     now_ms = int(time.time() * 1000)
     pnl_data = await ex.fetch_pnl_for_trade(symbol, pos.opened_ts_ms, now_ms)

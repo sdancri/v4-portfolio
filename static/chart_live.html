@@ -526,6 +526,10 @@ function makeBoundedLine(color) {
   return chart.addLineSeries({
     color, lineWidth: 1, lineStyle: 2,
     priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+    // Opt-out din autoscale: SL/TP istorice (de la trade-uri vechi cu pret
+    // mult diferit) ar trage scale-ul si ar turti candle-urile curente.
+    // Candle series ramane driver-ul autoscale.
+    autoscaleInfoProvider: () => null,
   });
 }
 function buildBounded(filteredTrades) {
