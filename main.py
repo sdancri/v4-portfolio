@@ -314,7 +314,15 @@ async def open_position(symbol: str, direction: str, close_price: float,
 
     # Pas qty → TP devine Limit (maker fee 0.020% in loc de 0.055% taker).
     # SL ramane Market (siguranta executiei pe gap).
-    await ex.set_position_sl(symbol, sl_price, tp_price, qty=qty)
+    # Return False = toate 4 retry-urile au esuat (Telegram critical sent
+    # deja in set_position_sl). NU abandonam trade-ul aici — pozitia exista
+    # pe Bybit, abandonul ar lasa-o orfana fara state local. Continuam,
+    # marcam pozitie ca activa, iar reconcilierea la close va detecta lipsa
+    # SL si va force chase_close. Print local pt context in logs.
+    sl_ok = await ex.set_position_sl(symbol, sl_price, tp_price, qty=qty)
+    if not sl_ok:
+        print(f"  [OPEN {symbol}] WARN: entry {direction} fara SL setat — "
+              f"relying on close-pipeline reconcile.")
 
     now_ms = int(time.time() * 1000)
     pos = LivePosition(

@@ -443,7 +443,24 @@ async def set_position_sl(symbol: str, sl_price: float,
             return True
         print(f"  [BYBIT] set_position_sl FAIL #{attempt+1}/4")
     print(f"  [BYBIT] set_position_sl FAILED definitiv pe {symbol} sl={sl_price} — "
-          f"pozitia ruleaza fara SL!")
+          f"pozitia ruleaza FARA protectie!")
+    # Alerta CRITICA via Telegram — user-ul trebuie sa stie imediat (loguri
+    # nu sunt checked in real time pe productie). Best-effort: tg.send fail
+    # NU altereaza return-ul (caller-ul vede oricum False si stie sa actioneze).
+    # Import local pt evitare circular dependency.
+    try:
+        from core import telegram_bot as tg
+        tp_line = f"\n<b>tp:</b> {tp_price}" if tp_price is not None else ""
+        await tg.send_critical(
+            f"{symbol} SL NOT SET",
+            f"<b>set_position_sl FAILED</b> dupa 4 retry-uri (~7s)\n"
+            f"<b>sl:</b> {sl_price}{tp_line}\n"
+            f"<b>Pozitia ruleaza FARA protectie.</b>\n"
+            f"Reconcilierea va detecta la primul close si va force chase_close.",
+            symbol=symbol,
+        )
+    except Exception as tg_e:
+        print(f"  [BYBIT] tg.send_critical failed: {tg_e}")
     return False
 
 
