@@ -851,8 +851,8 @@ function switchSymbol(sym) {
   // [entry, now] cu padding mic — user vede direct contextul trade-ului
   // in curs. Clamp `from` la prima bara DISPONIBILA in date (CANDLES[0]):
   // dupa restart cu entry vechi nu fortam afisarea unui timestamp fara date.
-  // Altfel scrollToRealTime (margine dreapta, cum era).
-  const candles = CANDLES[sym] || [];
+  // Altfel scrollToRealTime (margine dreapta, cum era). Refolosim `candles`
+  // declarat la inceputul functiei (acelasi CANDLES[sym]).
   if (ap && ap.entry_ms && candles.length) {
     const entryS  = Math.floor(ap.entry_ms / 1000);
     const firstS  = candles[0].time;
