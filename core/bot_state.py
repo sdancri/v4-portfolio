@@ -57,6 +57,9 @@ class LivePosition:
     order_id: Optional[str] = None  # entry order ID (pt fetch_pnl)
     strategy: str = "hi"     # "hi" | "bb_mr" — folosit la dispatch + tg label
     bars_held: int = 0       # bare confirmed scurse de la entry (BB MR time-exit)
+    sl_armed: bool = True    # True daca set_position_sl a reusit (Bybit-side SL atomic).
+                              # False → fallback software: SL_LONG/SHORT signal din
+                              # strategy escaleaza la close_position (vezi main.py).
 
 
 @dataclass

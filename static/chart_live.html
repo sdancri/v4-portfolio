@@ -566,10 +566,19 @@ function buildBounded(filteredTrades) {
 function buildMarkers(filteredTrades) {
   const showE = document.getElementById("bEntry").classList.contains("on");
   const showX = document.getElementById("bExit").classList.contains("on");
+  // Skip markeri individuali (entry sau exit) ANTERIORI primei bare EFECTIV
+  // afisate pe chart (CANDLES[CURRENT_SYMBOL][0].time). NU folosim FIRST_TS
+  // pt ca acela vine din state.first_candle_ts (prima bara primita vreodata,
+  // persistata) si poate fi MULT mai vechi decat _candles[0] dupa restart
+  // (ring buffer reset). Verificam fiecare marker SEPARAT: trade-urile
+  // deschise inainte de zona vizibila dar inchise in interior tot afiseaza
+  // exit-ul.
+  const candles = CANDLES[CURRENT_SYMBOL] || [];
+  const firstMs = candles.length ? candles[0].time * 1000 : 0;
   const mk = [];
   filteredTrades.forEach(t => {
     if (t.symbol !== CURRENT_SYMBOL) return;
-    if (showE && t.entry_ms) {
+    if (showE && t.entry_ms && t.entry_ms >= firstMs) {
       mk.push({
         time: Math.floor(t.entry_ms / 1000),
         position: t.side === "L" ? "belowBar" : "aboveBar",
@@ -578,7 +587,7 @@ function buildMarkers(filteredTrades) {
         text: `${t.side} $${t.size_usdt.toFixed(0)}`, size: 2,
       });
     }
-    if (showX && t.exit_ms) {
+    if (showX && t.exit_ms && t.exit_ms >= firstMs) {
       const isTP = t.exit_reason === "BYBIT_TP";
       const isExternal = t.exit_reason === "EXTERNAL";
       mk.push({
@@ -590,9 +599,10 @@ function buildMarkers(filteredTrades) {
       });
     }
   });
-  // Active position pe simbolul curent
+  // Active position pe simbolul curent — sageata live pe bara entry (skip
+  // daca entry_ms anterior firstMs ca sa nu clusterizeze sub prima bara).
   const ap = activePositions[CURRENT_SYMBOL];
-  if (showE && ap && ap.entry_ms) {
+  if (showE && ap && ap.entry_ms && ap.entry_ms >= firstMs) {
     const isL = ap.direction === "LONG";
     const sizeUsd = (ap.qty || 0) * (ap.entry || 0);
     const letter = isL ? "L" : "S";
@@ -833,7 +843,24 @@ function switchSymbol(sym) {
   updateOpenPnl();
   // Markers + sidebar list (sidebar lists ALL trades but markers are filtered by symbol)
   render();
-  chart.timeScale().scrollToRealTime();
+  // Initial view: daca exista pozitie activa, focuseaza pe intervalul
+  // [entry, now] cu padding mic — user vede direct contextul trade-ului
+  // in curs. Clamp `from` la prima bara DISPONIBILA in date (CANDLES[0]):
+  // dupa restart cu entry vechi nu fortam afisarea unui timestamp fara date.
+  // Altfel scrollToRealTime (margine dreapta, cum era).
+  const candles = CANDLES[sym] || [];
+  if (ap && ap.entry_ms && candles.length) {
+    const entryS  = Math.floor(ap.entry_ms / 1000);
+    const firstS  = candles[0].time;
+    const latestS = candles[candles.length - 1].time;
+    const barS    = BAR_DURATION_S;
+    chart.timeScale().setVisibleRange({
+      from: Math.max(entryS - barS * 5, firstS),  // ~5 bare padding inainte de entry
+      to:   latestS + barS * 10,                  // ~10 bare padding la dreapta
+    });
+  } else {
+    chart.timeScale().scrollToRealTime();
+  }
 }
 
 // ============================================================================

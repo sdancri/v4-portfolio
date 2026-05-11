@@ -321,8 +321,8 @@ async def open_position(symbol: str, direction: str, close_price: float,
     # SL si va force chase_close. Print local pt context in logs.
     sl_ok = await ex.set_position_sl(symbol, sl_price, tp_price, qty=qty)
     if not sl_ok:
-        print(f"  [OPEN {symbol}] WARN: entry {direction} fara SL setat — "
-              f"relying on close-pipeline reconcile.")
+        print(f"  [OPEN {symbol}] WARN: entry {direction} fara SL Bybit-armed "
+              f"— fallback software (strategy SL_LONG/SHORT → close_position).")
 
     now_ms = int(time.time() * 1000)
     pos = LivePosition(
@@ -331,7 +331,7 @@ async def open_position(symbol: str, direction: str, close_price: float,
         sl_price=sl_price, tp_price=tp_price,
         leverage=pair_cfg.leverage,
         pos_usd=sizing.pos_usd, risk_usd=sizing.risk_usd,
-        opened_ts_ms=now_ms, order_id=order_id,
+        opened_ts_ms=now_ms, order_id=order_id, sl_armed=sl_ok,
         strategy=pair_cfg.strategy, bars_held=0,
     )
     _state.set_position(symbol, pos)
@@ -388,10 +388,10 @@ async def _assert_closed(symbol: str, qty_local: float,
     print(f"  [RECONCILE {symbol}] HALT: {msg}")
     await tg.send_critical(
         f"{symbol} chase_close esuat ({reason_label})",
-        f"<b>Local qty:</b> {qty_local}\n"
-        f"<b>Bybit qty dupa chase:</b> {qty_after}\n"
+        f"<b>Qty locală:</b> {qty_local}\n"
+        f"<b>Qty Bybit după închidere:</b> {qty_after}\n"
         f"chase_close nu a putut inchide pozitia (Bybit down sau order respins). "
-        f"Bot oprit pentru acest simbol. Verifica manual si restart.",
+        f"Bot oprit pe acest simbol. Verifică manual și restart.",
         symbol=symbol,
     )
     raise ReconciliationError(msg)
@@ -429,10 +429,10 @@ async def _reconcile_close(symbol: str, direction: str,
         print(f"  [RECONCILE {symbol}] HALT: {msg}")
         await tg.send_critical(
             f"{symbol} reconciliere {exit_reason}",
-            f"<b>Local qty:</b> {qty_local}\n"
-            f"<b>Bybit qty:</b> {qty_real}\n"
+            f"<b>Qty locală:</b> {qty_local}\n"
+            f"<b>Qty Bybit:</b> {qty_real}\n"
             f"<b>Exit reason:</b> {exit_reason}\n"
-            f"Bot oprit pentru acest simbol. Verifica manual si restart.",
+            f"Bot oprit pe acest simbol. Verifică manual și restart.",
             symbol=symbol,
         )
         raise ReconciliationError(msg)
@@ -519,7 +519,7 @@ async def _close_position_locked(symbol: str, exit_reason: str,
             if not ok:
                 await tg.send_critical(
                     f"CLOSE FAILED — {symbol}",
-                    "place_market + chase_close au esuat — verifica manual",
+                    "place_market + chase_close au eșuat — verifică manual",
                     symbol=symbol,
                 )
                 log_event("close_failed", symbol=symbol, reason=exit_reason)
@@ -587,7 +587,7 @@ async def _close_position_locked(symbol: str, exit_reason: str,
     ret_pct = ((_state.shared_equity - _state.initial_account)
                / _state.initial_account * 100) if _state.initial_account else 0
     await tg.send(
-        f"{icon} TRADE INCHIS — {pos.direction}",
+        f"{icon} TRADE ÎNCHIS — {pos.direction}",
         f"<b>Entry:</b> {pos.entry_price:.6f}  ({tg.fmt_time(pos.opened_ts_ms)})\n"
         f"<b>Exit:</b>  {avg_exit:.6f}  ({final_exit_reason})  ({tg.fmt_time(now_ms)})\n"
         f"<b>PnL:</b> ${pnl_real:+,.2f}  (Bybit real, fees incluse)\n"
@@ -633,7 +633,7 @@ async def check_external_close(symbol: str) -> bool:
             await tg.send_critical(
                 f"{symbol} qty desync",
                 f"<b>Local:</b> {pos.qty}\n<b>Bybit:</b> {qty_real}\n"
-                f"Bot HALTED pe simbol. Verifica manual.",
+                f"Bot HALTED pe simbol. Verifică manual.",
                 symbol=symbol,
             )
             _halted[symbol] = True
@@ -698,7 +698,7 @@ async def _close_pipeline_external_locked(symbol: str, exit_reason: str,
     ret_pct = ((_state.shared_equity - _state.initial_account)
                / _state.initial_account * 100) if _state.initial_account else 0
     await tg.send(
-        f"{icon} TRADE INCHIS — {pos.direction}",
+        f"{icon} TRADE ÎNCHIS — {pos.direction}",
         f"<b>Entry:</b> {pos.entry_price:.6f}  ({tg.fmt_time(pos.opened_ts_ms)})\n"
         f"<b>Exit:</b>  {avg_exit:.6f}  ({exit_reason})  ({tg.fmt_time(now_ms)})\n"
         f"<b>PnL:</b> ${pnl_real:+,.2f}\n"
@@ -791,8 +791,19 @@ async def on_confirmed_bar(symbol: str, bar: dict) -> None:
                              bar_ts_ms=bar["ts_ms"])
     elif action in ("CLOSE_LONG", "CLOSE_SHORT"):
         await close_position(symbol, "SIGNAL", decision.price)
-    # SL_LONG/TP_LONG/SL_SHORT/TP_SHORT delegate la Bybit setTradingStop —
-    # ne bazam pe private WS position event sa detecteze trigger-ul real.
+    elif action in ("SL_LONG", "SL_SHORT", "TP_LONG", "TP_SHORT"):
+        # Normal: SL/TP atomic Bybit triggereaza intra-bar si private WS
+        # detecteaza close-ul. Strategia evalueaza per bara si returneaza
+        # acelasi signal — il ignoram (pozitia e deja inchisa).
+        # SOFTWARE FALLBACK: cand pos.sl_armed=False (set_position_sl a
+        # esuat la open), Bybit nu va trigerui niciodata SL/TP. In acest
+        # caz folosim signal-ul strategiei ca SL/TP software — escaleaza
+        # la close_position cu reason "{action}_SOFTWARE".
+        if pos is not None and not pos.sl_armed:
+            sw_reason = f"{action}_SOFTWARE"
+            print(f"  [{symbol}] software fallback: {action} (Bybit SL nu e armed) "
+                  f"→ close_position({sw_reason})")
+            await close_position(symbol, sw_reason, decision.price)
 
 
 # ============================================================================
@@ -1032,12 +1043,12 @@ async def bootstrap() -> None:
         for p in CONFIG.pairs if p.enabled
     )
     await tg.send(
-        "BOT STARTED ✅",
+        "BOT PORNIT ✅",
         f"<b>Portfolio:</b> <code>{BOT_NAME}</code>\n"
         f"<b>Strategies:</b> multi (BB MR + Hull+Ichimoku)\n"
         f"<b>Pairs:</b> {pairs_label}\n"
-        f"<b>Account init:</b> ${_state.initial_account:,.2f}\n"
-        f"<b>Started:</b> {tg.fmt_time(_state.start_utc)}\n"
+        f"<b>Account inițial:</b> ${_state.initial_account:,.2f}\n"
+        f"<b>Pornit la:</b> {tg.fmt_time(_state.start_utc)}\n"
         f"<b>Chart:</b> port {CHART_HOST_PORT}",
     )
 
@@ -1066,8 +1077,8 @@ async def lifespan(app: FastAPI):
             ret_pct = ((_state.shared_equity - _state.initial_account)
                        / _state.initial_account * 100) if _state.initial_account else 0
             await tg.send(
-                "BOT STOPPED 🛑",
-                f"<b>Stopped:</b> {tg.fmt_time(datetime.now(timezone.utc))}\n"
+                "BOT OPRIT 🛑",
+                f"<b>Oprit la:</b> {tg.fmt_time(datetime.now(timezone.utc))}\n"
                 f"<b>Equity:</b> ${_state.shared_equity:,.2f}  |  Return: {ret_pct:+.2f}%\n"
                 f"<b>Trades:</b> {len(_state.trades)}",
             )

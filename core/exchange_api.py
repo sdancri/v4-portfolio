@@ -128,10 +128,13 @@ async def _get(endpoint: str, params: dict, signed: bool = True) -> Optional[dic
             if signed:
                 if not key or not secret:
                     return None
-                qs = urllib.parse.urlencode(params)
-                r = await c.get(f"{_base()}{endpoint}",
-                                headers=_sign(key, secret, qs),
-                                params=params)
+                # Build qs ONE TIME, sortat alfabetic. Folosim ACELASI string
+                # si pt semnatura si pt URL — eliminam orice risc ca httpx sa
+                # re-serializeze `params=params` cu alta ordine / encoding si
+                # sa rezulte mismatch cu signature → Bybit 10004 "error sign!".
+                qs = urllib.parse.urlencode(sorted(params.items()))
+                r = await c.get(f"{_base()}{endpoint}?{qs}",
+                                headers=_sign(key, secret, qs))
             else:
                 r = await c.get(f"{_base()}{endpoint}", params=params)
             d = r.json()
@@ -452,11 +455,12 @@ async def set_position_sl(symbol: str, sl_price: float,
         from core import telegram_bot as tg
         tp_line = f"\n<b>tp:</b> {tp_price}" if tp_price is not None else ""
         await tg.send_critical(
-            f"{symbol} SL NOT SET",
-            f"<b>set_position_sl FAILED</b> dupa 4 retry-uri (~7s)\n"
-            f"<b>sl:</b> {sl_price}{tp_line}\n"
-            f"<b>Pozitia ruleaza FARA protectie.</b>\n"
-            f"Reconcilierea va detecta la primul close si va force chase_close.",
+            f"{symbol} SL NESETAT",
+            f"<b>set_position_sl A EȘUAT</b> după 4 reîncercări (~7s)\n"
+            f"<b>SL:</b> {sl_price}{tp_line}\n"
+            f"<b>Poziția rulează FĂRĂ protecție Bybit-side.</b>\n"
+            f"Strategia escaladează SL_LONG/SHORT software → close_position. "
+            f"Reconcilierea la primul close va force chase_close dacă e cazul.",
             symbol=symbol,
         )
     except Exception as tg_e:
