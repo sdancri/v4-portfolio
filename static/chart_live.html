@@ -573,8 +573,12 @@ function buildMarkers(filteredTrades) {
   // (ring buffer reset). Verificam fiecare marker SEPARAT: trade-urile
   // deschise inainte de zona vizibila dar inchise in interior tot afiseaza
   // exit-ul.
+  // CANDLES EMPTY (fresh boot, niciun candle inca): folosim Infinity ca toti
+  // markerii sa fie skipped. Daca am folosi 0, toate ar trece si ar clusteriza
+  // la "epoch 0" cand soseste primul candle. La primul WS tick (vezi handler
+  // mai jos) re-rulam buildMarkers cu firstMs corect.
   const candles = CANDLES[CURRENT_SYMBOL] || [];
-  const firstMs = candles.length ? candles[0].time * 1000 : 0;
+  const firstMs = candles.length ? candles[0].time * 1000 : Infinity;
   const mk = [];
   filteredTrades.forEach(t => {
     if (t.symbol !== CURRENT_SYMBOL) return;
@@ -1015,8 +1019,10 @@ function connectWS() {
       if (!FIRST_TS[sym]) FIRST_TS[sym] = c.time;
       if (c.time < FIRST_TS[sym]) return;
 
-      // Update CANDLES[sym]
+      // Update CANDLES[sym]. wasEmpty = primul candle vreodata pe acest sym
+      // → trigger re-render markers cu firstMs corect (vezi buildMarkers).
       const ring = CANDLES[sym] || (CANDLES[sym] = []);
+      const wasEmpty = ring.length === 0;
       if (ring.length && ring[ring.length - 1].time === c.time) {
         ring[ring.length - 1] = c;
       } else {
@@ -1024,6 +1030,13 @@ function connectWS() {
         if (ring.length > 20000) ring.shift();
       }
       lastPrices[sym] = c.close;
+
+      if (wasEmpty && sym === CURRENT_SYMBOL) {
+        // CANDLES[sym] tocmai a primit primul element — buildMarkers
+        // anterior a skipped totul cu firstMs=Infinity. Re-rulam acum
+        // cu firstMs valid (in render() prin filteredTrades).
+        render();
+      }
 
       // Daca e simbolul curent — update chart
       if (sym === CURRENT_SYMBOL) {
