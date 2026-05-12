@@ -948,8 +948,15 @@ async function loadInit() {
   document.getElementById("title-text").textContent = `${titleLabel} ${PAIRS.join(" • ")} — live`;
 
   // Candles per symbol — payload arrives as {symbol: [[ts,o,h,l,c], ...]}
+  // Defensive: validam ca arr e Array. Daca backend serializeaza altceva
+  // (dict null, string corrupt) chart-ul nu mai crash silent — skip + log.
   const rawCandles = data.candles || {};
   for (const [sym, arr] of Object.entries(rawCandles)) {
+    if (!Array.isArray(arr)) {
+      console.warn(`[CANDLES] ${sym}: payload non-array (${typeof arr}), skip`);
+      CANDLES[sym] = [];
+      continue;
+    }
     CANDLES[sym] = arr.map(c => ({
       time: c[0], open: c[1], high: c[2], low: c[3], close: c[4]
     }));

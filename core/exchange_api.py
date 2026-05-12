@@ -25,8 +25,10 @@ API:
     get_open_orders(symbol)                                 -> list[dict]
     get_order_status(symbol, order_id)                      -> dict | None
     set_leverage(symbol, leverage)                          -> bool
-    set_position_sl(symbol, sl_price, tp_price=None, qty=None) -> bool
-                                                             # qty given → TP=Limit (maker)
+    set_position_sl(symbol, sl_price, tp_price=None, is_initial=True) -> bool
+                                                             # TP=Market (varianta C)
+                                                             # is_initial=False → trailing
+                                                             # update, warning vs critical
 
   PnL:
     fetch_closed_pnl(symbol, start_ms, limit)               -> list[dict]
@@ -358,38 +360,30 @@ async def set_leverage(symbol: str, leverage: int) -> bool:
 
 async def set_position_sl(symbol: str, sl_price: float,
                           tp_price: Optional[float] = None,
-                          qty: Optional[float] = None) -> bool:
+                          is_initial: bool = True) -> bool:
     """
     setTradingStop: atasaza SL (si optional TP) la pozitia DESCHISA, atomic.
     Bybit triggereaza intra-bar pe LastPrice (high/low).
 
-    Pattern fee management (din boilerplate):
-        Action | Type                                   | Fee
-        -------+----------------------------------------+----------------------------
-        Entry  | maker_entry_or_market                  | maker 0.01% / taker 0.055%
-        SL     | atomic Bybit Market (siguranta gap)    | taker 0.055%
-        TP     | atomic Bybit Limit cu tpLimitPrice     | maker 0.020%
-               | (~0.05% past trigger pt fill prob)     |
+    Pattern fee management (varianta C — robust, simplu):
+        Action | Type                                            | Fee
+        -------+-------------------------------------------------+--------------
+        Entry  | maker_entry_or_market                           | maker 0.02%
+        SL     | atomic Bybit Market (siguranta gap)             | taker 0.055%
+        TP     | atomic Bybit Market (deterministic la trigger)  | taker 0.055%
 
-    SL = ALWAYS Market (siguranta executiei pe gap, nu economisim aici).
+    Net: ~0.075% fee total/trade. Vs maker+maker teoretic (~0.04%) pierdem
+    ~3.5 bps pe TP-side — irelevant pe target R mare. Beneficiu: TP executa
+    GARANTAT la trigger (fara spike-through pe alts subtiri), independent
+    de bot/WS uptime. Cod minim: tpslMode=Full default + tpOrderType=Market.
 
-    TP = Limit (maker) cand `qty` e dat. La trigger, Bybit plaseaza intern un
-    Limit reduce-only la `tpLimitPrice` = tp_price ± 0.05% (long: above, short:
-    below) → ramane in book ca maker, nu cross spread. Daca pretul whipsaza
-    inapoi prin TP fara fill volume, limit-ul "stick" pana revine — backstop
-    e signal exit / time-exit din strategia.
+    Args:
+      is_initial: True (default) = primul SL pe pozitie (post-fill). False =
+                  update trailing/breakeven (pozitia are deja un SL valid; un
+                  fail aici NU e critical — Telegram trimite warning, NU
+                  critical).
 
-    Constraint Bybit: tpOrderType=Limit cere tpslMode=Partial cu tpSize/slSize
-    explicite. tpslMode=Full + Limit = respins ("only Market when Full").
-
-    Direction inferata din sl_price vs tp_price:
-        LONG:  sl < entry < tp  → tpLimitPrice > tp (slightly above)
-        SHORT: tp < entry < sl  → tpLimitPrice < tp (slightly below)
-
-    Fallback: qty=None → TP Market (legacy). Apelat asa cand caller nu cunoaste
-    qty (ex: post-fill before bar_meta complete).
-
-    Retry 3x backoff 1/2/4s — race condition place_market → set-trading-stop
+    Retry 3x backoff 1/2/4s — race condition place_market → trading-stop
     (Bybit poate avea cateva sute ms pana cand pozitia apare activa).
     """
     info = await get_market_info(symbol)
@@ -397,43 +391,17 @@ async def set_position_sl(symbol: str, sl_price: float,
         "category": _cat(),
         "symbol": symbol,
         "positionIdx": 0,  # one-way mode
+        "stopLoss": _fmt_price(sl_price, info["price_prec"]),
+        "slTriggerBy": "LastPrice",
+        "slOrderType": "Market",
     }
-
-    if tp_price is not None and qty is not None and qty > 0:
-        # MAKER TP via Limit + Partial mode (economisesc 0.035%/hit)
-        is_long = sl_price < tp_price
-        tp_limit = tp_price * (1 + 0.0005) if is_long else tp_price * (1 - 0.0005)
-        qty_str = _fmt_qty(qty, info["qty_prec"])
+    if tp_price is not None:
+        # TP server-side ca Market (varianta C — robust, simplu).
+        # tpslMode=Full e default; tpOrderType=Market e explicit pt claritate.
         payload.update({
-            "tpslMode": "Partial",
-            "stopLoss": _fmt_price(sl_price, info["price_prec"]),
-            "slTriggerBy": "LastPrice",
-            "slOrderType": "Market",
-            "slSize": qty_str,
-            "takeProfit": _fmt_price(tp_price, info["price_prec"]),
-            "tpTriggerBy": "LastPrice",
-            "tpOrderType": "Limit",
-            "tpLimitPrice": _fmt_price(tp_limit, info["price_prec"]),
-            "tpSize": qty_str,
-        })
-    elif tp_price is not None:
-        # Fallback legacy: TP Market (qty necunoscut)
-        payload.update({
-            "tpslMode": "Full",
-            "stopLoss": _fmt_price(sl_price, info["price_prec"]),
-            "slTriggerBy": "LastPrice",
-            "slOrderType": "Market",
             "takeProfit": _fmt_price(tp_price, info["price_prec"]),
             "tpTriggerBy": "LastPrice",
             "tpOrderType": "Market",
-        })
-    else:
-        # SL only
-        payload.update({
-            "tpslMode": "Full",
-            "stopLoss": _fmt_price(sl_price, info["price_prec"]),
-            "slTriggerBy": "LastPrice",
-            "slOrderType": "Market",
         })
 
     for attempt, delay in enumerate([0, 1.0, 2.0, 4.0]):
@@ -445,26 +413,44 @@ async def set_position_sl(symbol: str, sl_price: float,
                 print(f"  [BYBIT] set_position_sl OK dupa retry #{attempt}")
             return True
         print(f"  [BYBIT] set_position_sl FAIL #{attempt+1}/4")
-    print(f"  [BYBIT] set_position_sl FAILED definitiv pe {symbol} sl={sl_price} — "
-          f"pozitia ruleaza FARA protectie!")
-    # Alerta CRITICA via Telegram — user-ul trebuie sa stie imediat (loguri
-    # nu sunt checked in real time pe productie). Best-effort: tg.send fail
-    # NU altereaza return-ul (caller-ul vede oricum False si stie sa actioneze).
-    # Import local pt evitare circular dependency.
+    tp_info = f" tp={tp_price}" if tp_price is not None else ""
+    print(f"  [BYBIT] set_position_sl FAILED definitiv pe {symbol} "
+          f"sl={sl_price}{tp_info} — pozitia ruleaza FARA protectie!")
+    # Alerta Telegram diferentiata pe is_initial:
+    #   is_initial=True (primul SL post-fill): tg.send_critical — URGENT,
+    #     pozitia ruleaza fara nicio protectie Bybit-side.
+    #   is_initial=False (trailing/breakeven update): tg.send — warning,
+    #     pozitia ramane protejata de SL initial setat anterior.
+    # Best-effort: tg.send fail NU altereaza return-ul.
     try:
         from core import telegram_bot as tg
-        tp_line = f"\n<b>tp:</b> {tp_price}" if tp_price is not None else ""
-        await tg.send_critical(
-            f"{symbol} SL NESETAT",
-            f"<b>set_position_sl A EȘUAT</b> după 4 reîncercări (~7s)\n"
-            f"<b>SL:</b> {sl_price}{tp_line}\n"
-            f"<b>Poziția rulează FĂRĂ protecție Bybit-side.</b>\n"
-            f"Strategia escaladează SL_LONG/SHORT software → close_position. "
-            f"Reconcilierea la primul close va force chase_close dacă e cazul.",
-            symbol=symbol,
-        )
+        tp_line = f"<b>TP:</b> {tp_price}\n" if tp_price is not None else ""
+        if is_initial:
+            await tg.send_critical(
+                f"{symbol} SL/TP NESETAT" if tp_price is not None else f"{symbol} SL NESETAT",
+                f"<b>set_position_sl A EȘUAT</b> după 4 reîncercări (~7s)\n"
+                f"<b>SL:</b> {sl_price}\n"
+                f"{tp_line}"
+                f"<b>Poziția rulează FĂRĂ protecție Bybit-side.</b>\n"
+                f"Strategia escaladează SL_LONG/SHORT software → close_position. "
+                f"Reconcilierea la primul close va force chase_close dacă e cazul.",
+                symbol=symbol,
+            )
+        else:
+            # Trailing/breakeven update — pozitia are deja SL valid pe Bybit;
+            # un fail aici inseamna doar ca trailing-ul n-a putut muta SL-ul,
+            # nu o urgenta. Warning normal, nu critical.
+            await tg.send(
+                f"{symbol} SL trailing update FAILED",
+                f"<b>set_position_sl A EȘUAT</b> după 4 reîncercări (~7s)\n"
+                f"<b>SL țintit:</b> {sl_price}\n"
+                f"{tp_line}"
+                f"Poziția rămâne protejată de SL-ul inițial setat anterior.\n"
+                f"Strategy poate reîncerca pe următoarea bară.",
+                symbol=symbol,
+            )
     except Exception as tg_e:
-        print(f"  [BYBIT] tg.send_critical failed: {tg_e}")
+        print(f"  [BYBIT] tg send failed: {tg_e}")
     return False
 
 
