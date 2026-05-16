@@ -354,21 +354,22 @@ async def open_position(symbol: str, direction: str, close_price: float,
         "entry_ms": chart_entry_ms,
     })
 
-    # Telegram — afiseaza fill real (match cu Bybit App) + tip fill (maker/taker/mixed)
+    # Telegram — afiseaza fill real (match cu Bybit App) + tip fill (maker/taker/mixed).
+    # smart_price = auto-precision pe magnitudine (~5 cifre semnificative).
     icon = "🟢" if direction == "LONG" else "🔴"
-    tp_line = f"\n<b>TP:</b> {tp_price:.6f}  <i>(Limit, maker)</i>" if tp_price else ""
+    tp_line = f"\n<b>TP:</b> {ex.smart_price(tp_price)}  <i>(Market atomic)</i>" if tp_price else ""
     slip_line = ""
     if abs(real_fill_price - close_price) > 0:
         slip_bps = (real_fill_price - close_price) / close_price * 10000
-        slip_line = f"  <i>(signal {close_price:.6f}, slip {slip_bps:+.1f}bps)</i>"
+        slip_line = f"  <i>(signal {ex.smart_price(close_price)}, slip {slip_bps:+.1f}bps)</i>"
     fill_emoji = {"maker": "🟢", "mixed": "🟡", "taker": "🔴"}.get(fill_kind, "⚪")
     await tg.send(
         f"{icon} ENTRY {direction}",
         f"<b>Strategy:</b> <code>{_strategy_label(pair_cfg.strategy)}</code>\n"
         f"<b>Fill:</b> {fill_emoji} <code>{fill_kind}</code>\n"
-        f"<b>Entry:</b> {real_fill_price:.6f}{slip_line}  ({tg.fmt_time(now_ms)})\n"
+        f"<b>Entry:</b> {ex.smart_price(real_fill_price)}{slip_line}  ({tg.fmt_time(now_ms)})\n"
         f"<b>Qty:</b> {qty}  (${sizing.pos_usd:,.2f})\n"
-        f"<b>SL:</b> {sl_price:.6f}  ({sl_pct_use*100:.1f}%, Market){tp_line}\n"
+        f"<b>SL:</b> {ex.smart_price(sl_price)}  ({sl_pct_use*100:.1f}%, Market){tp_line}\n"
         f"<b>Risk:</b> ${sizing.risk_usd:,.2f}  ({pair_cfg.risk_pct_per_trade*100:.0f}% × ${_state.shared_equity:,.2f})",
         symbol=symbol,
     )
@@ -589,20 +590,28 @@ async def _close_position_locked(symbol: str, exit_reason: str,
 
     ret_pct = ((_state.shared_equity - _state.initial_account)
                / _state.initial_account * 100) if _state.initial_account else 0
-    await tg.send(
-        f"{icon} TRADE ÎNCHIS — {pos.direction}",
-        f"<b>Entry:</b> {pos.entry_price:.6f}  ({tg.fmt_time(pos.opened_ts_ms)})\n"
-        f"<b>Exit:</b>  {avg_exit:.6f}  ({final_exit_reason})  ({tg.fmt_time(now_ms)})\n"
-        f"<b>PnL:</b> ${pnl_real:+,.2f}  (Bybit real, fees incluse)\n"
-        f"<b>Equity:</b> ${_state.shared_equity:,.2f}  |  Return: {ret_pct:+.2f}%",
-        symbol=symbol,
-    )
+    # Best-effort tg.send + broadcast — daca pica, trade-ul ramane corect
+    # inregistrat in _state (pipeline-ul nu cade pe notification failure).
+    try:
+        await tg.send(
+            f"{icon} TRADE ÎNCHIS — {pos.direction}",
+            f"<b>Entry:</b> {ex.smart_price(pos.entry_price)}  ({tg.fmt_time(pos.opened_ts_ms)})\n"
+            f"<b>Exit:</b>  {ex.smart_price(avg_exit)}  ({final_exit_reason})  ({tg.fmt_time(now_ms)})\n"
+            f"<b>PnL:</b> ${pnl_real:+,.2f}  (Bybit real, fees incluse)\n"
+            f"<b>Equity:</b> ${_state.shared_equity:,.2f}  |  Return: {ret_pct:+.2f}%",
+            symbol=symbol,
+        )
+    except Exception as e:
+        print(f"  [CLOSE {symbol}] tg.send failed (best-effort): {e!r}")
 
     # Broadcast to chart (trade_closed include equity_point pt update curve)
-    eq_point = (_state.equity_curve[-1] if _state.equity_curve else None)
-    await broadcast({"type": "trade_closed", "symbol": symbol,
-                     "trade": trade.to_dict(), "summary": _state.summary(),
-                     "equity_point": eq_point})
+    try:
+        eq_point = (_state.equity_curve[-1] if _state.equity_curve else None)
+        await broadcast({"type": "trade_closed", "symbol": symbol,
+                         "trade": trade.to_dict(), "summary": _state.summary(),
+                         "equity_point": eq_point})
+    except Exception as e:
+        print(f"  [CLOSE {symbol}] broadcast failed (best-effort): {e!r}")
 
     # Post-close equity sync
     await sync_equity(reason=f"CLOSE_{symbol}")
@@ -700,18 +709,25 @@ async def _close_pipeline_external_locked(symbol: str, exit_reason: str,
     icon = "⚠️" if exit_reason == "EXTERNAL" else "🎯"
     ret_pct = ((_state.shared_equity - _state.initial_account)
                / _state.initial_account * 100) if _state.initial_account else 0
-    await tg.send(
-        f"{icon} TRADE ÎNCHIS — {pos.direction}",
-        f"<b>Entry:</b> {pos.entry_price:.6f}  ({tg.fmt_time(pos.opened_ts_ms)})\n"
-        f"<b>Exit:</b>  {avg_exit:.6f}  ({exit_reason})  ({tg.fmt_time(now_ms)})\n"
-        f"<b>PnL:</b> ${pnl_real:+,.2f}\n"
-        f"<b>Equity:</b> ${_state.shared_equity:,.2f}  |  Return: {ret_pct:+.2f}%",
-        symbol=symbol,
-    )
-    eq_point = (_state.equity_curve[-1] if _state.equity_curve else None)
-    await broadcast({"type": "trade_closed", "symbol": symbol,
-                     "trade": trade.to_dict(), "summary": _state.summary(),
-                     "equity_point": eq_point})
+    # Best-effort: tg + broadcast nu blocheaza state cleanup.
+    try:
+        await tg.send(
+            f"{icon} TRADE ÎNCHIS — {pos.direction}",
+            f"<b>Entry:</b> {ex.smart_price(pos.entry_price)}  ({tg.fmt_time(pos.opened_ts_ms)})\n"
+            f"<b>Exit:</b>  {ex.smart_price(avg_exit)}  ({exit_reason})  ({tg.fmt_time(now_ms)})\n"
+            f"<b>PnL:</b> ${pnl_real:+,.2f}\n"
+            f"<b>Equity:</b> ${_state.shared_equity:,.2f}  |  Return: {ret_pct:+.2f}%",
+            symbol=symbol,
+        )
+    except Exception as e:
+        print(f"  [CLOSE-EXT {symbol}] tg.send failed (best-effort): {e!r}")
+    try:
+        eq_point = (_state.equity_curve[-1] if _state.equity_curve else None)
+        await broadcast({"type": "trade_closed", "symbol": symbol,
+                         "trade": trade.to_dict(), "summary": _state.summary(),
+                         "equity_point": eq_point})
+    except Exception as e:
+        print(f"  [CLOSE-EXT {symbol}] broadcast failed (best-effort): {e!r}")
     await sync_equity(reason=f"CLOSE_{symbol}")
 
 
@@ -858,7 +874,12 @@ async def public_ws_loop() -> None:
                                 "volume": float(k.get("volume", 0)),
                                 "confirmed": confirmed,
                             }
-                            # Track all bars in candles ring (for chart)
+                            # Track all bars in candles ring (for chart).
+                            # Confirmed bars: dedup pe ts (un singur ts unic
+                            # per bara confirmed). Unconfirmed bars (intra-bar
+                            # tick-uri): TOT broadcast la chart pt update real-time,
+                            # dar fara dedup si fara on_confirmed_bar (NU evaluam
+                            # strategia pe tick — doar pe bara inchisa).
                             ts_s = ts_ms // 1000
                             ring = _candles.setdefault(symbol, [])
                             if ring and ring[-1][0] == ts_s:
@@ -873,7 +894,7 @@ async def public_ws_loop() -> None:
                             if confirmed:
                                 last_synced = _last_synced_ts.get(symbol, 0)
                                 if ts_s <= last_synced:
-                                    continue  # dedup
+                                    continue  # dedup confirmed only
                                 _last_synced_ts[symbol] = ts_s
                                 _state.mark_first_candle(symbol, ts_s)
                                 try:
@@ -881,6 +902,21 @@ async def public_ws_loop() -> None:
                                 except Exception:
                                     print(f"  [{symbol}] on_confirmed_bar CRASHED:\n"
                                           f"{traceback.format_exc()}")
+                            else:
+                                # Intra-bar tick → broadcast candle update la chart
+                                # (chart-ul vede pretul in formare in timp real).
+                                # NU evaluam strategie aici.
+                                try:
+                                    await broadcast({
+                                        "type": "candle", "symbol": symbol,
+                                        "candle": {"time": ts_s,
+                                                   "open": bar["open"],
+                                                   "high": bar["high"],
+                                                   "low": bar["low"],
+                                                   "close": bar["close"]},
+                                    })
+                                except Exception:
+                                    pass  # best-effort, nu blocam WS loop
                 finally:
                     hb.cancel()
         except Exception as e:

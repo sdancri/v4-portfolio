@@ -469,12 +469,18 @@ function showLiveLines(p) {
     color, lineWidth: 2, lineStyle: 0,
     priceLineVisible: false, lastValueVisible: true, crosshairMarkerVisible: false,
     title,
+    // Opt-out din autoscale: TP/SL la valori extreme (ex tp=0 sentinel pe
+    // strategii fara TP initial) NU mai trag price scale-ul si turtesc
+    // candle-urile. Candle series ramane unicul driver autoscale.
+    autoscaleInfoProvider: () => null,
   });
   liveEntryLine = mkSer(entryColor, `LIVE ${p.direction}`);
   liveSlLine    = mkSer("#ff3352",  "LIVE SL");
   liveEntryLine.setData([{time: startTs, value: p.entry}, {time: endTs, value: p.entry}]);
   liveSlLine   .setData([{time: startTs, value: p.sl},    {time: endTs, value: p.sl}]);
-  if (p.tp) {
+  // Guard p.tp > 0: strategii fara TP initial pot trimite tp=0 / null /
+  // undefined ca sentinel → nu cream linie TP.
+  if (p.tp && p.tp > 0) {
     liveTpLine = mkSer("#00e676",  "LIVE TP");
     liveTpLine.setData([{time: startTs, value: p.tp}, {time: endTs, value: p.tp}]);
   }
@@ -486,7 +492,7 @@ function extendLiveLines(latestTs) {
   if (latestTs < startTs) return;
   liveEntryLine.setData([{time: startTs, value: p.entry}, {time: latestTs, value: p.entry}]);
   liveSlLine   .setData([{time: startTs, value: p.sl},    {time: latestTs, value: p.sl}]);
-  if (liveTpLine && p.tp) {
+  if (liveTpLine && p.tp && p.tp > 0) {
     liveTpLine.setData([{time: startTs, value: p.tp}, {time: latestTs, value: p.tp}]);
   }
 }

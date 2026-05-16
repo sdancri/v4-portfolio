@@ -201,6 +201,19 @@ def round_qty_down(qty: float, step: float) -> float:
     return math.floor(qty / step) * step
 
 
+def smart_price(p: float) -> str:
+    """
+    Format pret pentru AFISARE (Telegram, loguri). Auto-precision pe baza
+    magnitudinii (~5 cifre semnificative) — functioneaza corect si pe coin-uri
+    sub 1$ (KAIA, etc.). NU folosi pentru payload-uri Bybit (foloseste _fmt_price
+    care respecta per-symbol price_prec din instruments-info).
+    """
+    if not p or not math.isfinite(p) or p <= 0:
+        return f"{p}"
+    prec = max(2, min(8, 4 - math.floor(math.log10(abs(p)))))
+    return f"{p:.{prec}f}"
+
+
 # ============================================================================
 # Market data
 # ============================================================================
@@ -424,12 +437,16 @@ async def set_position_sl(symbol: str, sl_price: float,
     # Best-effort: tg.send fail NU altereaza return-ul.
     try:
         from core import telegram_bot as tg
-        tp_line = f"<b>TP:</b> {tp_price}\n" if tp_price is not None else ""
+        # smart_price = auto-precision (~5 cifre semnificative), corect si pe
+        # coin-uri sub 1$. Folosit doar in Telegram/log, NU in payload Bybit.
+        sl_str = smart_price(sl_price)
+        tp_str = smart_price(tp_price) if tp_price is not None else None
+        tp_line = f"<b>TP:</b> {tp_str}\n" if tp_str is not None else ""
         if is_initial:
             await tg.send_critical(
                 f"{symbol} SL/TP NESETAT" if tp_price is not None else f"{symbol} SL NESETAT",
                 f"<b>set_position_sl A EȘUAT</b> după 4 reîncercări (~7s)\n"
-                f"<b>SL:</b> {sl_price}\n"
+                f"<b>SL:</b> {sl_str}\n"
                 f"{tp_line}"
                 f"<b>Poziția rulează FĂRĂ protecție Bybit-side.</b>\n"
                 f"Strategia escaladează SL_LONG/SHORT software → close_position. "
@@ -443,7 +460,7 @@ async def set_position_sl(symbol: str, sl_price: float,
             await tg.send(
                 f"{symbol} SL trailing update FAILED",
                 f"<b>set_position_sl A EȘUAT</b> după 4 reîncercări (~7s)\n"
-                f"<b>SL țintit:</b> {sl_price}\n"
+                f"<b>SL țintit:</b> {sl_str}\n"
                 f"{tp_line}"
                 f"Poziția rămâne protejată de SL-ul inițial setat anterior.\n"
                 f"Strategy poate reîncerca pe următoarea bară.",
