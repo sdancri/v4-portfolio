@@ -77,6 +77,17 @@ def _creds() -> tuple[str, str]:
     return os.getenv("BYBIT_API_KEY", ""), os.getenv("BYBIT_API_SECRET", "")
 
 
+# retCode-uri Bybit care semnifica "no-op" (nu eroare). Le tratam ca SUCCES
+# SILENT — returnam dict gol in loc de None ca caller-ul (ex set_position_sl)
+# sa NU intre pe ramura de FAIL/retry/Telegram-warn la fiecare bara.
+#   34040 — "not modified" pe /v5/position/trading-stop (SL/TP identic cu cel
+#           deja setat; tipic la trailing cand noua valoare rotunjeste la
+#           acelasi tick ca cea existenta SAU la re-deploy / restart cand bot
+#           reataseaza pozitia si trimite identic SL).
+# Adauga aici alte coduri "no-op" pe masura ce le intalnesti.
+_NOOP_RETCODES: set[int] = {34040}
+
+
 def _sign(key: str, secret: str, payload: str) -> dict:
     ts = str(int(time.time() * 1000))
     recv = "5000"
@@ -113,8 +124,13 @@ async def _post(endpoint: str, body: dict) -> Optional[dict]:
                 print(f"  [BYBIT] {endpoint} HTTP {r.status_code} non-JSON: "
                       f"{(r.text or '<empty>')[:200]!r} ({je})")
                 return None
-        if d.get("retCode") != 0:
-            print(f"  [BYBIT] {endpoint} {d['retCode']}: {d['retMsg']}")
+        rc = d.get("retCode")
+        if rc != 0:
+            if rc in _NOOP_RETCODES:
+                # No-op silent (ex 34040 trading-stop "not modified"). Caller
+                # vede dict non-None si trateaza ca succes — fara retry/Telegram.
+                return {}
+            print(f"  [BYBIT] {endpoint} {rc}: {d.get('retMsg')}")
             return None
         return d.get("result")
     except Exception as e:
@@ -140,8 +156,11 @@ async def _get(endpoint: str, params: dict, signed: bool = True) -> Optional[dic
             else:
                 r = await c.get(f"{_base()}{endpoint}", params=params)
             d = r.json()
-        if d.get("retCode") != 0:
-            print(f"  [BYBIT] {endpoint} {d['retCode']}: {d['retMsg']}")
+        rc = d.get("retCode")
+        if rc != 0:
+            if rc in _NOOP_RETCODES:
+                return {}
+            print(f"  [BYBIT] {endpoint} {rc}: {d.get('retMsg')}")
             return None
         return d.get("result")
     except Exception as e:
