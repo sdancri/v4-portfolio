@@ -1042,7 +1042,10 @@ async def bootstrap() -> None:
         print(f"  [{sym}] strategy={_strategy_label(pair_cfg.strategy)}")
         _signals[sym] = sig
         _pair_cfgs[sym] = pair_cfg
-        _state.set_position(sym, None)
+        # NU clobberam _state.positions[sym] aici — daca _state.load() a
+        # restaurat un LivePosition pentru acest simbol, vrem sa-l pastram
+        # si sa-l reconciliem cu Bybit mai jos. _state.get_position() returneaza
+        # oricum None pe missing key (no need pt explicit set).
 
         # Set leverage
         await ex.set_leverage(sym, pair_cfg.leverage)
@@ -1060,6 +1063,27 @@ async def bootstrap() -> None:
             print(f"  [{sym}] warmup {len(bars)} bars  last={df.index[-1]}")
         else:
             print(f"  [{sym}] WARN: warmup returned 0 bars")
+
+        # Boot-time reconcile (resume): daca _state.load() a restaurat o pozitie
+        # pe acest simbol, verificam ca inca exista pe Bybit. Daca a fost
+        # inchisa extern intre runs (manual / SL/TP atomic), sintetizam close
+        # acum in loc sa asteptam urmatoarea bara confirmed.
+        restored_pos = _state.get_position(sym)
+        if restored_pos is not None:
+            bybit_pos = await ex.fetch_open_position(sym)
+            if bybit_pos is None:
+                print(f"  [{sym}] resume: restored pos but Bybit qty=0 → "
+                      f"sintetizam close EXTERNAL")
+                last_close = (float(sig.df.iloc[-1]["close"])
+                              if len(sig.df) else restored_pos.entry_price)
+                try:
+                    await close_pipeline_external(sym, "EXTERNAL_AT_RESUME",
+                                                   target_price=last_close)
+                except Exception as e:
+                    print(f"  [{sym}] resume close failed: {e!r}")
+            else:
+                print(f"  [{sym}] resume: pos OK pe Bybit "
+                      f"({bybit_pos['direction']} qty={bybit_pos['qty']})")
 
     # INIT equity sync
     await sync_equity(reason="INIT")

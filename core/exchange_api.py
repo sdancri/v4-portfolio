@@ -13,7 +13,8 @@ API:
 
   Account:
     get_balance()                            -> float (USDT available)
-    get_position(symbol)                     -> {size, avgPrice, side, ...} | None
+    get_position(symbol)                     -> raw Bybit position dict | None
+    fetch_open_position(symbol)              -> normalized {direction, qty, entry_price, sl_price, tp_price, ...} | None
 
   Orders:
     place_market(symbol, side, qty, reduce_only)            -> orderId | None
@@ -302,8 +303,11 @@ async def get_balance() -> Optional[float]:
 
 async def get_position(symbol: str) -> Optional[dict]:
     """
-    Full position info: size, avgPrice, side ("Buy"/"Sell"/""), unrealisedPnl, etc.
-    Returns None if no position or API error.
+    Full position info RAW Bybit: size, avgPrice, side ("Buy"/"Sell"/""),
+    unrealisedPnl, etc. Returns None if no position or API error.
+
+    Pentru output normalizat (LONG/SHORT, sl_price, tp_price ca floats) vezi
+    `fetch_open_position(symbol)`.
     """
     r = await _get("/v5/position/list",
                    {"category": _cat(), "symbol": symbol})
@@ -312,6 +316,61 @@ async def get_position(symbol: str) -> Optional[dict]:
     for p in r.get("list", []):
         if p["symbol"] == symbol and float(p.get("size", 0)) > 0:
             return p
+    return None
+
+
+async def fetch_open_position(symbol: str) -> Optional[dict]:
+    """
+    Detalii complete despre pozitia deschisa pe `symbol`, output normalizat.
+    Util pentru restart-recovery la bootstrap (verificare ca pozitia restaurata
+    din _state.load() inca exista pe Bybit) sau monitoring custom.
+
+    Returneaza None daca nu e nicio pozitie (size=0 sau side gol) sau pe error.
+
+    Output:
+      {
+        "direction":   "LONG" | "SHORT",   # mapat din Bybit side Buy/Sell
+        "qty":         float,              # size in coin
+        "entry_price": float,              # avgPrice ponderat (incl. piramidari)
+        "sl_price":    float | None,       # stopLoss (None daca nu e setat)
+        "tp_price":    float | None,       # takeProfit (None daca nu e setat)
+        "created_ms":  int,                # createdTime Bybit (entry initial)
+        "updated_ms":  int,                # ultima modificare server-side
+        "raw":         dict,               # raw record pt debug
+      }
+    """
+    r = await _get("/v5/position/list",
+                   {"category": _cat(), "symbol": symbol})
+    if not r:
+        return None
+    for p in r.get("list", []):
+        if p.get("symbol") != symbol:
+            continue
+        try:
+            size = float(p.get("size", 0) or 0)
+        except (ValueError, TypeError):
+            size = 0.0
+        if size <= 0:
+            continue
+        side = p.get("side", "")
+        if side not in ("Buy", "Sell"):
+            continue
+        sl_raw = p.get("stopLoss") or ""
+        tp_raw = p.get("takeProfit") or ""
+        try:
+            return {
+                "direction":   "LONG" if side == "Buy" else "SHORT",
+                "qty":         size,
+                "entry_price": float(p.get("avgPrice", 0) or 0),
+                "sl_price":    float(sl_raw) if sl_raw else None,
+                "tp_price":    float(tp_raw) if tp_raw else None,
+                "created_ms":  int(p.get("createdTime", 0) or 0),
+                "updated_ms":  int(p.get("updatedTime", 0) or 0),
+                "raw":         p,
+            }
+        except (ValueError, TypeError) as e:
+            print(f"  [BYBIT] fetch_open_position {symbol} parse error: {e}")
+            return None
     return None
 
 
@@ -419,17 +478,21 @@ async def set_position_sl(symbol: str, sl_price: float,
     (Bybit poate avea cateva sute ms pana cand pozitia apare activa).
     """
     info = await get_market_info(symbol)
+    # tpslMode "Full" EXPLICIT — Bybit V5 cere field-ul (NU e default chiar
+    # daca docs sugereaza). Fara el, payload-ul cu tp_price poate fi respins
+    # silent / cu retCode neasteptat. Asta pt orice trading-stop payload.
     payload: dict = {
         "category": _cat(),
         "symbol": symbol,
         "positionIdx": 0,  # one-way mode
+        "tpslMode": "Full",
         "stopLoss": _fmt_price(sl_price, info["price_prec"]),
         "slTriggerBy": "LastPrice",
         "slOrderType": "Market",
     }
     if tp_price is not None:
         # TP server-side ca Market (varianta C — robust, simplu).
-        # tpslMode=Full e default; tpOrderType=Market e explicit pt claritate.
+        # tpOrderType=Market explicit pt claritate.
         payload.update({
             "takeProfit": _fmt_price(tp_price, info["price_prec"]),
             "tpTriggerBy": "LastPrice",
