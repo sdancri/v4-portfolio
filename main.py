@@ -1064,26 +1064,50 @@ async def bootstrap() -> None:
         else:
             print(f"  [{sym}] WARN: warmup returned 0 bars")
 
-        # Boot-time reconcile (resume): daca _state.load() a restaurat o pozitie
-        # pe acest simbol, verificam ca inca exista pe Bybit. Daca a fost
-        # inchisa extern intre runs (manual / SL/TP atomic), sintetizam close
-        # acum in loc sa asteptam urmatoarea bara confirmed.
-        restored_pos = _state.get_position(sym)
-        if restored_pos is not None:
-            bybit_pos = await ex.fetch_open_position(sym)
-            if bybit_pos is None:
-                print(f"  [{sym}] resume: restored pos but Bybit qty=0 → "
-                      f"sintetizam close EXTERNAL")
-                last_close = (float(sig.df.iloc[-1]["close"])
-                              if len(sig.df) else restored_pos.entry_price)
-                try:
-                    await close_pipeline_external(sym, "EXTERNAL_AT_RESUME",
-                                                   target_price=last_close)
-                except Exception as e:
-                    print(f"  [{sym}] resume close failed: {e!r}")
-            else:
-                print(f"  [{sym}] resume: pos OK pe Bybit "
-                      f"({bybit_pos['direction']} qty={bybit_pos['qty']})")
+        # Boot-time resume: V4 NU persista LivePosition in bot_state.json (doar
+        # trades + equity). Single source of truth pt pozitii active = Bybit.
+        # Scanam Bybit la fiecare bootstrap si construim LivePosition din
+        # datele exchange-ului (qty, entry_price, sl_price, tp_price, direction).
+        bybit_pos = await ex.fetch_open_position(sym)
+        if bybit_pos is not None:
+            entry_px = bybit_pos["entry_price"]
+            qty_real = bybit_pos["qty"]
+            dir_real = bybit_pos["direction"]
+            sl_real  = bybit_pos["sl_price"]
+            tp_real  = bybit_pos["tp_price"]
+            # SL fallback: daca Bybit n-are stopLoss setat (rar, dar posibil
+            # daca set_position_sl a esuat fara recovery), calculam fallback
+            # din entry * (1 ± effective_sl_pct).
+            if sl_real is None or sl_real <= 0:
+                sl_pct = pair_cfg.effective_sl_pct
+                sl_real = (entry_px * (1 - sl_pct) if dir_real == "LONG"
+                           else entry_px * (1 + sl_pct))
+                print(f"  [{sym}] resume: Bybit sl_price absent → fallback {sl_real}")
+            pos_usd = qty_real * entry_px
+            risk_usd = pos_usd * pair_cfg.effective_sl_pct
+            opened_ts = bybit_pos["created_ms"] or int(time.time() * 1000)
+            resumed = LivePosition(
+                symbol=sym,
+                side=("Buy" if dir_real == "LONG" else "Sell"),
+                direction=dir_real,
+                qty=qty_real,
+                entry_price=entry_px,
+                sl_price=sl_real,
+                tp_price=tp_real,
+                leverage=pair_cfg.leverage,
+                pos_usd=pos_usd,
+                risk_usd=risk_usd,
+                opened_ts_ms=opened_ts,
+                order_id="",                  # lost dupa restart, irelevant
+                strategy=pair_cfg.strategy,
+                bars_held=0,                   # restart de la 0 (BB MR time-exit
+                                                # poate fi prelungit cu cateva bare)
+                sl_armed=(bybit_pos["sl_price"] is not None
+                          and bybit_pos["sl_price"] > 0),
+            )
+            _state.set_position(sym, resumed)
+            print(f"  [{sym}] resume: pos restaurata din Bybit "
+                  f"({dir_real} qty={qty_real} entry={entry_px} sl={sl_real})")
 
     # INIT equity sync
     await sync_equity(reason="INIT")
