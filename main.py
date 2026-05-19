@@ -1075,14 +1075,35 @@ async def bootstrap() -> None:
             dir_real = bybit_pos["direction"]
             sl_real  = bybit_pos["sl_price"]
             tp_real  = bybit_pos["tp_price"]
-            # SL fallback: daca Bybit n-are stopLoss setat (rar, dar posibil
-            # daca set_position_sl a esuat fara recovery), calculam fallback
-            # din entry * (1 ± effective_sl_pct).
-            if sl_real is None or sl_real <= 0:
+
+            # Pozitia ruleaza fara SL pe Bybit (raro, dar posibil daca
+            # set_position_sl a esuat la open original SAU pozitia a fost
+            # deschisa manual). Atasam SL acum + TP daca strategia il cere.
+            need_attach_sl = sl_real is None or sl_real <= 0
+            if need_attach_sl:
                 sl_pct = pair_cfg.effective_sl_pct
                 sl_real = (entry_px * (1 - sl_pct) if dir_real == "LONG"
                            else entry_px * (1 + sl_pct))
-                print(f"  [{sym}] resume: Bybit sl_price absent → fallback {sl_real}")
+                # TP calc per-strategy (mirror din open_position)
+                tp_attach: Optional[float] = tp_real
+                if tp_real is None or tp_real <= 0:
+                    if pair_cfg.strategy == "bb_mr":
+                        tp_d = pair_cfg.sl_pct * pair_cfg.tp_rr
+                        tp_attach = (entry_px * (1 + tp_d) if dir_real == "LONG"
+                                     else entry_px * (1 - tp_d))
+                    elif pair_cfg.tp_pct and pair_cfg.tp_pct > 0:
+                        tp_attach = (entry_px * (1 + pair_cfg.tp_pct)
+                                     if dir_real == "LONG"
+                                     else entry_px * (1 - pair_cfg.tp_pct))
+                print(f"  [{sym}] resume: Bybit n-are SL → atasam acum "
+                      f"sl={sl_real} tp={tp_attach}")
+                sl_armed = await ex.set_position_sl(
+                    sym, sl_real, tp_attach, is_initial=True)
+                if sl_armed and tp_attach is not None:
+                    tp_real = tp_attach
+            else:
+                sl_armed = True
+
             pos_usd = qty_real * entry_px
             risk_usd = pos_usd * pair_cfg.effective_sl_pct
             opened_ts = bybit_pos["created_ms"] or int(time.time() * 1000)
@@ -1102,12 +1123,12 @@ async def bootstrap() -> None:
                 strategy=pair_cfg.strategy,
                 bars_held=0,                   # restart de la 0 (BB MR time-exit
                                                 # poate fi prelungit cu cateva bare)
-                sl_armed=(bybit_pos["sl_price"] is not None
-                          and bybit_pos["sl_price"] > 0),
+                sl_armed=sl_armed,
             )
             _state.set_position(sym, resumed)
             print(f"  [{sym}] resume: pos restaurata din Bybit "
-                  f"({dir_real} qty={qty_real} entry={entry_px} sl={sl_real})")
+                  f"({dir_real} qty={qty_real} entry={entry_px} "
+                  f"sl={sl_real} sl_armed={sl_armed})")
 
     # INIT equity sync
     await sync_equity(reason="INIT")
