@@ -1138,10 +1138,31 @@ async def bootstrap() -> None:
             # Warning informativ daca pozitia e veche de >24h — fetch_pnl_for_trade
             # la close va clamp-a window-ul la 7 zile (vezi _PNL_LOOKBACK_MAX_MS).
             age_ms = int(time.time() * 1000) - opened_ts
+            age_h = age_ms / (3600 * 1000)
             if age_ms > 24 * 3600 * 1000:
-                age_h = age_ms / (3600 * 1000)
                 print(f"  [{sym}] resume: pozitia veche {age_h:.1f}h (>24h). "
                       f"PnL la close va folosi window clamped la 7 zile.")
+
+            # Telegram POZITIE GASITA — separat de "BOT PORNIT ✅" (care vine
+            # imediat dupa). User vede explicit ca botul a preluat o pozitie
+            # deschisa, nu doar ca a pornit curat. Vital pe restart Portainer
+            # cand pozitia ruleaza pe Bybit dar state-ul local e fresh.
+            sl_str = ex.smart_price(sl_real) if sl_real else "—"
+            tp_str = ex.smart_price(tp_real) if tp_real else "—"
+            risk_str = f"${risk_usd:.2f}"
+            try:
+                await tg.send(
+                    f"♻️ POZIȚIE GĂSITĂ — {sym}",
+                    f"<b>Strategy:</b> <code>{_strategy_label(pair_cfg.strategy)}</code>\n"
+                    f"<b>Direcție:</b> {dir_real}  <b>Qty:</b> {qty_real}\n"
+                    f"<b>Entry:</b> {ex.smart_price(entry_px)}\n"
+                    f"<b>SL:</b> {sl_str}  <b>TP:</b> {tp_str}\n"
+                    f"<b>Risk:</b> {risk_str}  <b>Vârsta:</b> ~{age_h:.1f}h\n"
+                    f"<b>SL armed Bybit:</b> {'da' if sl_armed else 'NU (fallback software)'}",
+                    symbol=sym,
+                )
+            except Exception as e:
+                print(f"  [{sym}] resume tg.send failed (best-effort): {e!r}")
 
     # INIT equity sync
     await sync_equity(reason="INIT")
