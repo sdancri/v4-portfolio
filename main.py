@@ -59,6 +59,12 @@ from core import telegram_bot as tg
 from core import no_lookahead as nl
 from core.bot_state import BotState, LivePosition, TradeRecord, ReconciliationError
 from core.config import AppConfig, load_config
+from core.monitoring import (
+    SHUTDOWN_SIGNAL,
+    install_asyncio_exception_handler,
+    install_signal_handlers,
+    memory_monitor,
+)
 from core.position_sizing import compute_position_size, compute_qty
 from strategies.bb_mr_signal import BBMeanReversionSignal, BBMRConfig
 from strategies.ichimoku_signal import IchimokuSignal, PairStrategyConfig
@@ -1129,6 +1135,13 @@ async def bootstrap() -> None:
             print(f"  [{sym}] resume: pos restaurata din Bybit "
                   f"({dir_real} qty={qty_real} entry={entry_px} "
                   f"sl={sl_real} sl_armed={sl_armed})")
+            # Warning informativ daca pozitia e veche de >24h — fetch_pnl_for_trade
+            # la close va clamp-a window-ul la 7 zile (vezi _PNL_LOOKBACK_MAX_MS).
+            age_ms = int(time.time() * 1000) - opened_ts
+            if age_ms > 24 * 3600 * 1000:
+                age_h = age_ms / (3600 * 1000)
+                print(f"  [{sym}] resume: pozitia veche {age_h:.1f}h (>24h). "
+                      f"PnL la close va folosi window clamped la 7 zile.")
 
     # INIT equity sync
     await sync_equity(reason="INIT")
@@ -1167,18 +1180,34 @@ async def bootstrap() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Install asyncio exception handler INAINTE de await-uri (loop e activ aici).
+    # Task-uri create_task care arunca fara await sunt logged cu traceback in
+    # loc de "Task exception was never retrieved" silent la GC.
+    install_asyncio_exception_handler()
+
     await bootstrap()
-    # Spawn background tasks
+    # Spawn background tasks (memory_monitor inclusiv — pre-OOM Telegram alert
+    # cand RSS > MEM_MON_RSS_ALERT_MB; SIGKILL/OOM NU invoca excepthook,
+    # singura fereastra de notification e PRE-kill via monitor).
     tasks = [
         asyncio.create_task(public_ws_loop()),
         asyncio.create_task(pws.run(on_order=on_order_event,
                                      on_execution=on_execution_event,
                                      on_position=on_position_event)),
         asyncio.create_task(heartbeat_loop()),
+        asyncio.create_task(memory_monitor(BOT_NAME, tg_alert=tg.send_critical)),
     ]
     try:
         yield
     finally:
+        # INTERPRETARE EXIT CODES post-mortem (docker inspect ... OOMKilled):
+        #   137 + OOMKilled=true   → OOM killer (SIGKILL, lifespan NU ajunge aici)
+        #   143 + SIGTERM in log   → docker stop / restart policy
+        #   130 + SIGINT in log    → Ctrl-C manual
+        #   0   + graceful         → lifespan return curat
+        # Pentru OOM (SIGKILL) NU ajungem aici — alerta vine din memory_monitor.
+        print(f"  [SHUTDOWN] lifespan finally start  "
+              f"signal={SHUTDOWN_SIGNAL['name']}", flush=True)
         for t in tasks:
             t.cancel()
         try:
@@ -1187,11 +1216,18 @@ async def lifespan(app: FastAPI):
             await tg.send(
                 "BOT OPRIT 🛑",
                 f"<b>Oprit la:</b> {tg.fmt_time(datetime.now(timezone.utc))}\n"
+                f"<b>Signal:</b> <code>{SHUTDOWN_SIGNAL['name'] or 'graceful'}</code>\n"
                 f"<b>Equity:</b> ${_state.shared_equity:,.2f}  |  Return: {ret_pct:+.2f}%\n"
                 f"<b>Trades:</b> {len(_state.trades)}",
             )
         except Exception as e:
             print(f"  [SHUTDOWN] tg.send failed: {e}")
+
+
+# Signal handlers: SIGTERM (docker stop), SIGINT (Ctrl-C), SIGHUP. SIGKILL
+# (OOM, kill -9) NU poate fi interceptat; vezi memory_monitor pre-OOM alert si
+# `docker inspect ... OOMKilled` post-mortem.
+install_signal_handlers()
 
 
 app = FastAPI(lifespan=lifespan, title=f"{BOT_NAME} chart")

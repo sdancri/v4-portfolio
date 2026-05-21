@@ -89,6 +89,15 @@ def _creds() -> tuple[str, str]:
 _NOOP_RETCODES: set[int] = {34040}
 
 
+# Lookback maxim pt fetch_pnl_for_trade. Defensive guard contra entry_ts_ms
+# vechi (tipic la pozitii resumed cu createdTime Bybit istoric de saptamani).
+# Fara clamp, window-ul pt closed-pnl ar include toate inchiderile istorice
+# pe simbol care intra in fereastra → suma falsa cumulativa. 7 zile acopera
+# majoritatea trade-urilor (chiar si swing pe TF mare); position trading pe
+# 30+ zile e exceptional.
+_PNL_LOOKBACK_MAX_MS: int = 7 * 24 * 3600 * 1000
+
+
 def _sign(key: str, secret: str, payload: str) -> dict:
     ts = str(int(time.time() * 1000))
     recv = "5000"
@@ -771,7 +780,18 @@ async def fetch_pnl_for_trade(symbol: str,
     if settle_delay_sec > 0:
         await asyncio.sleep(settle_delay_sec)
 
-    start_ms = entry_ts_ms - 60_000
+    # Clamp start_ms la _PNL_LOOKBACK_MAX_MS inainte de exit_ts_ms. Protejeaza
+    # contra entry_ts_ms vechi de saptamani (tipic la pozitii resumed cu
+    # createdTime Bybit istoric). Fara clamp, toate close-urile pe symbol din
+    # fereastra ar fi sumate → PnL fals cumulativ. Pirámidari inchise inainte
+    # de clamp NU intra in PnL (acceptat — sunt vechi de zile).
+    raw_start_ms = entry_ts_ms - 60_000
+    clamped_start_ms = exit_ts_ms - _PNL_LOOKBACK_MAX_MS
+    start_ms = max(raw_start_ms, clamped_start_ms)
+    if start_ms > raw_start_ms:
+        print(f"  [BYBIT] fetch_pnl_for_trade {symbol}: entry_ts_ms "
+              f"vechi de >{_PNL_LOOKBACK_MAX_MS // (3600*1000)}h — window "
+              f"clamped la [{start_ms}, ...] (raw start={raw_start_ms})")
     end_limit_ms = max(exit_ts_ms + 300_000, int(time.time() * 1000) + 60_000)
 
     records: list = []
