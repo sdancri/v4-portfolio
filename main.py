@@ -1181,15 +1181,10 @@ async def bootstrap() -> None:
                 adopt_ts_ms=adopt_ts,
             )
             _state.set_position(sym, resumed)
-            age_ms = adopt_ts - opened_ts
-            age_h = age_ms / (3600 * 1000)
             print(f"  [{sym}] resume: pos adoptata ({dir_real} qty={qty_real} "
-                  f"entry={entry_px} sl={sl_real} age={age_h:.1f}h)")
-            if age_ms > 24 * 3600 * 1000:
-                print(f"  [{sym}] resume: pozitia veche {age_h:.1f}h (>24h). "
-                      f"PnL window la close se aliniaza la adopt_ts (NU createdMs).")
+                  f"entry={entry_px} sl={sl_real})")
             # Stocam datele pentru Telegram dupa "BOT PORNIT"
-            _resume_announce.append((sym, pair_cfg, resumed, age_h))
+            _resume_announce.append((sym, pair_cfg, resumed))
 
     # INIT equity sync
     await sync_equity(reason="INIT")
@@ -1223,7 +1218,7 @@ async def bootstrap() -> None:
 
     # Telegram POZITIE GASITA — dupa BOT PORNIT (ordine UX). Per pozitie
     # adoptata din Bybit, anunta user-ul ca bot-ul a preluat.
-    for sym, pair_cfg, pos, age_h in _resume_announce:
+    for sym, pair_cfg, pos in _resume_announce:
         sl_str = ex.smart_price(pos.sl_price) if pos.sl_price else "—"
         tp_str = ex.smart_price(pos.tp_price) if pos.tp_price else "—"
         try:
@@ -1233,7 +1228,7 @@ async def bootstrap() -> None:
                 f"<b>Direcție:</b> {pos.direction}  <b>Qty:</b> {pos.qty}\n"
                 f"<b>Entry:</b> {ex.smart_price(pos.entry_price)}\n"
                 f"<b>SL:</b> {sl_str}  <b>TP:</b> {tp_str}\n"
-                f"<b>Risk:</b> ${pos.risk_usd:.2f}  <b>Vârsta:</b> ~{age_h:.1f}h\n"
+                f"<b>Risk:</b> ${pos.risk_usd:.2f}\n"
                 f"Trailing continuă pe SL existent.",
                 symbol=sym,
             )
