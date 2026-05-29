@@ -32,7 +32,10 @@ services:
       - RESET_TOKEN=${RESET_TOKEN:-}
       - RATE_LIMIT_PER_SEC=${RATE_LIMIT_PER_SEC:-5}
       - RATE_LIMIT_BURST=${RATE_LIMIT_BURST:-10}
-      # Memory monitor: interval log + threshold pt diagnostic dump + pre-OOM TG
+      # Memory monitor: interval log + threshold pt diagnostic dump + pre-OOM TG.
+      # MEM_MON_RSS_ALERT_MB: CALIBREAZA per VPS — vezi sectiunea "CALIBRARE
+      # PER-BOT" mai jos (baseline + 30 headroom). Daca primesti alerta la fiecare
+      # boot, baseline > 320 → mareste pragul + mem_limit + memswap_limit.
       - MEM_MON_INTERVAL_SEC=${MEM_MON_INTERVAL_SEC:-300}
       - MEM_MON_RSS_ALERT_MB=${MEM_MON_RSS_ALERT_MB:-320}
     ports:
@@ -46,16 +49,41 @@ services:
       timeout: 5s
       retries: 3
       start_period: 45s
+    # ─────────────────────────────────────────────────────────────────────
+    # CALIBRARE PER-BOT
+    # ─────────────────────────────────────────────────────────────────────
+    # Tabelul de mai jos e INDICATIV. Calibreaza de fiecare data dupa
+    # specificul VPS-ului tau si workload-ul botului:
+    #   1. Porneste botul cu valorile indicative (mem_limit 384m, RSS_ALERT 320)
+    #   2. Lasa-l sa ruleze 2-4h, masoara cu:
+    #        docker stats V4 --no-stream
+    #      Noteaza valoarea steady-state RSS (= "baseline")
+    #   3. Calculeaza praguri:
+    #        RSS_ALERT_MB = baseline + 30        (≥30MB headroom pre-alerta)
+    #        mem_limit    = RSS_ALERT_MB + 24-50 (≥24MB suplimentar inainte OOM)
+    #   4. Daca baseline > RSS_ALERT_MB default (320), alerta Telegram se trimite
+    #      la FIECARE boot (false positive) → indicator clar ca trebuie sa
+    #      cresti pragul.
+    #
+    # PROFIL INDICATIV V4 (3 perechi, BB MR + Hull+Ichimoku 4h):
+    #   ┌────────────────────────────┬──────────┬──────────────┬─────────┐
+    #   │ Profil                     │ baseline │ RSS_ALERT_MB │ mem_lim │
+    #   ├────────────────────────────┼──────────┼──────────────┼─────────┤
+    #   │ V4 single-pair (pt teste)  │ ~200 MB  │ 240          │ 296m    │
+    #   │ V4 standard (3 perechi)    │ ~280 MB  │ 320          │ 384m    │
+    #   │ V4 extins (5+ perechi)     │ ~360 MB  │ 400          │ 480m    │
+    #   └────────────────────────────┴──────────┴──────────────┴─────────┘
+    #
+    # ESTIMARE TIMP REACTIE pre-OOM (gap RSS_ALERT → mem_limit = 24-50MB):
+    #   Gradual (1-5MB/min)   → 5-50min reactie OK
+    #   Mediu (10MB/min)      → 2-5min just enough
+    #   Rapid (>20MB/min)     → orice prag prea tarziu;
+    #                            restart_policy=unless-stopped = ultima plasa
+    # ─────────────────────────────────────────────────────────────────────
     # VPS resource hygiene — cap defensiv. Daca botul creste peste limita
     # (leak Python sau C-extension), OOM killer omoara DOAR acest container —
     # NU monopolizeaza RAM-ul VPS. memory_monitor (vezi core/monitoring.py)
-    # trimite Telegram alert pre-OOM cand RSS > MEM_MON_RSS_ALERT_MB (default
-    # 320MB, ~83% headroom vs mem_limit 384m).
-    #
-    # Profil V4 (3 perechi, BB MR + HI, RSS tipic 200-350MB):
-    #   mem_limit: 384m   memswap_limit: 512m   MEM_MON_RSS_ALERT_MB: 320
-    # Daca cresti la mai multe perechi sau strategii cu pandas heavy, mareste
-    # toate trei proportional.
+    # trimite Telegram alert pre-OOM cand RSS > MEM_MON_RSS_ALERT_MB.
     mem_limit: 384m
     memswap_limit: 512m          # swap soft cap (Linux only); peste asta OOM kill
     logging:

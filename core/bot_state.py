@@ -60,6 +60,12 @@ class LivePosition:
     sl_armed: bool = True    # True daca set_position_sl a reusit (Bybit-side SL atomic).
                               # False → fallback software: SL_LONG/SHORT signal din
                               # strategy escaleaza la close_position (vezi main.py).
+    adopt_ts_ms: Optional[int] = None  # Set DOAR la resume (adopție din Bybit).
+                                       # Folosit in fetch_pnl_for_trade ca entry_ts
+                                       # in loc de opened_ts_ms istoric → window PnL
+                                       # corect [adopt-60s, now+5min] FĂRĂ piramidari
+                                       # vechi (închise ÎNAINTE de adopt) contaminate.
+                                       # opened_ts_ms rămâne createdMs Bybit pt chart.
 
 
 @dataclass

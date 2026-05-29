@@ -565,7 +565,11 @@ async def _close_position_locked(symbol: str, exit_reason: str,
     await asyncio.sleep(1.5)
 
     now_ms = int(time.time() * 1000)
-    pnl_data = await ex.fetch_pnl_for_trade(symbol, pos.opened_ts_ms, now_ms)
+    # PnL window: adopt_ts_ms (daca pozitia a fost adoptata la resume) ALTFEL
+    # opened_ts_ms. Eviti contaminare cu piramidari/scale-out vechi inchise
+    # INAINTE de adopt-time pe trade-urile preluate la restart.
+    pnl_entry_ts = pos.adopt_ts_ms if pos.adopt_ts_ms is not None else pos.opened_ts_ms
+    pnl_data = await ex.fetch_pnl_for_trade(symbol, pnl_entry_ts, now_ms)
     avg_exit = pnl_data.get("avg_exit") or target_price
     pnl_real = pnl_data.get("pnl", 0.0)
     fees_real = pnl_data.get("fees", 0.0)
@@ -695,7 +699,11 @@ async def _close_pipeline_external_locked(symbol: str, exit_reason: str,
     """Body close_pipeline_external, executat sub _close_locks[symbol]."""
     await asyncio.sleep(1.5)  # let closed-pnl index
     now_ms = int(time.time() * 1000)
-    pnl_data = await ex.fetch_pnl_for_trade(symbol, pos.opened_ts_ms, now_ms)
+    # PnL window: adopt_ts_ms (daca pozitia a fost adoptata la resume) ALTFEL
+    # opened_ts_ms. Eviti contaminare cu piramidari/scale-out vechi inchise
+    # INAINTE de adopt-time pe trade-urile preluate la restart.
+    pnl_entry_ts = pos.adopt_ts_ms if pos.adopt_ts_ms is not None else pos.opened_ts_ms
+    pnl_data = await ex.fetch_pnl_for_trade(symbol, pnl_entry_ts, now_ms)
     avg_exit = pnl_data.get("avg_exit") or target_price
     pnl_real = pnl_data.get("pnl", 0.0)
     fees_real = pnl_data.get("fees", 0.0)
@@ -1012,6 +1020,10 @@ async def bootstrap() -> None:
     # Restore state if persisted
     await asyncio.to_thread(_state.load)
 
+    # Colectam pozitiile adoptate la resume; Telegram POZITIE GASITA se trimite
+    # DUPA "BOT PORNIT" (UX: user vede intai ca bot-ul s-a pornit, apoi pozitiile).
+    _resume_announce: list[tuple] = []
+
     for pair_cfg in CONFIG.pairs:
         if not pair_cfg.enabled:
             continue
@@ -1056,9 +1068,24 @@ async def bootstrap() -> None:
         # Set leverage
         await ex.set_leverage(sym, pair_cfg.leverage)
 
-        # Warmup 400 bars
-        bars = await ex.get_kline(sym, _TF_INTERVAL, limit=400)
-        bars = nl.filter_closed_bars(bars, _TF_INTERVAL)
+        # Warmup 400 bars cu retry 4x backoff (0, 2, 5, 10s) — Bybit poate
+        # avea hicup-uri tranzient pe market/kline endpoint la boot. Daca toate
+        # cele 4 incercari esueaza, marcam halt pe simbol + Telegram critical
+        # si continuam (restul simbolurilor ruleaza normal).
+        bars: list = []
+        for attempt, delay in enumerate([0, 2, 5, 10]):
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                bars = await ex.get_kline(sym, _TF_INTERVAL, limit=400)
+                bars = nl.filter_closed_bars(bars, _TF_INTERVAL)
+                if bars:
+                    if attempt > 0:
+                        print(f"  [{sym}] warmup OK dupa retry #{attempt}")
+                    break
+            except Exception as e:
+                print(f"  [{sym}] warmup attempt {attempt+1}/4 raised: {e!r}")
+            print(f"  [{sym}] warmup attempt {attempt+1}/4 returned 0 bars")
         if bars:
             df = pd.DataFrame(bars, columns=["ts_ms", "open", "high", "low",
                                               "close", "volume", "turnover"])
@@ -1068,12 +1095,25 @@ async def bootstrap() -> None:
             _last_synced_ts[sym] = int(bars[-1][0]) // 1000
             print(f"  [{sym}] warmup {len(bars)} bars  last={df.index[-1]}")
         else:
-            print(f"  [{sym}] WARN: warmup returned 0 bars")
+            print(f"  [{sym}] FATAL: warmup esuat dupa 4 retry-uri — halt simbol")
+            _halted[sym] = True
+            try:
+                await tg.send_critical(
+                    f"{sym} warmup eșuat",
+                    f"<b>get_kline</b> returnează 0 bare după 4 reîncercări "
+                    f"(~17s total).\n"
+                    f"<b>Stare bot:</b> simbolul e HALTAT — restul perechilor "
+                    f"rulează normal.\nVerifică connectivitate Bybit și redeploy.",
+                    symbol=sym,
+                )
+            except Exception:
+                pass
+            continue  # skip restul setup-ului pt acest simbol
 
         # Boot-time resume: V4 NU persista LivePosition in bot_state.json (doar
         # trades + equity). Single source of truth pt pozitii active = Bybit.
-        # Scanam Bybit la fiecare bootstrap si construim LivePosition din
-        # datele exchange-ului (qty, entry_price, sl_price, tp_price, direction).
+        # Scanam Bybit, dar Telegram POZITIE GASITA se trimite DUPA "BOT PORNIT"
+        # (vezi mai jos) — colectam aici in _resume_announce.
         bybit_pos = await ex.fetch_open_position(sym)
         if bybit_pos is not None:
             entry_px = bybit_pos["entry_price"]
@@ -1081,38 +1121,47 @@ async def bootstrap() -> None:
             dir_real = bybit_pos["direction"]
             sl_real  = bybit_pos["sl_price"]
             tp_real  = bybit_pos["tp_price"]
+            has_bybit_sl = sl_real is not None and sl_real > 0
 
-            # Pozitia ruleaza fara SL pe Bybit (raro, dar posibil daca
-            # set_position_sl a esuat la open original SAU pozitia a fost
-            # deschisa manual). Atasam SL acum + TP daca strategia il cere.
-            need_attach_sl = sl_real is None or sl_real <= 0
-            if need_attach_sl:
-                sl_pct = pair_cfg.effective_sl_pct
-                sl_real = (entry_px * (1 - sl_pct) if dir_real == "LONG"
-                           else entry_px * (1 + sl_pct))
-                # TP calc per-strategy (mirror din open_position)
-                tp_attach: Optional[float] = tp_real
-                if tp_real is None or tp_real <= 0:
-                    if pair_cfg.strategy == "bb_mr":
-                        tp_d = pair_cfg.sl_pct * pair_cfg.tp_rr
-                        tp_attach = (entry_px * (1 + tp_d) if dir_real == "LONG"
-                                     else entry_px * (1 - tp_d))
-                    elif pair_cfg.tp_pct and pair_cfg.tp_pct > 0:
-                        tp_attach = (entry_px * (1 + pair_cfg.tp_pct)
-                                     if dir_real == "LONG"
-                                     else entry_px * (1 - pair_cfg.tp_pct))
-                print(f"  [{sym}] resume: Bybit n-are SL → atasam acum "
-                      f"sl={sl_real} tp={tp_attach}")
-                sl_armed = await ex.set_position_sl(
-                    sym, sl_real, tp_attach, is_initial=True)
-                if sl_armed and tp_attach is not None:
-                    tp_real = tp_attach
-            else:
-                sl_armed = True
+            # STRAT 1 — Refuz adopt daca Bybit NU are SL setat.
+            # Scenariu suspect: cineva a deschis manual SAU bot anterior a
+            # esuat la set_position_sl + reconcilierile au omis. NU adoptam
+            # local — alerta CRITICA, user decide (close manual sau add SL pe
+            # Bybit App, apoi restart). Strategia continua in stadiul "no
+            # position" si poate genera trade nou pe semnal — risc dublu-pozitie
+            # pe care user trebuie sa-l gestioneze manual.
+            if not has_bybit_sl:
+                print(f"  [{sym}] resume: REFUZ ADOPT — Bybit qty={qty_real} "
+                      f"FARA SL setat (suspect: manual sau bot fail)")
+                try:
+                    await tg.send_critical(
+                        f"{sym} POZIȚIE FĂRĂ SL — refuz adoptie",
+                        f"<b>Pe Bybit:</b> {dir_real} qty={qty_real} "
+                        f"entry={ex.smart_price(entry_px)}\n"
+                        f"<b>SL Bybit:</b> NESETAT\n"
+                        f"<b>Acțiune:</b>\n"
+                        f"  1. Setează SL manual pe Bybit App (recomandat: "
+                        f"entry × (1 ± {pair_cfg.effective_sl_pct*100:.1f}%)),\n"
+                        f"  2. SAU închide pozițiamanual,\n"
+                        f"  3. Apoi redeploy bot.\n"
+                        f"<b>Stare bot:</b> NU adoptă local. Strategia poate "
+                        f"genera trade nou pe semnal — risc dublă-poziție.",
+                        symbol=sym,
+                    )
+                except Exception as e:
+                    print(f"  [{sym}] resume tg.send_critical failed: {e!r}")
+                # NU adoptam — continuam la urmatorul simbol
+                continue
 
+            # Bybit are SL → adoptie normala
             pos_usd = qty_real * entry_px
             risk_usd = pos_usd * pair_cfg.effective_sl_pct
+            # opened_ts_ms = createdMs Bybit (chart entry line afisata la
+            # momentul real al deschiderii). adopt_ts_ms = now (folosit pentru
+            # fetch_pnl_for_trade window la close → exclude piramidari vechi
+            # inchise INAINTE de adopt).
             opened_ts = bybit_pos["created_ms"] or int(time.time() * 1000)
+            adopt_ts = int(time.time() * 1000)
             resumed = LivePosition(
                 symbol=sym,
                 side=("Buy" if dir_real == "LONG" else "Sell"),
@@ -1125,44 +1174,22 @@ async def bootstrap() -> None:
                 pos_usd=pos_usd,
                 risk_usd=risk_usd,
                 opened_ts_ms=opened_ts,
-                order_id="",                  # lost dupa restart, irelevant
+                order_id="",
                 strategy=pair_cfg.strategy,
-                bars_held=0,                   # restart de la 0 (BB MR time-exit
-                                                # poate fi prelungit cu cateva bare)
-                sl_armed=sl_armed,
+                bars_held=0,
+                sl_armed=True,
+                adopt_ts_ms=adopt_ts,
             )
             _state.set_position(sym, resumed)
-            print(f"  [{sym}] resume: pos restaurata din Bybit "
-                  f"({dir_real} qty={qty_real} entry={entry_px} "
-                  f"sl={sl_real} sl_armed={sl_armed})")
-            # Warning informativ daca pozitia e veche de >24h — fetch_pnl_for_trade
-            # la close va clamp-a window-ul la 7 zile (vezi _PNL_LOOKBACK_MAX_MS).
-            age_ms = int(time.time() * 1000) - opened_ts
+            age_ms = adopt_ts - opened_ts
             age_h = age_ms / (3600 * 1000)
+            print(f"  [{sym}] resume: pos adoptata ({dir_real} qty={qty_real} "
+                  f"entry={entry_px} sl={sl_real} age={age_h:.1f}h)")
             if age_ms > 24 * 3600 * 1000:
                 print(f"  [{sym}] resume: pozitia veche {age_h:.1f}h (>24h). "
-                      f"PnL la close va folosi window clamped la 7 zile.")
-
-            # Telegram POZITIE GASITA — separat de "BOT PORNIT ✅" (care vine
-            # imediat dupa). User vede explicit ca botul a preluat o pozitie
-            # deschisa, nu doar ca a pornit curat. Vital pe restart Portainer
-            # cand pozitia ruleaza pe Bybit dar state-ul local e fresh.
-            sl_str = ex.smart_price(sl_real) if sl_real else "—"
-            tp_str = ex.smart_price(tp_real) if tp_real else "—"
-            risk_str = f"${risk_usd:.2f}"
-            try:
-                await tg.send(
-                    f"♻️ POZIȚIE GĂSITĂ — {sym}",
-                    f"<b>Strategy:</b> <code>{_strategy_label(pair_cfg.strategy)}</code>\n"
-                    f"<b>Direcție:</b> {dir_real}  <b>Qty:</b> {qty_real}\n"
-                    f"<b>Entry:</b> {ex.smart_price(entry_px)}\n"
-                    f"<b>SL:</b> {sl_str}  <b>TP:</b> {tp_str}\n"
-                    f"<b>Risk:</b> {risk_str}  <b>Vârsta:</b> ~{age_h:.1f}h\n"
-                    f"<b>SL armed Bybit:</b> {'da' if sl_armed else 'NU (fallback software)'}",
-                    symbol=sym,
-                )
-            except Exception as e:
-                print(f"  [{sym}] resume tg.send failed (best-effort): {e!r}")
+                      f"PnL window la close se aliniaza la adopt_ts (NU createdMs).")
+            # Stocam datele pentru Telegram dupa "BOT PORNIT"
+            _resume_announce.append((sym, pair_cfg, resumed, age_h))
 
     # INIT equity sync
     await sync_equity(reason="INIT")
@@ -1193,6 +1220,25 @@ async def bootstrap() -> None:
         f"<b>Pornit la:</b> {tg.fmt_time(_state.start_utc)}\n"
         f"<b>Chart:</b> port {CHART_HOST_PORT}",
     )
+
+    # Telegram POZITIE GASITA — dupa BOT PORNIT (ordine UX). Per pozitie
+    # adoptata din Bybit, anunta user-ul ca bot-ul a preluat.
+    for sym, pair_cfg, pos, age_h in _resume_announce:
+        sl_str = ex.smart_price(pos.sl_price) if pos.sl_price else "—"
+        tp_str = ex.smart_price(pos.tp_price) if pos.tp_price else "—"
+        try:
+            await tg.send(
+                f"♻️ POZIȚIE GĂSITĂ — {sym}",
+                f"<b>Strategy:</b> <code>{_strategy_label(pair_cfg.strategy)}</code>\n"
+                f"<b>Direcție:</b> {pos.direction}  <b>Qty:</b> {pos.qty}\n"
+                f"<b>Entry:</b> {ex.smart_price(pos.entry_price)}\n"
+                f"<b>SL:</b> {sl_str}  <b>TP:</b> {tp_str}\n"
+                f"<b>Risk:</b> ${pos.risk_usd:.2f}  <b>Vârsta:</b> ~{age_h:.1f}h\n"
+                f"Trailing continuă pe SL existent.",
+                symbol=sym,
+            )
+        except Exception as e:
+            print(f"  [{sym}] resume tg.send failed (best-effort): {e!r}")
 
 
 # ============================================================================
