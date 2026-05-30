@@ -464,6 +464,12 @@ function showLiveLines(p) {
   const lastCandleTs = candles.length ? candles[candles.length - 1].time : startTs;
   const endTs = Math.max(lastCandleTs, startTs + BAR_DURATION_S);
 
+  // Respect toggles: SL/TP/Entries OFF → NU cream linia respectiva.
+  // (Toggle handler re-apeleaza showLiveLines dupa flip — vezi mai jos.)
+  const showSL = document.getElementById("bSL").classList.contains("on");
+  const showTP = document.getElementById("bTP").classList.contains("on");
+  const showE  = document.getElementById("bEntry").classList.contains("on");
+
   const entryColor = p.direction === "LONG" ? "#00e676" : "#ff3352";
   const mkSer = (color, title) => chart.addLineSeries({
     color, lineWidth: 2, lineStyle: 0,
@@ -474,13 +480,17 @@ function showLiveLines(p) {
     // candle-urile. Candle series ramane unicul driver autoscale.
     autoscaleInfoProvider: () => null,
   });
-  liveEntryLine = mkSer(entryColor, `LIVE ${p.direction}`);
-  liveSlLine    = mkSer("#ff3352",  "LIVE SL");
-  liveEntryLine.setData([{time: startTs, value: p.entry}, {time: endTs, value: p.entry}]);
-  liveSlLine   .setData([{time: startTs, value: p.sl},    {time: endTs, value: p.sl}]);
+  if (showE) {
+    liveEntryLine = mkSer(entryColor, `LIVE ${p.direction}`);
+    liveEntryLine.setData([{time: startTs, value: p.entry}, {time: endTs, value: p.entry}]);
+  }
+  if (showSL) {
+    liveSlLine = mkSer("#ff3352",  "LIVE SL");
+    liveSlLine.setData([{time: startTs, value: p.sl},    {time: endTs, value: p.sl}]);
+  }
   // Guard p.tp > 0: strategii fara TP initial pot trimite tp=0 / null /
   // undefined ca sentinel → nu cream linie TP.
-  if (p.tp && p.tp > 0) {
+  if (showTP && p.tp && p.tp > 0) {
     liveTpLine = mkSer("#00e676",  "LIVE TP");
     liveTpLine.setData([{time: startTs, value: p.tp}, {time: endTs, value: p.tp}]);
   }
@@ -837,6 +847,12 @@ function switchSymbol(sym) {
       });
     }
     candleSeries.setData(candles);
+    // Force autoScale: setData pe alt simbol pastreaza range-ul vizual
+    // cache-uit de la simbolul anterior (preturi pot diferi cu 1000x), iar
+    // tooltip-ul nu mai apare in zona vizibila. Reset → recalculeaza range
+    // pe candle series, restul lineSeries cu autoscaleInfoProvider=null sunt
+    // ignored si nu afecteaza calculul.
+    chart.priceScale("right").applyOptions({ autoScale: true });
     document.getElementById("hdr-price").textContent = fmtPx(candles[candles.length - 1].close);
   } else {
     candleSeries.setData([]);
@@ -929,6 +945,11 @@ chart.subscribeCrosshairMove(p => {
   document.getElementById(id).addEventListener("click", function() {
     this.classList.toggle("on");
     render();
+    // Re-aplica live lines pt pozitia activa pe simbolul curent: toggle OFF
+    // sterge liniile LIVE (entry/SL/TP), toggle ON le re-creeaza. Fara asta
+    // doar bounded SL/TP istorice raspund la toggle, liniile LIVE raman.
+    const ap = activePositions[CURRENT_SYMBOL];
+    if (ap) showLiveLines(ap);
   }));
 document.getElementById("bInd").addEventListener("click", function() {
   this.classList.toggle("on");

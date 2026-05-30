@@ -255,6 +255,14 @@ class IchimokuSignal:
         tk = c.tenkan[i]; kj = c.kijun[i]
         sh = c.senkou_h[i]; sl_ = c.senkou_l[i]; ch = c.chikou[i]
 
+        # Strat 2 — Guard entry_price > 0 inainte de orice calcul SL/TP.
+        # Defense-in-depth: daca cineva alimenteaza state cu entry=0 (state
+        # corupt, fork modificat al on_resume), evitam fake SL trigger pe
+        # SHORT (sl=0, high>=0 → trigger imediat fiecare bara) si comportament
+        # nedeterminat pe LONG.
+        if has_position is not None and (entry_price is None or entry_price <= 0):
+            return SignalDecision("HOLD", close, "invalid_entry_price")
+
         # EXIT
         if has_position == "long":
             sl_price = entry_price * (1 - self.cfg.sl_initial_pct)

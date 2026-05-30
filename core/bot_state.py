@@ -85,6 +85,9 @@ class TradeRecord:
     exit_reason: str         # "BYBIT_SL" / "BYBIT_TP" / "SIGNAL" / "EXTERNAL"
     pnl: float               # USDT real (incl fees)
     fees: float = 0.0
+    extra: dict = field(default_factory=dict)  # Audit trail flexibil per trade.
+                                                # Ex la adopt: {adopted: True,
+                                                # bybit_created_ms, adopt_ts_ms}.
 
     @property
     def slippage(self) -> float:
@@ -114,6 +117,7 @@ class TradeRecord:
             "exit_reason": self.exit_reason,
             "pnl": round(self.pnl, 4),
             "fees": round(self.fees, 4),
+            "extra": self.extra,
         }
 
     def to_persist(self) -> dict:
@@ -125,6 +129,7 @@ class TradeRecord:
             "exit_price": self.exit_price,
             "exit_price_target": self.exit_price_target,
             "exit_reason": self.exit_reason, "pnl": self.pnl, "fees": self.fees,
+            "extra": self.extra,
         }
 
     @classmethod
@@ -137,6 +142,7 @@ class TradeRecord:
             qty=d["qty"], exit_ts_ms=d["exit_ts_ms"], exit_price=exit_price,
             exit_price_target=d.get("exit_price_target", exit_price),
             exit_reason=d["exit_reason"], pnl=d["pnl"], fees=d.get("fees", 0.0),
+            extra=d.get("extra", {}) or {},
         )
 
 

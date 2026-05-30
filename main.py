@@ -187,6 +187,20 @@ def _next_bar_close_ms(now_ms: int) -> int:
     return ((now_ms // _TF_MS) + 1) * _TF_MS
 
 
+def _build_trade_extra(pos: LivePosition) -> dict:
+    """Audit trail per trade — populat in TradeRecord.extra la close.
+
+    Caz: pozitie adoptata la resume → marcam {adopted:True, bybit_created_ms,
+    adopt_ts_ms}. Caz normal (trade deschis de bot) → {}.
+    """
+    extra: dict = {}
+    if pos.adopt_ts_ms is not None:
+        extra["adopted"] = True
+        extra["bybit_created_ms"] = pos.opened_ts_ms
+        extra["adopt_ts_ms"] = pos.adopt_ts_ms
+    return extra
+
+
 # ============================================================================
 # Equity sync (INIT / CLOSE / HEARTBEAT)
 # ============================================================================
@@ -582,6 +596,7 @@ async def _close_position_locked(symbol: str, exit_reason: str,
         exit_ts_ms=now_ms, exit_price=avg_exit,
         exit_price_target=target_price, exit_reason=final_exit_reason,
         pnl=pnl_real, fees=fees_real,
+        extra=_build_trade_extra(pos),
     )
     _state.record_closed_trade(trade)
     _state.save()

@@ -166,6 +166,12 @@ class BBMeanReversionSignal:
         prev_close = float(prev["close"])
         bb_lower_prev = c.bb_lower[i - 1]; bb_upper_prev = c.bb_upper[i - 1]
 
+        # Strat 2 — Guard entry_price > 0 inainte de orice calcul SL/TP.
+        # Defense-in-depth: state corupt cu entry=0 ar produce sl=0 → SHORT
+        # high>=0 trigger imediat fiecare bara. Refuzam evaluarea.
+        if has_position is not None and (entry_price is None or entry_price <= 0):
+            return SignalDecision("HOLD", close, "invalid_entry_price")
+
         # EXIT
         if has_position == "long":
             sl_price = entry_price * (1 - self.cfg.sl_pct)
