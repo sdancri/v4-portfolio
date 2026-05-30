@@ -661,7 +661,14 @@ function renderList(filteredTrades) {
   let pnlSum = 0;
   filteredTrades.forEach(t => pnlSum += t.pnl);
   const totEl = document.getElementById("total-pnl");
-  totEl.textContent = (pnlSum >= 0 ? "+" : "") + "$" + pnlSum.toFixed(2);
+  // Procent PnL relativ la initial account (acelasi referential ca header Return).
+  // INITIAL_ACCOUNT vine din /api/init payload; fallback la 0 → afisam doar $.
+  let pctStr = "";
+  if (INITIAL_ACCOUNT && INITIAL_ACCOUNT > 0) {
+    const pct = (pnlSum / INITIAL_ACCOUNT) * 100;
+    pctStr = "  (" + (pct >= 0 ? "+" : "") + pct.toFixed(2) + "%)";
+  }
+  totEl.textContent = (pnlSum >= 0 ? "+" : "") + "$" + pnlSum.toFixed(2) + pctStr;
   totEl.style.color = pnlSum >= 0 ? "#00e676" : "#ff3352";
 
   [...filteredTrades].reverse().forEach(t => {
@@ -782,8 +789,10 @@ function updateOpenPnl() {
 // ============================================================================
 // Header summary
 // ============================================================================
+let INITIAL_ACCOUNT = 0;  // populat din summary.initial_account la /api/init
 function updateSummary(s) {
   document.getElementById("hdr-account").textContent = "$" + s.account.toFixed(2);
+  if (s.initial_account) INITIAL_ACCOUNT = s.initial_account;
   const retEl = document.getElementById("hdr-return");
   retEl.textContent = (s.return_pct >= 0 ? "+" : "") + s.return_pct.toFixed(2) + "%";
   retEl.className = "v " + (s.return_pct >= 0 ? "pos" : "neg");
