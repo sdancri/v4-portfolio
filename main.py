@@ -993,14 +993,20 @@ async def on_position_event(event: dict) -> None:
 
 
 async def on_order_event(event: dict) -> None:
+    sym = event.get("symbol", "")
+    if sym and sym not in _signals:
+        return  # not our pair — drop instant (defensive: subaccount V4 e dedicat
+                # dar daca cineva adauga manual alt simbol, NU logam zgomot)
     status = event.get("orderStatus", "?")
-    sym = event.get("symbol", "?")
     if status in ("Filled", "Cancelled", "Rejected"):
         print(f"  [ORDER {sym}] {status}  id={event.get('orderId', '?')[:8]}")
 
 
 async def on_execution_event(event: dict) -> None:
-    pass  # silent — fills sunt trate prin position events
+    sym = event.get("symbol", "")
+    if sym and sym not in _signals:
+        return  # not our pair
+    # silent — fills sunt trate prin position events
 
 
 # ============================================================================
