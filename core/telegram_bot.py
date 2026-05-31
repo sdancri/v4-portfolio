@@ -50,6 +50,38 @@ def fmt_time(ts) -> str:
     return f"{_DAYS_RO[local.weekday()]}, {local.strftime('%d.%m.%Y  %H:%M')}"
 
 
+def dir_emoji(direction: str) -> str:
+    """
+    Emoji colorat pt direction trade (vizibilitate vizuala in Telegram).
+    Telegram NU suporta culori arbitrare in text — emoji prefixate sunt
+    workaround-ul standard ca user-ul sa identifice rapid LONG vs SHORT
+    in stream-ul de notificari.
+
+    LONG  -> 🟢 (cerc verde)
+    SHORT -> 🔴 (cerc rosu)
+    alta  -> "" (gol, no emoji)
+    """
+    d = (direction or "").upper()
+    if d == "LONG":
+        return "🟢"
+    if d == "SHORT":
+        return "🔴"
+    return ""
+
+
+def pnl_emoji(pnl: float) -> str:
+    """
+    Emoji pt PnL realizat: scan rapid pe Telegram intre win-uri (bani)
+    si loss-uri (sange) fara sa citesti suma. Bonus: vizual diferentiat
+    de `dir_emoji` (LONG/SHORT) — nu se confunda 🟢 (LONG) cu un PnL
+    pozitiv care s-ar putea sa fie pe un trade SHORT castigator.
+
+    pnl >= 0  -> 💰 (money bag — castig)
+    pnl <  0  -> 🩸 (blood drop — pierdere)
+    """
+    return "💰" if (pnl or 0) >= 0 else "🩸"
+
+
 def _header(symbol: Optional[str] = None) -> str:
     name = html.escape(os.getenv("BOT_NAME", "ichimoku2"))
     strategy = html.escape(os.getenv("STRATEGY_NAME", "Hull+Ichimoku").strip())

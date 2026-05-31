@@ -376,21 +376,29 @@ async def open_position(symbol: str, direction: str, close_price: float,
 
     # Telegram — afiseaza fill real (match cu Bybit App) + tip fill (maker/taker/mixed).
     # smart_price = auto-precision pe magnitudine (~5 cifre semnificative).
-    icon = "🟢" if direction == "LONG" else "🔴"
-    tp_line = f"\n<b>TP:</b> {ex.smart_price(tp_price)}  <i>(Market atomic)</i>" if tp_price else ""
     slip_line = ""
     if abs(real_fill_price - close_price) > 0:
         slip_bps = (real_fill_price - close_price) / close_price * 10000
-        slip_line = f"  <i>(signal {ex.smart_price(close_price)}, slip {slip_bps:+.1f}bps)</i>"
+        slip_line = (f"  <i>(signal <code>{ex.smart_price(close_price)}</code>, "
+                     f"slip <code>{slip_bps:+.1f}bps</code>)</i>")
     fill_emoji = {"maker": "🟢", "mixed": "🟡", "taker": "🔴"}.get(fill_kind, "⚪")
+    tp_section = (f"🎯 <b>Take Profit:</b> <code>{ex.smart_price(tp_price)}</code>  "
+                 f"<i>(Market atomic)</i>\n\n" if tp_price else "")
     await tg.send(
-        f"{icon} ENTRY {direction}",
-        f"<b>Strategy:</b> <code>{_strategy_label(pair_cfg.strategy)}</code>\n"
-        f"<b>Fill:</b> {fill_emoji} <code>{fill_kind}</code>\n"
-        f"<b>Entry:</b> {ex.smart_price(real_fill_price)}{slip_line}  ({tg.fmt_time(now_ms)})\n"
-        f"<b>Qty:</b> {qty}  (${sizing.pos_usd:,.2f})\n"
-        f"<b>SL:</b> {ex.smart_price(sl_price)}  ({sl_pct_use*100:.1f}%, Market){tp_line}\n"
-        f"<b>Risk:</b> ${sizing.risk_usd:,.2f}  ({pair_cfg.risk_pct_per_trade*100:.0f}% × ${_state.shared_equity:,.2f})",
+        f"🚀 INTRARE: {direction} {tg.dir_emoji(direction)}",
+        f"<b>Fill:</b>     {fill_emoji} <code>{fill_kind}</code>\n"
+        f"<b>Entry:</b>    <code>{ex.smart_price(real_fill_price)}</code>{slip_line}  "
+        f"(<code>{tg.fmt_time(now_ms)}</code>)\n"
+        f"<b>Notional:</b> <code>${sizing.pos_usd:,.2f}</code>\n"
+        f"<b>Risk:</b>     <code>${sizing.risk_usd:,.2f}</code>  "
+        f"(<code>{pair_cfg.risk_pct_per_trade*100:.0f}%</code> × "
+        f"<code>${_state.shared_equity:,.2f}</code>)\n"
+        f"\n"
+        f"{tp_section}"
+        f"🛑 <b>Stop Loss:</b>   <code>{ex.smart_price(sl_price)}</code>  "
+        f"(<code>{sl_pct_use*100:.1f}%</code>, Market)\n"
+        f"\n"
+        f"<b>Qty:</b> <code>{qty}</code>",
         symbol=symbol,
     )
 
@@ -602,16 +610,13 @@ async def _close_position_locked(symbol: str, exit_reason: str,
     _state.save()
     log_event("trade_closed", **trade.to_dict())
 
-    # Telegram — icon by reason. _PARTIAL / _FORCED sufix = warning (reconcile triggered).
+    # Telegram — icon titlu: ⚠️ pe EXTERNAL/reconcile (defense-in-depth, verifica).
+    # Altfel 💰 win / 🩸 loss (pnl_emoji) pt scan rapid in stream-ul Telegram.
     is_reconcile_path = final_exit_reason.endswith(("_PARTIAL", "_FORCED"))
     if final_exit_reason.startswith("EXTERNAL") or is_reconcile_path:
-        icon = "⚠️"
-    elif final_exit_reason in ("BYBIT_SL", "BYBIT_TP"):
-        icon = "🎯"
-    elif pnl_real >= 0:
-        icon = "📈"
+        sign = "⚠️"
     else:
-        icon = "📉"
+        sign = tg.pnl_emoji(pnl_real)
 
     ret_pct = ((_state.shared_equity - _state.initial_account)
                / _state.initial_account * 100) if _state.initial_account else 0
@@ -619,11 +624,15 @@ async def _close_position_locked(symbol: str, exit_reason: str,
     # inregistrat in _state (pipeline-ul nu cade pe notification failure).
     try:
         await tg.send(
-            f"{icon} TRADE ÎNCHIS — {pos.direction}",
-            f"<b>Entry:</b> {ex.smart_price(pos.entry_price)}  ({tg.fmt_time(pos.opened_ts_ms)})\n"
-            f"<b>Exit:</b>  {ex.smart_price(avg_exit)}  ({final_exit_reason})  ({tg.fmt_time(now_ms)})\n"
-            f"<b>PnL:</b> ${pnl_real:+,.2f}  (Bybit real, fees incluse)\n"
-            f"<b>Equity:</b> ${_state.shared_equity:,.2f}  |  Return: {ret_pct:+.2f}%",
+            f"{sign} TRADE ÎNCHIS — {tg.dir_emoji(pos.direction)} {pos.direction}",
+            f"<b>Entry:</b> <code>{ex.smart_price(pos.entry_price)}</code>  "
+            f"(<code>{tg.fmt_time(pos.opened_ts_ms)}</code>)\n"
+            f"<b>Exit:</b>  <code>{ex.smart_price(avg_exit)}</code>  "
+            f"(<code>{final_exit_reason}</code>)  (<code>{tg.fmt_time(now_ms)}</code>)\n"
+            f"{tg.pnl_emoji(pnl_real)} <b>PnL:</b> <code>${pnl_real:+,.2f}</code>  "
+            f"(Bybit real, fees incluse)\n"
+            f"📊 <b>Account:</b> <code>${_state.shared_equity:,.2f}</code>  |  "
+            f"<b>Return:</b> <code>{ret_pct:+.2f}%</code>",
             symbol=symbol,
         )
     except Exception as e:
@@ -735,17 +744,22 @@ async def _close_pipeline_external_locked(symbol: str, exit_reason: str,
     _state.save()
     log_event("trade_closed", **trade.to_dict())
 
-    icon = "⚠️" if exit_reason == "EXTERNAL" else "🎯"
+    # Icon ⚠️ pe EXTERNAL: defense-in-depth a sintetizat close-ul (Bybit a
+    # inchis fara stiinta strategiei — verifica de ce). Altfel pnl_emoji.
+    sign = "⚠️" if exit_reason == "EXTERNAL" else tg.pnl_emoji(pnl_real)
     ret_pct = ((_state.shared_equity - _state.initial_account)
                / _state.initial_account * 100) if _state.initial_account else 0
     # Best-effort: tg + broadcast nu blocheaza state cleanup.
     try:
         await tg.send(
-            f"{icon} TRADE ÎNCHIS — {pos.direction}",
-            f"<b>Entry:</b> {ex.smart_price(pos.entry_price)}  ({tg.fmt_time(pos.opened_ts_ms)})\n"
-            f"<b>Exit:</b>  {ex.smart_price(avg_exit)}  ({exit_reason})  ({tg.fmt_time(now_ms)})\n"
-            f"<b>PnL:</b> ${pnl_real:+,.2f}\n"
-            f"<b>Equity:</b> ${_state.shared_equity:,.2f}  |  Return: {ret_pct:+.2f}%",
+            f"{sign} TRADE ÎNCHIS — {tg.dir_emoji(pos.direction)} {pos.direction}",
+            f"<b>Entry:</b> <code>{ex.smart_price(pos.entry_price)}</code>  "
+            f"(<code>{tg.fmt_time(pos.opened_ts_ms)}</code>)\n"
+            f"<b>Exit:</b>  <code>{ex.smart_price(avg_exit)}</code>  "
+            f"(<code>{exit_reason}</code>)  (<code>{tg.fmt_time(now_ms)}</code>)\n"
+            f"{tg.pnl_emoji(pnl_real)} <b>PnL:</b> <code>${pnl_real:+,.2f}</code>\n"
+            f"📊 <b>Account:</b> <code>${_state.shared_equity:,.2f}</code>  |  "
+            f"<b>Return:</b> <code>{ret_pct:+.2f}%</code>",
             symbol=symbol,
         )
     except Exception as e:
@@ -1156,15 +1170,18 @@ async def bootstrap() -> None:
                       f"FARA SL setat (suspect: manual sau bot fail)")
                 try:
                     await tg.send_critical(
-                        f"{sym} POZIȚIE FĂRĂ SL — refuz adoptie",
-                        f"<b>Pe Bybit:</b> {dir_real} qty={qty_real} "
-                        f"entry={ex.smart_price(entry_px)}\n"
-                        f"<b>SL Bybit:</b> NESETAT\n"
+                        "POZIȚIE FĂRĂ SL — refuz adoptie",
+                        f"<b>Pe Bybit:</b> {tg.dir_emoji(dir_real)} {dir_real}  "
+                        f"<b>Qty:</b> <code>{qty_real}</code>  "
+                        f"<b>Entry:</b> <code>{ex.smart_price(entry_px)}</code>\n"
+                        f"<b>SL Bybit:</b> <code>NESETAT</code>\n"
+                        f"\n"
                         f"<b>Acțiune:</b>\n"
                         f"  1. Setează SL manual pe Bybit App (recomandat: "
-                        f"entry × (1 ± {pair_cfg.effective_sl_pct*100:.1f}%)),\n"
-                        f"  2. SAU închide pozițiamanual,\n"
+                        f"entry × (1 ± <code>{pair_cfg.effective_sl_pct*100:.1f}%</code>)),\n"
+                        f"  2. SAU închide poziția manual,\n"
                         f"  3. Apoi redeploy bot.\n"
+                        f"\n"
                         f"<b>Stare bot:</b> NU adoptă local. Strategia poate "
                         f"genera trade nou pe semnal — risc dublă-poziție.",
                         symbol=sym,
@@ -1227,29 +1244,39 @@ async def bootstrap() -> None:
         f"{p.symbol} [{_strategy_label(p.strategy)}]"
         for p in CONFIG.pairs if p.enabled
     )
+    # INITIAL vs RESTART — daca restart_at ~ start_utc (< 60s) e primul boot;
+    # altfel bot-ul a fost repornit si afisam ambele timestamp-uri (cand a
+    # pornit prima oara + cand s-a repornit acum).
+    restart_at = datetime.now(timezone.utc)
+    is_first_boot = abs((restart_at - _state.start_utc).total_seconds()) < 60
+    time_lines = (
+        f"⏰ <b>Pornit la:</b>     <code>{tg.fmt_time(restart_at)}</code>\n"
+        if is_first_boot else
+        f"⏰ <b>Pornit initial:</b> <code>{tg.fmt_time(_state.start_utc)}</code>\n"
+        f"🔄 <b>Restart la:</b>     <code>{tg.fmt_time(restart_at)}</code>\n"
+    )
     await tg.send(
-        "BOT PORNIT ✅",
-        f"<b>Portfolio:</b> <code>{BOT_NAME}</code>\n"
-        f"<b>Strategies:</b> multi (BB MR + Hull+Ichimoku)\n"
-        f"<b>Pairs:</b> {pairs_label}\n"
-        f"<b>Account inițial:</b> ${_state.initial_account:,.2f}\n"
-        f"<b>Pornit la:</b> {tg.fmt_time(_state.start_utc)}\n"
-        f"<b>Chart:</b> port {CHART_HOST_PORT}",
+        "BOT PORNIT ✅ (multi-pair)",
+        f"🧠 <b>Strategies:</b>   <code>multi (BB MR + Hull+Ichimoku)</code>\n"
+        f"🪙 <b>Pairs:</b>        {pairs_label}\n"
+        f"📊 <b>Account init:</b> <code>${_state.initial_account:,.2f}</code>\n"
+        f"{time_lines}"
+        f"🌐 <b>Chart:</b>        port <code>{CHART_HOST_PORT}</code>",
     )
 
     # Telegram POZITIE GASITA — dupa BOT PORNIT (ordine UX). Per pozitie
     # adoptata din Bybit, anunta user-ul ca bot-ul a preluat.
-    for sym, pair_cfg, pos in _resume_announce:
-        sl_str = ex.smart_price(pos.sl_price) if pos.sl_price else "—"
-        tp_str = ex.smart_price(pos.tp_price) if pos.tp_price else "—"
+    for sym, _pair_cfg, pos in _resume_announce:
+        sl_str = f"<code>{ex.smart_price(pos.sl_price)}</code>" if pos.sl_price else "—"
+        tp_str = f"<code>{ex.smart_price(pos.tp_price)}</code>" if pos.tp_price else "—"
         try:
             await tg.send(
-                f"♻️ POZIȚIE GĂSITĂ — {sym}",
-                f"<b>Strategy:</b> <code>{_strategy_label(pair_cfg.strategy)}</code>\n"
-                f"<b>Direcție:</b> {pos.direction}  <b>Qty:</b> {pos.qty}\n"
-                f"<b>Entry:</b> {ex.smart_price(pos.entry_price)}\n"
+                "♻️ POZIȚIE GĂSITĂ",
+                f"<b>Direcție:</b> {tg.dir_emoji(pos.direction)} {pos.direction}  "
+                f"<b>Qty:</b> <code>{pos.qty}</code>\n"
+                f"<b>Entry:</b> <code>{ex.smart_price(pos.entry_price)}</code>\n"
                 f"<b>SL:</b> {sl_str}  <b>TP:</b> {tp_str}\n"
-                f"<b>Risk:</b> ${pos.risk_usd:.2f}\n"
+                f"<b>Risk:</b> <code>${pos.risk_usd:.2f}</code>\n"
                 f"Trailing continuă pe SL existent.",
                 symbol=sym,
             )
@@ -1298,10 +1325,12 @@ async def lifespan(app: FastAPI):
                        / _state.initial_account * 100) if _state.initial_account else 0
             await tg.send(
                 "BOT OPRIT 🛑",
-                f"<b>Oprit la:</b> {tg.fmt_time(datetime.now(timezone.utc))}\n"
-                f"<b>Signal:</b> <code>{SHUTDOWN_SIGNAL['name'] or 'graceful'}</code>\n"
-                f"<b>Equity:</b> ${_state.shared_equity:,.2f}  |  Return: {ret_pct:+.2f}%\n"
-                f"<b>Trades:</b> {len(_state.trades)}",
+                f"🧠 <b>Strategies:</b> <code>multi (BB MR + Hull+Ichimoku)</code>\n"
+                f"📡 <b>Signal:</b>     <code>{SHUTDOWN_SIGNAL['name'] or 'graceful'}</code>\n"
+                f"⏰ <b>Oprit la:</b>   <code>{tg.fmt_time(datetime.now(timezone.utc))}</code>\n"
+                f"📊 <b>Account:</b>    <code>${_state.shared_equity:,.2f}</code>  |  "
+                f"<b>Return:</b> <code>{ret_pct:+.2f}%</code>\n"
+                f"🔢 <b>Trades:</b>     <code>{len(_state.trades)}</code>",
             )
         except Exception as e:
             print(f"  [SHUTDOWN] tg.send failed: {e}")
