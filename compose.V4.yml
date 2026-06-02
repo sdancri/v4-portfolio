@@ -32,6 +32,10 @@ services:
       - RESET_TOKEN=${RESET_TOKEN:-}
       - RATE_LIMIT_PER_SEC=${RATE_LIMIT_PER_SEC:-5}
       - RATE_LIMIT_BURST=${RATE_LIMIT_BURST:-10}
+      # WS zombie watchdog: forteaza reconnect daca nu vine niciun mesaj (public
+      # kline + private order/exec/position) > N secunde. Vezi public_ws_loop /
+      # private_ws.run (triple defense: native ping + app-ping + watchdog).
+      - WS_ZOMBIE_TIMEOUT=${WS_ZOMBIE_TIMEOUT:-60}
       # Memory monitor: interval log + threshold pt diagnostic dump + pre-OOM TG.
       # MEM_MON_RSS_ALERT_MB: CALIBREAZA per VPS — vezi sectiunea "CALIBRARE
       # PER-BOT" mai jos (baseline + 30 headroom). Daca primesti alerta la fiecare

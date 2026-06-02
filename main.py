@@ -880,12 +880,21 @@ async def public_ws_loop() -> None:
            if os.getenv("BYBIT_TESTNET", "0") == "1"
            else "wss://stream.bybit.com/v5/public/linear")
 
+    # Triple defense vs WS zombie (conexiune ramane "open" dar nu mai curg
+    # mesaje): (1) keepalive nativ websockets (ping_interval/ping_timeout →
+    # ConnectionClosed pe pong miss), (2) Bybit app-level ping (unele
+    # endpoint-uri il asteapta), (3) watchdog pe last_msg_ts (force close daca
+    # nu vine niciun mesaj > WS_ZOMBIE_TIMEOUT). Toate → except → reconnect.
+    ws_zombie_timeout = int(os.getenv("WS_ZOMBIE_TIMEOUT", "60"))
     while True:
         try:
-            async with websockets.connect(url, ping_interval=None,
+            async with websockets.connect(url, ping_interval=20,
+                                          ping_timeout=10,
                                           open_timeout=15) as ws:
                 await ws.send(json.dumps({"op": "subscribe", "args": topics}))
                 print(f"  [WS-PUB] subscribed: {topics}")
+
+                last_msg_ts = time.time()
 
                 async def _hb():
                     while True:
@@ -895,9 +904,25 @@ async def public_ws_loop() -> None:
                         except Exception:
                             break
 
+                async def _watchdog():
+                    while True:
+                        await asyncio.sleep(10)
+                        idle = time.time() - last_msg_ts
+                        if idle > ws_zombie_timeout:
+                            print(f"  [WS-PUB] ZOMBIE detected: no msg "
+                                  f"{idle:.0f}s > {ws_zombie_timeout}s — "
+                                  f"forcing close → reconnect")
+                            try:
+                                await ws.close()
+                            except Exception:
+                                pass
+                            return
+
                 hb = asyncio.create_task(_hb())
+                wd = asyncio.create_task(_watchdog())
                 try:
                     async for raw in ws:
+                        last_msg_ts = time.time()
                         msg = json.loads(raw)
                         if msg.get("op") in ("pong", "subscribe"):
                             continue
@@ -962,6 +987,7 @@ async def public_ws_loop() -> None:
                                     pass  # best-effort, nu blocam WS loop
                 finally:
                     hb.cancel()
+                    wd.cancel()
         except Exception as e:
             print(f"  [WS-PUB] error: {e!r} — reconnect in 5s")
             await asyncio.sleep(5)
