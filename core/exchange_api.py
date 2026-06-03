@@ -460,7 +460,9 @@ async def set_leverage(symbol: str, leverage: int) -> bool:
 
 async def set_position_sl(symbol: str, sl_price: float,
                           tp_price: Optional[float] = None,
-                          is_initial: bool = True) -> bool:
+                          is_initial: bool = True,
+                          max_retries: int = 4,
+                          send_tg_on_fail: bool = True) -> bool:
     """
     setTradingStop: atasaza SL (si optional TP) la pozitia DESCHISA, atomic.
     Bybit triggereaza intra-bar pe LastPrice (high/low).
@@ -482,8 +484,13 @@ async def set_position_sl(symbol: str, sl_price: float,
                   update trailing/breakeven (pozitia are deja un SL valid; un
                   fail aici NU e critical — Telegram trimite warning, NU
                   critical).
+      max_retries: cate tentative cu backoff [0,1,2,4]s. Default 4 (~7s total);
+                  1 = single attempt fail-fast (folosit de _arm_sl Layer 0).
+      send_tg_on_fail: daca True (default) si toate retries esueaza, trimite
+                  Telegram. False = silent (caller-ul, ex _arm_sl/_sl_retry_loop,
+                  gestioneaza singur notificarea ca sa evite spam).
 
-    Retry 3x backoff 1/2/4s — race condition place_market → trading-stop
+    Retry backoff 1/2/4s — race condition place_market → trading-stop
     (Bybit poate avea cateva sute ms pana cand pozitia apare activa).
     """
     info = await get_market_info(symbol)
@@ -508,7 +515,12 @@ async def set_position_sl(symbol: str, sl_price: float,
             "tpOrderType": "Market",
         })
 
-    for attempt, delay in enumerate([0, 1.0, 2.0, 4.0]):
+    # Backoff fix [0,1,2,4]s. max_retries restrange cate iteratii rulam
+    # (default 4 = ~7s total; 1 = single attempt fail-fast pt _arm_sl Layer 0).
+    full_delays = [0, 1.0, 2.0, 4.0]
+    n_retries = max(1, min(max_retries, len(full_delays)))
+    delays = full_delays[:n_retries]
+    for attempt, delay in enumerate(delays):
         if delay > 0:
             await asyncio.sleep(delay)
         r = await _post("/v5/position/trading-stop", payload)
@@ -516,10 +528,16 @@ async def set_position_sl(symbol: str, sl_price: float,
             if attempt > 0:
                 print(f"  [BYBIT] set_position_sl OK dupa retry #{attempt}")
             return True
-        print(f"  [BYBIT] set_position_sl FAIL #{attempt+1}/4")
+        print(f"  [BYBIT] set_position_sl FAIL #{attempt+1}/{n_retries}")
     tp_info = f" tp={tp_price}" if tp_price is not None else ""
     print(f"  [BYBIT] set_position_sl FAILED definitiv pe {symbol} "
           f"sl={sl_price}{tp_info} — pozitia ruleaza FARA protectie!")
+    # SKIP TG complet daca caller a cerut send_tg_on_fail=False (Layer 0
+    # fail-fast din _arm_sl — _sl_retry_loop trimite singur critical doar la
+    # timeout total, nu per attempt → evita spam).
+    if not send_tg_on_fail:
+        return False
+    retry_s = int(sum(delays))
     # Alerta Telegram diferentiata pe is_initial:
     #   is_initial=True (primul SL post-fill): tg.send_critical — URGENT,
     #     pozitia ruleaza fara nicio protectie Bybit-side.
@@ -536,7 +554,7 @@ async def set_position_sl(symbol: str, sl_price: float,
         if is_initial:
             await tg.send_critical(
                 f"{symbol} SL/TP NESETAT" if tp_price is not None else f"{symbol} SL NESETAT",
-                f"<b>set_position_sl A EȘUAT</b> după 4 reîncercări (~7s)\n"
+                f"<b>set_position_sl A EȘUAT</b> după {n_retries} reîncercări (~{retry_s}s)\n"
                 f"<b>SL:</b> {sl_str}\n"
                 f"{tp_line}"
                 f"<b>Poziția rulează FĂRĂ protecție Bybit-side.</b>\n"
@@ -550,7 +568,7 @@ async def set_position_sl(symbol: str, sl_price: float,
             # nu o urgenta. Warning normal, nu critical.
             await tg.send(
                 f"{symbol} SL trailing update FAILED",
-                f"<b>set_position_sl A EȘUAT</b> după 4 reîncercări (~7s)\n"
+                f"<b>set_position_sl A EȘUAT</b> după {n_retries} reîncercări (~{retry_s}s)\n"
                 f"<b>SL țintit:</b> {sl_str}\n"
                 f"{tp_line}"
                 f"Poziția rămâne protejată de SL-ul inițial setat anterior.\n"

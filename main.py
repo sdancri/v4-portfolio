@@ -332,22 +332,55 @@ async def open_position(symbol: str, direction: str, close_price: float,
         tp_price = (real_fill_price * (1 + pair_cfg.tp_pct) if direction == "LONG"
                     else real_fill_price * (1 - pair_cfg.tp_pct))
 
+    # Telegram INTRARE — trimis INAINTE de set_position_sl. set_position_sl
+    # emite intern HALT "SL/TP NESETAT" pe esec dupa ~7s retry; daca am trimite
+    # INTRARE dupa, pe timeline-ul Telegram HALT-ul ar aparea PRIMUL (confuz —
+    # pare ca botul deschide intentionat fara protectie). Ordinea corecta:
+    # intai "am intrat", apoi (daca pica SL) "ruleaza fara protectie".
+    # now_ms fixat aici = momentul fill-ului (nu +7s daca SL retry esueaza),
+    # reutilizat ca opened_ts_ms.
+    now_ms = int(time.time() * 1000)
+    slip_line = ""
+    if abs(real_fill_price - close_price) > 0:
+        slip_bps = (real_fill_price - close_price) / close_price * 10000
+        slip_line = (f"  <i>(signal <code>{ex.smart_price(close_price)}</code>, "
+                     f"slip <code>{slip_bps:+.1f}bps</code>)</i>")
+    fill_emoji = {"maker": "🟢", "mixed": "🟡", "taker": "🔴"}.get(fill_kind, "⚪")
+    tp_section = (f"🎯 <b>Take Profit:</b> <code>{ex.smart_price(tp_price)}</code>  "
+                 f"<i>(Market atomic)</i>\n\n" if tp_price else "")
+    await tg.send(
+        f"🚀 INTRARE: {direction} {tg.dir_emoji(direction)}",
+        f"<b>Fill:</b>     {fill_emoji} <code>{fill_kind}</code>\n"
+        f"<b>Entry:</b>    <code>{ex.smart_price(real_fill_price)}</code>{slip_line}  "
+        f"(<code>{tg.fmt_time(now_ms)}</code>)\n"
+        f"<b>Notional:</b> <code>${sizing.pos_usd:,.2f}</code>\n"
+        f"<b>Risk:</b>     <code>${sizing.risk_usd:,.2f}</code>  "
+        f"(<code>{pair_cfg.risk_pct_per_trade*100:.0f}%</code> × "
+        f"<code>${_state.shared_equity:,.2f}</code>)\n"
+        f"\n"
+        f"{tp_section}"
+        f"🛑 <b>Stop Loss:</b>   <code>{ex.smart_price(sl_price)}</code>  "
+        f"(<code>{sl_pct_use*100:.1f}%</code>, Market)\n"
+        f"\n"
+        f"<b>Qty:</b> <code>{qty}</code>",
+        symbol=symbol,
+    )
+
     # SL + TP atomic server-side Market (varianta C — robust, simplu).
     # SL: siguranta executiei pe gap. TP: deterministic la trigger (fara
     # spike-through pe alts subtiri). Cost: ~3.5 bps fata de TP-Limit maker —
     # irelevant pe target R mare; beneficiu: exec garantata independent
     # de bot/WS uptime.
-    # Return False = toate 4 retry-urile au esuat (Telegram critical sent
-    # deja in set_position_sl). NU abandonam trade-ul — pozitia exista
-    # pe Bybit, abandonul ar lasa-o orfana fara state local. Continuam,
-    # marcam pozitie ca activa, iar reconcilierea la close va detecta lipsa
-    # SL si va force chase_close. is_initial=True (primul SL post-fill).
-    sl_ok = await ex.set_position_sl(symbol, sl_price, tp_price, is_initial=True)
+    # Pattern armed_set_sl (sync cu BP): Layer 1 = ex.set_position_sl quick
+    # (race-aware, silent). Pe esec → Layer 2 background retry pana la
+    # _SL_RETRY_TIMEOUT (flip sl_armed=True la succes, HALT o SINGURA data la
+    # timeout). NU abandonam trade-ul; pana la armare ramane fallback software
+    # (SL_LONG/SHORT pe bara confirmed → close_position).
+    sl_ok = await _arm_sl(symbol, sl_price, tp_price)
     if not sl_ok:
-        print(f"  [OPEN {symbol}] WARN: entry {direction} fara SL Bybit-armed "
-              f"— fallback software (strategy SL_LONG/SHORT → close_position).")
+        print(f"  [OPEN {symbol}] SL initial NEsetat — Layer 2 background retry "
+              f"activ (max {_SL_RETRY_TIMEOUT}s); fallback software pana atunci.")
 
-    now_ms = int(time.time() * 1000)
     pos = LivePosition(
         symbol=symbol, side=side, direction=direction,
         qty=qty, entry_price=real_fill_price,
@@ -374,33 +407,96 @@ async def open_position(symbol: str, direction: str, close_price: float,
         "entry_ms": chart_entry_ms,
     })
 
-    # Telegram — afiseaza fill real (match cu Bybit App) + tip fill (maker/taker/mixed).
-    # smart_price = auto-precision pe magnitudine (~5 cifre semnificative).
-    slip_line = ""
-    if abs(real_fill_price - close_price) > 0:
-        slip_bps = (real_fill_price - close_price) / close_price * 10000
-        slip_line = (f"  <i>(signal <code>{ex.smart_price(close_price)}</code>, "
-                     f"slip <code>{slip_bps:+.1f}bps</code>)</i>")
-    fill_emoji = {"maker": "🟢", "mixed": "🟡", "taker": "🔴"}.get(fill_kind, "⚪")
-    tp_section = (f"🎯 <b>Take Profit:</b> <code>{ex.smart_price(tp_price)}</code>  "
-                 f"<i>(Market atomic)</i>\n\n" if tp_price else "")
-    await tg.send(
-        f"🚀 INTRARE: {direction} {tg.dir_emoji(direction)}",
-        f"<b>Fill:</b>     {fill_emoji} <code>{fill_kind}</code>\n"
-        f"<b>Entry:</b>    <code>{ex.smart_price(real_fill_price)}</code>{slip_line}  "
-        f"(<code>{tg.fmt_time(now_ms)}</code>)\n"
-        f"<b>Notional:</b> <code>${sizing.pos_usd:,.2f}</code>\n"
-        f"<b>Risk:</b>     <code>${sizing.risk_usd:,.2f}</code>  "
-        f"(<code>{pair_cfg.risk_pct_per_trade*100:.0f}%</code> × "
-        f"<code>${_state.shared_equity:,.2f}</code>)\n"
-        f"\n"
-        f"{tp_section}"
-        f"🛑 <b>Stop Loss:</b>   <code>{ex.smart_price(sl_price)}</code>  "
-        f"(<code>{sl_pct_use*100:.1f}%</code>, Market)\n"
-        f"\n"
-        f"<b>Qty:</b> <code>{qty}</code>",
-        symbol=symbol,
-    )
+    # (Telegram INTRARE deja trimis mai sus, INAINTE de set_position_sl —
+    # vezi nota despre ordinea pe timeline vs HALT "SL NESETAT".)
+
+
+# ============================================================================
+# armed_set_sl pattern (sync cu BP) — Layer 1 quick + Layer 2 background retry
+# ============================================================================
+# Layer 1: _arm_sl face UN singur attempt (fail-fast, silent). Pe succes, SL e
+#   armat Bybit-side instant. Pe esec → spawneaza Layer 2 si returneaza imediat
+#   (non-blocking → open_position nu blocheaza ~7s, INTRARE iese instant).
+# Layer 2: _sl_retry_loop ruleaza in background cu backoff lung. La succes:
+#   flip pos.sl_armed=True (opreste fallback software). Trimite UN SINGUR
+#   Telegram critical doar la timeout total — nu per-attempt (zero spam).
+# Pana la armare ramane fallback software: SL_LONG/SHORT pe bara confirmed →
+#   close_position (vezi on_confirmed_bar).
+_SL_RETRY_BACKOFF = [5, 10, 20, 30, 60]                        # secunde (Layer 2)
+_SL_RETRY_TIMEOUT = int(os.getenv("SL_RETRY_TIMEOUT", "120"))  # total wait Layer 2
+
+
+async def _arm_sl(symbol: str, sl_price: float,
+                  tp_price: Optional[float]) -> bool:
+    """Layer 1 SL arming. Single attempt fail-fast (silent); pe esec spawneaza
+    Layer 2 background retry si returneaza imediat (non-blocking). Return True =
+    SL armat Bybit-side instant; False = in curs de retry background."""
+    ok = await ex.set_position_sl(symbol, sl_price, tp_price, is_initial=True,
+                                  max_retries=1, send_tg_on_fail=False)
+    if not ok:
+        asyncio.create_task(_sl_retry_loop(symbol, sl_price, tp_price))
+    return ok
+
+
+async def _sl_retry_loop(symbol: str, sl_price: float,
+                         tp_price: Optional[float]) -> None:
+    """Layer 2 background retry (NU se cheama direct — folosit de _arm_sl).
+    Backoff _SL_RETRY_BACKOFF pana la _SL_RETRY_TIMEOUT. Abandoneaza daca pozitia
+    s-a inchis sau a fost deja armata intre timp. La succes: flip sl_armed +
+    Telegram info. La timeout total: UN singur Telegram critical (software
+    fallback — V4 nu foloseste panic close)."""
+    def _needs_arming() -> bool:
+        # Pozitia inca deschisa SI inca nearmata (nu inchisa/reopen/armata altfel).
+        p = _state.get_position(symbol)
+        return p is not None and not p.sl_armed
+
+    elapsed = 0
+    for delay in _SL_RETRY_BACKOFF:
+        if elapsed >= _SL_RETRY_TIMEOUT:
+            break
+        await asyncio.sleep(delay)
+        elapsed += delay
+        if not _needs_arming():
+            return  # inchisa/armata intre timp — abandonam silentios
+        ok = await ex.set_position_sl(symbol, sl_price, tp_price, is_initial=True,
+                                      max_retries=1, send_tg_on_fail=False)
+        if ok:
+            pos = _state.get_position(symbol)
+            if pos is not None:
+                pos.sl_armed = True
+                _state.save()
+            print(f"  [{symbol}] SL armed dupa {elapsed}s retry (Layer 2)")
+            try:
+                await tg.send(
+                    "✅ SL setat cu întârziere",
+                    f"🛑 <b>set_position_sl</b> a reușit după <code>{elapsed}s</code> "
+                    f"de reîncercări.\nPoziția e protejată acum și Bybit-side.",
+                    symbol=symbol,
+                )
+            except Exception:
+                pass
+            return
+
+    # Timeout total — fallback software in-code (SL_LONG/SHORT pe bara confirmed).
+    if not _needs_arming():
+        return
+    print(f"  [{symbol}] SL retry timeout {elapsed}s — fallback software in-code")
+    try:
+        sl_str = ex.smart_price(sl_price)
+        tp_line = (f"🎯 <b>TP:</b> <code>{ex.smart_price(tp_price)}</code>\n"
+                   if tp_price is not None else "")
+        await tg.send_critical(
+            "SL/TP NESETAT" if tp_price is not None else "SL NESETAT",
+            f"<b>set_position_sl A EȘUAT</b> după <code>{elapsed}s</code> de reîncercări\n"
+            f"🛑 <b>SL:</b> <code>{sl_str}</code>\n"
+            f"{tp_line}"
+            f"<b>Poziția rulează FĂRĂ protecție Bybit-side.</b>\n"
+            f"Fallback software: SL_LONG/SHORT pe bară confirmed → close_position. "
+            f"Reconcilierea la primul close va force chase_close dacă e cazul.",
+            symbol=symbol,
+        )
+    except Exception as e:
+        print(f"  [{symbol}] SL timeout tg.send_critical failed: {e!r}")
 
 
 async def _assert_closed(symbol: str, qty_local: float,
