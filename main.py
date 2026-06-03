@@ -376,7 +376,30 @@ async def open_position(symbol: str, direction: str, close_price: float,
     # _SL_RETRY_TIMEOUT (flip sl_armed=True la succes, HALT o SINGURA data la
     # timeout). NU abandonam trade-ul; pana la armare ramane fallback software
     # (SL_LONG/SHORT pe bara confirmed → close_position).
-    sl_ok = await _arm_sl(symbol, sl_price, tp_price)
+    # Guard geometrie SL (validate_sl din BP). In V4 sl_price = fill×(1∓sl_pct)
+    # e corect prin constructie, dar prindem bug-uri viitoare: SL pe partea
+    # gresita sau <=0 → Bybit l-ar trigerui INSTANT la primul tick (pierdere
+    # silentioasa + Telegram "SL/TP" misleading). NU armam un SL invalid.
+    sl_geometry_bad = (
+        sl_price <= 0
+        or (direction == "LONG" and sl_price >= real_fill_price)
+        or (direction == "SHORT" and sl_price <= real_fill_price)
+    )
+    if sl_geometry_bad:
+        print(f"  [OPEN {symbol}] SL GEOMETRY INVALID: dir={direction} "
+              f"entry={real_fill_price} sl={sl_price} — NU armez (fallback software)")
+        await tg.send_critical(
+            "SL geometrie INVALIDĂ",
+            f"<b>Direcție:</b> {direction}  "
+            f"<b>Entry:</b> <code>{ex.smart_price(real_fill_price)}</code>  "
+            f"<b>SL:</b> <code>{sl_price}</code>\n"
+            f"SL pe partea greșită / ≤0 — NU îl armez pe Bybit (ar închide "
+            f"instant). Poziția rulează pe fallback software. Verifică strategia.",
+            symbol=symbol,
+        )
+        sl_ok = False
+    else:
+        sl_ok = await _arm_sl(symbol, sl_price, tp_price)
     if not sl_ok:
         print(f"  [OPEN {symbol}] SL initial NEsetat — Layer 2 background retry "
               f"activ (max {_SL_RETRY_TIMEOUT}s); fallback software pana atunci.")
@@ -539,8 +562,26 @@ async def _reconcile_close(symbol: str, direction: str,
       qty_real ≈ qty_local     -> stop nu s-a triggerit; retry; daca persista, force
       qty_real > qty_local     -> anomalie; HALT, raise ReconciliationError
     """
-    bybit_pos = await ex.get_position(symbol)
-    qty_real = float(bybit_pos.get("size", 0)) if bybit_pos else 0.0
+    # STRICT — pe API fail NU concludem fals "clean close" cu PnL=0.
+    # Multi-attempt re-confirm; daca toate esueaza → assume open, force chase.
+    qty_real_opt = await ex.get_position_qty_strict(symbol)
+    if qty_real_opt is None:
+        print(f"  [RECONCILE {symbol}] get_position API fail — re-confirm multi-attempt")
+        confirmed = await ex.confirm_position_closed(symbol, attempts=3, delay=1.0)
+        if confirmed is None:
+            print(f"  [RECONCILE {symbol}] confirm all attempts FAILED — "
+                  f"assume open, force chase_close")
+            await ex.chase_close(symbol, direction)
+            forced_reason = f"{exit_reason}_FORCED"
+            await _assert_closed(symbol, qty_local, forced_reason)
+            return forced_reason
+        if confirmed:
+            return exit_reason
+        # confirmed False (inca activa) — citim qty pt ramurile de mai jos.
+        bybit_pos = await ex.get_position(symbol)
+        qty_real = float(bybit_pos.get("size", 0)) if bybit_pos else 0.0
+    else:
+        qty_real = qty_real_opt
 
     # Ramura 1: clean close (cazul comun)
     if qty_real <= _RECONCILE_QTY_EPS:
@@ -578,9 +619,14 @@ async def _reconcile_close(symbol: str, direction: str,
     # Asteptam putin (poate e doar latenta), apoi forcam inchidere.
     for attempt in range(_RECONCILE_RETRIES):
         await asyncio.sleep(_RECONCILE_RETRY_SLEEP)
-        bybit_pos = await ex.get_position(symbol)
-        qty_real = float(bybit_pos.get("size", 0)) if bybit_pos else 0.0
-        if qty_real <= _RECONCILE_QTY_EPS:
+        # Strict: pe API fail in retry, assume still open (continue) — NU
+        # concludem fals ca s-a triggerit.
+        qty_real_opt = await ex.get_position_qty_strict(symbol)
+        if qty_real_opt is None:
+            print(f"  [RECONCILE {symbol}] retry {attempt+1}: API fail — "
+                  f"assume still open, continuing")
+            continue
+        if qty_real_opt <= _RECONCILE_QTY_EPS:
             print(f"  [RECONCILE {symbol}] {exit_reason} a triggerit dupa retry "
                   f"#{attempt + 1}")
             return exit_reason
@@ -760,13 +806,14 @@ async def check_external_close(symbol: str) -> bool:
     if pos is None:
         return False
 
-    try:
-        bybit_pos = await ex.get_position(symbol)
-    except Exception as e:
-        print(f"  [EXTERNAL-CHECK {symbol}] fetch failed: {e}")
+    # Strict read — None pe API fail (NU 0.0). Un GET ratat (timeout, rate
+    # limit, 5xx, NAT reset la 00:00 UTC) NU trebuie interpretat ca qty=0 →
+    # close fals al unui trade sanatos.
+    qty_real = await ex.get_position_qty_strict(symbol)
+    if qty_real is None:
+        print(f"  [EXTERNAL-CHECK {symbol}] API fail — skip (retry next bar)")
         return False
 
-    qty_real = float(bybit_pos.get("size", 0)) if bybit_pos else 0.0
     if qty_real > _RECONCILE_QTY_EPS:
         # Position still exists — check no anomaly
         if qty_real > pos.qty + _RECONCILE_QTY_EPS:
@@ -782,8 +829,22 @@ async def check_external_close(symbol: str) -> bool:
             raise ReconciliationError(msg)
         return False
 
-    # qty=0 — pozitia inchisa pe Bybit fara sa stim. Sintetizam EXTERNAL.
-    print(f"  [{symbol}] DESYNC: local in_trade=True, Bybit qty=0 → EXTERNAL")
+    # qty=0 dintr-un singur read — CONFIRMA multi-attempt inainte de a sintetiza
+    # EXTERNAL (care e ireversibil: record_closed_trade). Pe API unreachable sau
+    # qty>0 la re-check → skip, retry pe bara urmatoare.
+    confirmed = await ex.confirm_position_closed(symbol)
+    if confirmed is None:
+        print(f"  [{symbol}] external_close: confirm API unreachable — skip, retry next bar")
+        return False
+    if not confirmed:
+        print(f"  [{symbol}] external_close: confirm=False (inca activa/race) — skip")
+        return False
+    # Re-check local: alt handler (private WS) ar fi putut inchide intre timp.
+    if _state.get_position(symbol) is None:
+        return False
+
+    # qty=0 confirmat multi-attempt — sintetizam EXTERNAL.
+    print(f"  [{symbol}] DESYNC: local in_trade=True, Bybit qty=0 (confirmat) → EXTERNAL")
     last_close = _signals[symbol].df.iloc[-1]["close"] if len(_signals[symbol].df) else pos.entry_price
     await close_pipeline_external(symbol, exit_reason="EXTERNAL",
                                    target_price=float(last_close))

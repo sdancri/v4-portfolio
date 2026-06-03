@@ -328,6 +328,71 @@ async def get_position(symbol: str) -> Optional[dict]:
     return None
 
 
+async def get_position_qty_strict(symbol: str) -> Optional[float]:
+    """
+    Varianta strict-error a citirii qty. Returneaza:
+      float  — qty real (0.0 daca pozitie cu adevarat absenta din list)
+      None   — API fail (timeout, retCode!=0, parse error). Caller decide:
+               retry / treat as "unknown" (NU concluziona qty=0).
+
+    Folosit in loops cu polling rapid (chase_close) si reconcile — distinge
+    "API down" de "pozitie inchisa real", fix pt bug-ul "API fail = 0 =
+    sintetizez fals EXTERNAL close / clean close" din citirea legacy.
+    """
+    r = await _get("/v5/position/list",
+                   {"category": _cat(), "symbol": symbol})
+    if r is None:
+        return None
+    try:
+        for p in r.get("list", []):
+            if p["symbol"] == symbol:
+                return float(p.get("size", 0))
+        return 0.0     # API success, symbol absent = legitim 0
+    except Exception:
+        return None    # parse fail = treat as unknown
+
+
+async def confirm_position_closed(symbol: str,
+                                  attempts: int = 3,
+                                  delay: float = 1.5) -> Optional[bool]:
+    """
+    Verifica MULTI-ATTEMPT daca pozitia e cu adevarat inchisa pe Bybit.
+    Distinge 3 stari (fix pt "API fail = qty 0 = inchidere falsa"):
+
+      True   — TOATE `attempts` apeluri au reusit si TOATE au returnat qty=0.
+      False  — Cel putin un apel a returnat qty > 0 (inca activa / reopened).
+      None   — Cel putin un apel a esuat (API unreachable) → caller abandoneaza.
+
+    Folosit in defense-in-depth (check_external_close) + reconcile, ca un singur
+    GET ratat (timeout, rate limit, 5xx, NAT reset la 00:00 UTC) sa NU mai
+    inchida fals un trade sanatos.
+    """
+    for i in range(attempts):
+        if i > 0:
+            await asyncio.sleep(delay)
+        r = await _get("/v5/position/list",
+                       {"category": _cat(), "symbol": symbol})
+        if r is None:
+            print(f"  [BYBIT] confirm_position_closed {symbol}: attempt "
+                  f"{i+1}/{attempts} API fail → None (abandon)")
+            return None
+        try:
+            qty = 0.0
+            for p in r.get("list", []):
+                if p["symbol"] == symbol:
+                    qty = float(p.get("size", 0))
+                    break
+        except Exception as e:
+            print(f"  [BYBIT] confirm_position_closed {symbol}: attempt "
+                  f"{i+1}/{attempts} parse error ({e!r}) → None (abandon)")
+            return None
+        if qty > 1e-9:
+            print(f"  [BYBIT] confirm_position_closed {symbol}: attempt "
+                  f"{i+1}/{attempts} qty={qty} → NOT closed")
+            return False
+    return True
+
+
 async def fetch_open_position(symbol: str) -> Optional[dict]:
     """
     Detalii complete despre pozitia deschisa pe `symbol`, output normalizat.
@@ -793,8 +858,15 @@ async def chase_close(symbol: str, direction: str,
     last_id: Optional[str] = None
 
     for attempt in range(max_attempts):
-        bybit_pos = await get_position(symbol)
-        qty = float(bybit_pos.get("size", 0)) if bybit_pos else 0.0
+        # Strict: None pe API fail (NU 0.0). Critic — daca API e tranzient down
+        # si am crede ca pozitia e inchisa, am exit chase → pozitie ramane
+        # deschisa fara aware. None → assume open, keep chasing.
+        qty = await get_position_qty_strict(symbol)
+        if qty is None:
+            print(f"  [BYBIT] chase_close {symbol} {attempt+1}/{max_attempts}: "
+                  f"API fail — assume open, keep chasing")
+            await asyncio.sleep(interval_sec)
+            continue
         if qty <= 0:
             print(f"  [BYBIT] chase_close {symbol}: inchis ({attempt} attempts)")
             return True
@@ -816,9 +888,13 @@ async def chase_close(symbol: str, direction: str,
                   f"{close_side} @ {price} qty={qty}")
         await asyncio.sleep(interval_sec)
 
-    # Fallback market
-    bybit_pos = await get_position(symbol)
-    qty = float(bybit_pos.get("size", 0)) if bybit_pos else 0.0
+    # Fallback market — strict: None pe API fail → skip market (NU presupunem
+    # qty=0 si nici nu trimitem market pe state ambiguu / double-trigger).
+    qty = await get_position_qty_strict(symbol)
+    if qty is None:
+        print(f"  [BYBIT] chase_close {symbol} fallback: API fail — "
+              f"skip market (state ambiguu)")
+        return False
     if qty > 0:
         if last_id:
             await cancel_order(symbol, last_id)
