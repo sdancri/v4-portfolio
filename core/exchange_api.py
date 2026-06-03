@@ -598,6 +598,44 @@ async def set_position_sl(symbol: str, sl_price: float,
 #      place_limit_postonly returneaza None instant → fallback Market imediat,
 #      nu astepta timeout-ul degeaba.
 
+async def _confirm_market_fill(symbol: str, oid: Optional[str],
+                                expected_qty: float,
+                                timeout_sec: int = 3) -> tuple[float, float]:
+    """
+    Poll orderStatus dupa place_market ca sa CONFIRMAM fill-ul REAL (NU
+    presupunem ca acceptarea orderId-ului implica fill). place_market returneaza
+    orderId = ordin acceptat, NU fillat — pe IOC market reject / transient API
+    fail am raporta fals "taker" cu filled_qty optimist → trade fantoma.
+
+    Returneaza (cum_exec_qty, avg_price):
+      (>0, avg)   — partial sau full fill confirmat
+      (0.0, 0.0)  — n-a fillat nimic (rejected, expired, API fail, oid None)
+
+    IOC market pe Bybit fillueaza tipic sub 100ms. Polling 0.5s × timeout_sec
+    (default 3s) e abundent + tolerant cu API latency.
+    """
+    if not oid:
+        return (0.0, 0.0)
+    last_cum = 0.0
+    last_avg = 0.0
+    for _ in range(max(1, timeout_sec * 2)):  # ~2 polls/sec
+        await asyncio.sleep(0.5)
+        st = await get_order_status(symbol, oid)
+        if st is None:
+            continue   # API fail tranzitor — retry
+        status = st.get("orderStatus", "")
+        try:
+            last_cum = float(st.get("cumExecQty", 0) or 0)
+            last_avg = float(st.get("avgPrice", 0) or 0)
+        except (ValueError, TypeError):
+            pass
+        # Terminal states — return ce a fillat (poate fi 0 pe Rejected/Cancelled).
+        if status in ("Filled", "Rejected", "Cancelled", "PartiallyFilledCanceled"):
+            return (last_cum, last_avg)
+    # Timeout — return last known cum (may be 0).
+    return (last_cum, last_avg)
+
+
 async def maker_entry_or_market(symbol: str, side: str, qty: float,
                                 top: Optional[dict] = None,
                                 timeout_sec: int = 5,
@@ -656,9 +694,11 @@ async def maker_entry_or_market(symbol: str, side: str, qty: float,
         if fallback == "skip":
             return {"result": "skipped", "filled_qty": 0.0, "avg_price": 0.0}
         market_id = await place_market(symbol, side, qty, reduce_only=reduce_only)
-        return {"result": "taker" if market_id else "failed",
-                "filled_qty": qty if market_id else 0.0,
-                "avg_price": 0.0}
+        # Confirm fill REAL — place_market = ordin acceptat, nu fillat.
+        real_fill, real_avg = await _confirm_market_fill(symbol, market_id, qty)
+        if real_fill <= 0:
+            return {"result": "failed", "filled_qty": 0.0, "avg_price": 0.0}
+        return {"result": "taker", "filled_qty": real_fill, "avg_price": real_avg}
 
     # 1. Plasare maker. None = rejection PostOnly sau alt error.
     oid = await place_limit_postonly(symbol, side, px, qty,
@@ -668,9 +708,10 @@ async def maker_entry_or_market(symbol: str, side: str, qty: float,
         if fallback == "skip":
             return {"result": "skipped", "filled_qty": 0.0, "avg_price": 0.0}
         market_id = await place_market(symbol, side, qty, reduce_only=reduce_only)
-        return {"result": "taker" if market_id else "failed",
-                "filled_qty": qty if market_id else 0.0,
-                "avg_price": 0.0}
+        real_fill, real_avg = await _confirm_market_fill(symbol, market_id, qty)
+        if real_fill <= 0:
+            return {"result": "failed", "filled_qty": 0.0, "avg_price": 0.0}
+        return {"result": "taker", "filled_qty": real_fill, "avg_price": real_avg}
 
     # 2. Poll orderStatus (NU position qty — bug fix: evita probleme cu pyramiding)
     for _ in range(timeout_sec):
@@ -692,18 +733,32 @@ async def maker_entry_or_market(symbol: str, side: str, qty: float,
         return {"result": "skipped",
                 "filled_qty": cum_qty, "avg_price": avg_maker}
 
-    # fallback == "market": completeaza pe remainder
+    # fallback == "market": completeaza pe remainder + confirma fill REAL.
+    # NU mai presupunem "market a fillat tot" — pe IOC reject / transient API
+    # fail am raporta trade fantoma cu filled_qty=qty optimist.
     qty_step = info["qty_step"]
+    market_fill = 0.0
     if remaining > max(min_qty, qty_step):
-        await place_market(symbol, side, remaining, reduce_only=reduce_only)
+        market_id = await place_market(symbol, side, remaining, reduce_only=reduce_only)
+        market_fill, _ = await _confirm_market_fill(symbol, market_id, remaining)
 
-    if cum_qty > 0:
+    total_fill = cum_qty + market_fill
+
+    if total_fill <= 0:
+        # Nici maker, nici market n-au fillat nimic. Trade fantoma evitat.
+        return {"result": "failed", "filled_qty": 0.0, "avg_price": 0.0}
+
+    if cum_qty > 0 and market_fill > 0:
         return {"result": "mixed",
-                "filled_qty": qty,
+                "filled_qty": total_fill,
                 "avg_price": avg_maker}  # avg afisat e cel maker; ponderat real
                                           # vine din fetch_pnl_for_trade
+    if cum_qty > 0:
+        # Doar maker (partial); market fallback n-a fillat. Strategia decide.
+        return {"result": "maker",
+                "filled_qty": cum_qty, "avg_price": avg_maker}
     return {"result": "taker",
-            "filled_qty": qty, "avg_price": 0.0}
+            "filled_qty": market_fill, "avg_price": 0.0}
 
 
 # ============================================================================
