@@ -13,4 +13,5 @@ replay_trades.csv
 .claude/
 .vscode/
 *.code-workspace
+!V4_PORTFOLIO.code-workspace
 *.log
