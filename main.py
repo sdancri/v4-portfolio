@@ -40,6 +40,7 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 import time
 import traceback
 from contextlib import asynccontextmanager
@@ -71,6 +72,40 @@ from strategies.ichimoku_signal import IchimokuSignal, PairStrategyConfig
 
 # Type alias pentru orice signal generator (dispatch by strategy)
 SignalGen = IchimokuSignal | BBMeanReversionSignal
+
+
+# ============================================================================
+# Last-resort crash handler — Telegram alert pe exceptii Python necapturate pe
+# main-thread. Complementar lui install_asyncio_exception_handler (care prinde
+# task-urile async). NU prinde SIGKILL/OOM/segfault (pt astea: memory_monitor
+# pre-OOM + docker inspect OOMKilled).
+# ============================================================================
+def _crash_excepthook(exc_type, exc_value, tb):
+    import traceback as _tb
+    err_text = ''.join(_tb.format_exception(exc_type, exc_value, tb))
+    print(f"[CRASH] uncaught {exc_type.__name__}: {exc_value}", file=sys.stderr)
+    print(err_text, file=sys.stderr)
+    # TG sincron via httpx — event loop poate fi deja mort, NU folosim asyncio.
+    try:
+        import httpx as _httpx
+        import html as _html
+        token = os.getenv("TELEGRAM_TOKEN", "")
+        chat = os.getenv("TELEGRAM_CHAT_ID", "")
+        if token and chat:
+            name = _html.escape(os.getenv("BOT_NAME", "V4"))
+            tb_short = _html.escape(err_text[-1500:])
+            text = (f"🤖 <b>[{name}]</b>\n<b>BOT CRASHED 💥</b>\n"
+                    f"<code>{exc_type.__name__}: "
+                    f"{_html.escape(str(exc_value))[:200]}</code>\n<pre>{tb_short}</pre>")
+            _httpx.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                        json={"chat_id": chat, "text": text, "parse_mode": "HTML"},
+                        timeout=5)
+    except Exception:
+        pass
+    sys.__excepthook__(exc_type, exc_value, tb)
+
+
+sys.excepthook = _crash_excepthook
 
 
 def _strategy_label(strategy: str) -> str:
@@ -105,6 +140,7 @@ _signals: dict[str, SignalGen] = {}  # HI sau BB MR — dispatch dupa pair_cfg.s
 _pair_cfgs: dict[str, any] = {}  # PairConfig from config.yaml (has leverage, sl, etc.)
 _candles: dict[str, list] = {}  # ring buffer per symbol pt chart [ts_s, o, h, l, c]
 _last_synced_ts: dict[str, int] = {}  # last confirmed bar ts (seconds) per symbol
+_sync_done: dict[str, bool] = {}  # per-symbol: gap-fill rulat pe sesiunea WS curenta
 _clients: set[WebSocket] = set()
 _halted: dict[str, bool] = {}  # per-symbol HALT flag (after ReconciliationError)
 
@@ -1031,6 +1067,58 @@ async def on_confirmed_bar(symbol: str, bar: dict) -> None:
 
 async def public_ws_loop() -> None:
     """Connect Bybit V5 public, subscribe kline.<interval>.<symbol> for each enabled pair."""
+    await _public_ws_run()
+
+
+async def _fill_ws_gap(symbol: str, first_ws_ts_s: int) -> None:
+    """Backfill bare confirmed ratate intre ultima bara sincronizata si prima
+    bara primita pe (re)conectarea WS curenta. Bybit streameaza kline DOAR de la
+    subscribe inainte — barele inchise in timpul unui disconnect NU sunt
+    retrimise → fara backfill, semnalul de pe bara ratata nu e evaluat
+    (entry/exit ratat → desync fata de Pine). Le aducem prin REST si le rulam
+    in ordine prin on_confirmed_bar (acelasi pipeline ca un tick WS confirmed)."""
+    last_synced = _last_synced_ts.get(symbol)
+    if last_synced is None:
+        return
+    interval_s = nl.interval_ms(_TF_INTERVAL) // 1000
+    next_expected = last_synced + interval_s
+    if first_ws_ts_s <= next_expected:
+        return  # continuitate normala, niciun gap
+    print(f"  [SYNC {symbol}] GAP: have {last_synced}, first WS bar "
+          f"{first_ws_ts_s} (expected {next_expected}) — fetch REST")
+    try:
+        raw = await ex.get_kline(symbol, _TF_INTERVAL,
+                                 start=(last_synced + 1) * 1000,
+                                 end=first_ws_ts_s * 1000, limit=1000)
+    except Exception as e:
+        print(f"  [SYNC {symbol}] gap fetch failed: {e!r}")
+        return
+    n = 0
+    for row in raw:  # get_kline returneaza ASC
+        ts_s = int(row[0]) // 1000
+        if ts_s <= last_synced or ts_s >= first_ws_ts_s:
+            continue  # capete excluse (last_synced procesat; first_ws vine via WS)
+        bar = {"ts_ms": int(row[0]), "open": float(row[1]), "high": float(row[2]),
+               "low": float(row[3]), "close": float(row[4]),
+               "volume": float(row[5]), "confirmed": True}
+        ring = _candles.setdefault(symbol, [])
+        if not (ring and ring[-1][0] == ts_s):
+            ring.append([ts_s, bar["open"], bar["high"], bar["low"], bar["close"]])
+            if len(ring) > 5000:
+                ring.pop(0)
+        _last_synced_ts[symbol] = ts_s
+        _state.mark_first_candle(symbol, ts_s)
+        try:
+            await on_confirmed_bar(symbol, bar)
+        except Exception:
+            print(f"  [{symbol}] gap-fill on_confirmed_bar CRASHED:\n"
+                  f"{traceback.format_exc()}")
+        n += 1
+    print(f"  [SYNC {symbol}] gap filled: {n} bare "
+          f"(last_synced → {_last_synced_ts.get(symbol)})")
+
+
+async def _public_ws_run() -> None:
     enabled = [p.symbol for p in CONFIG.pairs if p.enabled]
     topics = [f"kline.{_TF_INTERVAL}.{s}" for s in enabled]
     url = ("wss://stream-testnet.bybit.com/v5/public/linear"
@@ -1050,6 +1138,11 @@ async def public_ws_loop() -> None:
                                           open_timeout=15) as ws:
                 await ws.send(json.dumps({"op": "subscribe", "args": topics}))
                 print(f"  [WS-PUB] subscribed: {topics}")
+                # Reset gap-check pe fiecare (re)conectare — daca WS a fost jos
+                # peste close-uri de bara, _fill_ws_gap le aduce prin REST la
+                # primul tick per simbol.
+                for s in enabled:
+                    _sync_done[s] = False
 
                 last_msg_ts = time.time()
 
@@ -1106,6 +1199,12 @@ async def public_ws_loop() -> None:
                             # dar fara dedup si fara on_confirmed_bar (NU evaluam
                             # strategia pe tick — doar pe bara inchisa).
                             ts_s = ts_ms // 1000
+                            # Gap-fill la primul tick al sesiunii WS curente
+                            # (per simbol): aduce barele inchise ratate in timpul
+                            # unui disconnect (Bybit nu le retrimite).
+                            if not _sync_done.get(symbol):
+                                _sync_done[symbol] = True
+                                await _fill_ws_gap(symbol, ts_s)
                             ring = _candles.setdefault(symbol, [])
                             if ring and ring[-1][0] == ts_s:
                                 ring[-1] = [ts_s, bar["open"], bar["high"],
