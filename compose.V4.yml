@@ -42,11 +42,21 @@ services:
       # boot, baseline > 320 → mareste pragul + mem_limit + memswap_limit.
       - MEM_MON_INTERVAL_SEC=${MEM_MON_INTERVAL_SEC:-300}
       - MEM_MON_RSS_ALERT_MB=${MEM_MON_RSS_ALERT_MB:-320}
+      # Dashboard control (vezi core/bot_control.py + endpoints /api/pause|resume|stop):
+      # BOT_CONTROL_URL = http://<container_name>:<chart_port>. Dashboard scrie
+      # in state.db ca sa stie unde POST. Container_name aici = V4, port intern = 8104.
+      - BOT_CONTROL_URL=${BOT_CONTROL_URL:-http://V4:8104}
     ports:
       - "8107:8104"
     volumes:
-      - ./logs/V4:/app/logs
-      - ./data/V4:/app/data
+      - /srv/bots/V4/logs:/app/logs
+      - /srv/bots/V4/data:/app/data
+      # Dashboard agregat (read-only): pentru self-discovery / status report la
+      # dashboard prin /srv/bots/dashboard/state.db. Activeaza doar daca rulezi
+      # dashboard pe acelasi VPS. VPS prep: mkdir -p /srv/bots/dashboard
+      - /srv/bots/dashboard:/dashboard
+    networks:
+      - bots
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8104/api/status || exit 1"]
       interval: 30s
@@ -95,3 +105,11 @@ services:
       options:
         max-size: "10m"          # 10MB per fisier log
         max-file: "3"            # max 30MB total (rotation 3×)
+
+# Network shared cu dashboard + alti boti din ecosystem (DNS Docker:
+# container_name = hostname intern). Creat manual ONE-TIME pe VPS:
+#   docker network create bots
+# Fara asta, dashboard primeste "host not found" cand incearca sa POST.
+networks:
+  bots:
+    external: true

@@ -54,6 +54,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from core import bot_control as bc
 from core import exchange_api as ex
 from core import private_ws as pws
 from core import telegram_bot as tg
@@ -296,7 +297,14 @@ async def open_position(symbol: str, direction: str, close_price: float,
     Direction: 'LONG' / 'SHORT'. Bybit side: 'Buy' / 'Sell'.
     bar_ts_ms: open-ul barei la care s-a executat (chart-ul afiseaza linii
     aliniate la bara, nu la wall-clock).
+
+    Respecta is_paused() (set via /api/pause endpoint din dashboard) — daca
+    e True, NU deschide noi pozitii. Pozitiile EXISTENTE raman protejate de
+    SL/TP atomic (NU le inchidem la pauza — `stop` face asta explicit).
     """
+    if bc.is_paused():
+        print(f"  [OPEN {symbol}] BOT PAUZAT — skip entry signal {direction}")
+        return
     pair_cfg = _pair_cfgs[symbol]
     side = _direction_to_side(direction)
 
@@ -1685,6 +1693,74 @@ async def ws_endpoint(ws: WebSocket):
         pass
     finally:
         _clients.discard(ws)
+
+
+# ============================================================================
+# Control endpoints — dashboard ecosystem (vezi core/bot_control.py)
+# ============================================================================
+
+@app.post("/api/pause")
+async def api_pause(token: str = ""):
+    ok, err = bc.check_token(token)
+    if not ok:
+        return JSONResponse({"error": err}, status_code=403)
+    bc.set_paused(True)
+    try:
+        await tg.send_warning(
+            "Bot pauzat via dashboard",
+            "Pozitiile EXISTENTE raman protejate de SL/TP atomic Bybit-side. "
+            "Nu se mai deschid pozitii noi pana la /api/resume.",
+        )
+    except Exception:
+        pass
+    return {"status": "paused"}
+
+
+@app.post("/api/resume")
+async def api_resume(token: str = ""):
+    ok, err = bc.check_token(token)
+    if not ok:
+        return JSONResponse({"error": err}, status_code=403)
+    bc.set_paused(False)
+    try:
+        await tg.send_info(
+            "Bot reluat via dashboard",
+            "Strategiile pot deschide pozitii noi pe semnal.",
+        )
+    except Exception:
+        pass
+    return {"status": "running"}
+
+
+@app.post("/api/stop")
+async def api_stop(token: str = ""):
+    """Stop = pauza + market-close TOATE pozitiile active."""
+    ok, err = bc.check_token(token)
+    if not ok:
+        return JSONResponse({"error": err}, status_code=403)
+    bc.set_paused(True)
+    closed: list = []
+    failed: list = []
+    for sym in list(_state.positions.keys()):
+        pos = _state.get_position(sym)
+        if pos is None:
+            continue
+        try:
+            await close_position(sym, "DASHBOARD_STOP", pos.entry_price)
+            closed.append(sym)
+        except Exception as e:
+            print(f"  [STOP {sym}] close failed: {e!r}")
+            failed.append(sym)
+    try:
+        await tg.send_critical(
+            "Bot OPRIT via dashboard",
+            f"<b>Inchise:</b> {', '.join(closed) if closed else '—'}\n"
+            f"<b>Esuate:</b> {', '.join(failed) if failed else '—'}\n"
+            f"<b>Stare:</b> PAUZAT (use /api/resume pt restart trading).",
+        )
+    except Exception:
+        pass
+    return {"status": "stopped", "closed": closed, "failed": failed}
 
 
 if __name__ == "__main__":

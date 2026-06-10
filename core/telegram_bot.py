@@ -109,6 +109,26 @@ async def send_critical(title: str, body: str = "",
     await send_raw(text)
 
 
+async def send_warning(title: str, body: str = "",
+                       symbol: Optional[str] = None) -> None:
+    """Mesaj WARNING — prefix '⚠️ WARN'. Folosit pt pauze, alerte non-critice."""
+    safe_title = html.escape(title)
+    text = f"{_header(symbol)}\n⚠️ <b>WARN — {safe_title}</b>"
+    if body:
+        text += f"\n{body}"
+    await send_raw(text)
+
+
+async def send_info(title: str, body: str = "",
+                    symbol: Optional[str] = None) -> None:
+    """Mesaj INFO — prefix 'ℹ️'. Folosit pt notificari neutre (resume etc.)."""
+    safe_title = html.escape(title)
+    text = f"{_header(symbol)}\nℹ️ <b>{safe_title}</b>"
+    if body:
+        text += f"\n{body}"
+    await send_raw(text)
+
+
 async def send_raw(text: str) -> None:
     token = os.getenv("TELEGRAM_TOKEN", "")
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
