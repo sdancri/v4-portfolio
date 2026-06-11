@@ -50,6 +50,10 @@ services:
       # Path-ul corespunde mount-ului /srv/bots/dashboard:/dashboard de mai jos.
       # Disable explicit: BOT_REPORTER_DB="" (env override → reporter dezactivat).
       - BOT_REPORTER_DB=${BOT_REPORTER_DB:-/dashboard/state.db}
+      # Heartbeat periodic (independent de bara confirmed) la dashboard.
+      # Pe TF 4h, heartbeat_loop pe bara = 1×/4h → dashboard threshold (~5min)
+      # depasit intre bare → bot apare 'dead'. Default 30s. Disable: 0.
+      - BOT_REPORTER_HEARTBEAT_SEC=${BOT_REPORTER_HEARTBEAT_SEC:-30}
       # Taker fee rate pt fallback PnL (cand Bybit closed-pnl nu se indexeaza).
       # Default 0.055% (Bybit linear taker). Vezi _estimate_pnl_fallback in main.py.
       - TAKER_FEE_RATE=${TAKER_FEE_RATE:-0.00055}

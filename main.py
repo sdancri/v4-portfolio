@@ -155,6 +155,9 @@ _sync_done: dict[str, bool] = {}  # per-symbol: gap-fill rulat pe sesiunea WS cu
 _clients: set[WebSocket] = set()
 _halted: dict[str, bool] = {}  # per-symbol HALT flag (after ReconciliationError)
 _reporters: dict[str, "BotReporter"] = {}  # per-symbol reporter (dashboard SQLite)
+_last_prices: dict[str, float] = {}  # per-symbol last close (orice tick WS).
+# Folosit de _periodic_heartbeat pt uPnL fresh (heartbeat_loop pe bara confirmed
+# e prea rar pe TF 4h → dashboard considera bot 'dead' intre bare).
 
 # Map order_id (string) -> entry context, used to fetch_pnl after close
 # Filled at open, consumed at close.
@@ -1277,6 +1280,10 @@ async def _public_ws_run() -> None:
                                 "volume": float(k.get("volume", 0)),
                                 "confirmed": confirmed,
                             }
+                            # Track last_price per simbol pe ORICE tick (confirmed
+                            # sau intra-bar) → _periodic_heartbeat foloseste pt
+                            # uPnL fresh la dashboard (max 1-2s stale vs 4h).
+                            _last_prices[symbol] = bar["close"]
                             # Track all bars in candles ring (for chart).
                             # Confirmed bars: dedup pe ts (un singur ts unic
                             # per bara confirmed). Unconfirmed bars (intra-bar
@@ -1394,6 +1401,47 @@ async def on_execution_event(event: dict) -> None:
 # Heartbeat — equity sync la (next_bar_close - 60s)
 # ============================================================================
 
+def _send_reporter_heartbeat() -> None:
+    """Heartbeat per simbol la dashboard. Best-effort: exceptii nu blocheaza.
+    Apelat din heartbeat_loop (pe bara) + _periodic_heartbeat (30s)."""
+    if not _reporters:
+        return
+    paused = bc.is_paused()
+    equity = _state.shared_equity
+    for sym, reporter in _reporters.items():
+        try:
+            if _halted.get(sym):
+                status = "error"
+            elif paused:
+                status = "paused"
+            else:
+                status = "running"
+            pos = _state.get_position(sym)
+            open_side = None
+            open_entry = None
+            open_pnl = None
+            if pos is not None:
+                open_side = pos.direction.lower()
+                open_entry = pos.entry_price
+                # uPnL fresh: _last_prices[sym] update pe orice WS tick
+                # (max 1-2s stale). Fallback la signal buffer (max 4h stale).
+                last_price = _last_prices.get(sym)
+                if last_price is None:
+                    sig = _signals.get(sym)
+                    if sig is not None and len(sig.df):
+                        last_price = float(sig.df.iloc[-1]["close"])
+                if last_price is not None and pos.entry_price and pos.qty:
+                    sign_d = 1 if pos.direction == "LONG" else -1
+                    open_pnl = (last_price - pos.entry_price) * pos.qty * sign_d
+            reporter.heartbeat(
+                status=status, equity=equity,
+                open_side=open_side, open_entry=open_entry,
+                open_pnl=open_pnl,
+            )
+        except Exception as e:
+            print(f"  [REPORTER {sym}] heartbeat failed: {e}")
+
+
 async def heartbeat_loop() -> None:
     while True:
         now_ms = int(time.time() * 1000)
@@ -1404,40 +1452,30 @@ async def heartbeat_loop() -> None:
             await sync_equity(reason="HEARTBEAT")
         except Exception as e:
             print(f"  [HEARTBEAT] sync failed: {e}")
-        # Dashboard heartbeat: per simbol, status derivat din is_paused() +
-        # _halted. open_side/entry/uPnL daca pozitia activa. Best-effort:
-        # exceptii pe DB nu opresc bot-ul.
-        if _reporters:
-            paused = bc.is_paused()
-            equity = _state.shared_equity
-            for sym, reporter in _reporters.items():
-                try:
-                    if _halted.get(sym):
-                        status = "error"
-                    elif paused:
-                        status = "paused"
-                    else:
-                        status = "running"
-                    pos = _state.get_position(sym)
-                    open_side = None
-                    open_entry = None
-                    open_pnl = None
-                    if pos is not None:
-                        open_side = pos.direction.lower()
-                        open_entry = pos.entry_price
-                        # uPnL est: last close din signal buffer × qty × direction
-                        sig = _signals.get(sym)
-                        if sig is not None and len(sig.df):
-                            last = float(sig.df.iloc[-1]["close"])
-                            sign_d = 1 if pos.direction == "LONG" else -1
-                            open_pnl = (last - pos.entry_price) * pos.qty * sign_d
-                    reporter.heartbeat(
-                        status=status, equity=equity,
-                        open_side=open_side, open_entry=open_entry,
-                        open_pnl=open_pnl,
-                    )
-                except Exception as e:
-                    print(f"  [REPORTER {sym}] heartbeat failed: {e}")
+        _send_reporter_heartbeat()
+
+
+async def periodic_reporter_heartbeat() -> None:
+    """Heartbeat periodic la BOT_REPORTER_HEARTBEAT_SEC (default 30s) independent
+    de bare confirmed.
+
+    Motivatie: dashboard considera bot 'alive' daca last_heartbeat < threshold
+    (tipic 5-10min). Pe TF mari (4h V4) heartbeat-ul pe-bara e prea rar →
+    bot apare 'dead' intre bare. Acest task scrie heartbeat suplimentar cu
+    interval scurt ca bot-ul sa apara mereu live in UI.
+
+    Disable: BOT_REPORTER_HEARTBEAT_SEC=0. Fail-safe: exceptii logged, NU rup
+    trading (helper-ul intern deja captureaza per-symbol).
+    """
+    interval = int(os.getenv("BOT_REPORTER_HEARTBEAT_SEC", "30"))
+    if interval <= 0:
+        print("  [REPORTER] periodic heartbeat DISABLED "
+              "(BOT_REPORTER_HEARTBEAT_SEC=0)")
+        return
+    print(f"  [REPORTER] periodic heartbeat: every {interval}s")
+    while True:
+        await asyncio.sleep(interval)
+        _send_reporter_heartbeat()
 
 
 # ============================================================================
@@ -1729,6 +1767,10 @@ async def lifespan(app: FastAPI):
                                      on_position=on_position_event)),
         asyncio.create_task(heartbeat_loop()),
         asyncio.create_task(memory_monitor(BOT_NAME, tg_alert=tg.send_critical)),
+        # Periodic heartbeat pt dashboard — 30s default, independent de bare.
+        # Pe TF 4h, heartbeat_loop pe bara = 1×/4h → dashboard threshold (5-10min)
+        # depasit intre bare → bot apare 'dead'. Acest task tine bot 'alive' in UI.
+        asyncio.create_task(periodic_reporter_heartbeat()),
     ]
     try:
         yield

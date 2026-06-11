@@ -35,7 +35,8 @@ CREATE TABLE IF NOT EXISTS bot_state (
     open_pnl        REAL,
     cur_win_streak  INTEGER DEFAULT 0,
     cur_loss_streak INTEGER DEFAULT 0,
-    last_heartbeat  REAL NOT NULL
+    last_heartbeat  REAL NOT NULL,
+    control_url     TEXT
 );
 CREATE TABLE IF NOT EXISTS trades (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -45,7 +46,8 @@ CREATE TABLE IF NOT EXISTS trades (
     closed_ts   REAL NOT NULL,
     pnl         REAL NOT NULL,
     pnl_pct     REAL,
-    exit_reason TEXT
+    exit_reason TEXT,
+    side        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trades_bot  ON trades(bot_id);
 CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(closed_ts);
@@ -67,18 +69,31 @@ class BotReporter:
         symbol: str,
         timeframe: str = "",
         db_path: str | Path = "state.db",
+        control_url: str | None = None,
     ):
         self.bot_id = bot_id
         self.bot_name = bot_name
         self.symbol = symbol
         self.timeframe = timeframe
         self.db_path = db_path
+        # URL la care dashboard-ul ajunge la botul ăsta pentru control
+        # (pause/resume/stop). Setează-l per bot din env, ex.
+        # control_url=os.getenv("BOT_CONTROL_URL"). NULL = necontrolabil.
+        self.control_url = control_url
         self._cur_win = 0
         self._cur_loss = 0
         # creează tabelele dacă nu există (idempotent)
         conn = _get_conn(db_path)
         try:
             conn.executescript(_SCHEMA)
+            # Migrare idempotentă: adaugă control_url pe DB-uri vechi
+            # (CREATE TABLE IF NOT EXISTS nu adaugă coloane noi).
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(bot_state)")}
+            if cols and "control_url" not in cols:
+                conn.execute("ALTER TABLE bot_state ADD COLUMN control_url TEXT")
+            tcols = {r[1] for r in conn.execute("PRAGMA table_info(trades)")}
+            if tcols and "side" not in tcols:
+                conn.execute("ALTER TABLE trades ADD COLUMN side TEXT")
             conn.commit()
         finally:
             conn.close()
@@ -99,8 +114,8 @@ class BotReporter:
                 INSERT INTO bot_state
                   (bot_id, bot_name, symbol, timeframe, status, equity,
                    open_side, open_entry, open_pnl,
-                   cur_win_streak, cur_loss_streak, last_heartbeat)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                   cur_win_streak, cur_loss_streak, last_heartbeat, control_url)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(bot_id) DO UPDATE SET
                   bot_name=excluded.bot_name,
                   symbol=excluded.symbol,
@@ -112,12 +127,13 @@ class BotReporter:
                   open_pnl=excluded.open_pnl,
                   cur_win_streak=excluded.cur_win_streak,
                   cur_loss_streak=excluded.cur_loss_streak,
-                  last_heartbeat=excluded.last_heartbeat
+                  last_heartbeat=excluded.last_heartbeat,
+                  control_url=excluded.control_url
                 """,
                 (
                     self.bot_id, self.bot_name, self.symbol, self.timeframe,
                     status, equity, open_side, open_entry, open_pnl,
-                    self._cur_win, self._cur_loss, time.time(),
+                    self._cur_win, self._cur_loss, time.time(), self.control_url,
                 ),
             )
             conn.commit()
@@ -130,6 +146,7 @@ class BotReporter:
         pnl_pct: float | None = None,
         exit_reason: str = "",
         closed_ts: float | None = None,
+        side: str | None = None,
     ) -> None:
         """
         Înregistrează un trade închis. Win = pnl > 0 (NU pe exit_reason!).
@@ -148,12 +165,13 @@ class BotReporter:
             conn.execute(
                 """
                 INSERT INTO trades
-                  (bot_id, bot_name, symbol, closed_ts, pnl, pnl_pct, exit_reason)
-                VALUES (?,?,?,?,?,?,?)
+                  (bot_id, bot_name, symbol, closed_ts, pnl, pnl_pct, exit_reason, side)
+                VALUES (?,?,?,?,?,?,?,?)
                 """,
                 (
                     self.bot_id, self.bot_name, self.symbol,
                     closed_ts or time.time(), pnl, pnl_pct, exit_reason,
+                    (side or "").lower() or None,
                 ),
             )
             conn.commit()
@@ -163,9 +181,13 @@ class BotReporter:
 
 # Exemplu de integrare într-un bot:
 #
+#   import os
 #   from bot_reporter import BotReporter
 #   reporter = BotReporter("VSE_1_KAIA", "VSE_1", "KAIAUSDT", "1H",
-#                          db_path="/srv/bots/dashboard/state.db")
+#                          db_path="/srv/bots/dashboard/state.db",
+#                          # URL la care dashboard-ul (pe aceeași rețea Docker)
+#                          # ajunge la botul ăsta. Setează per bot în stack.
+#                          control_url=os.getenv("BOT_CONTROL_URL"))
 #
 #   # în bucla principală, la fiecare candle confirmat:
 #   reporter.heartbeat("running", equity=equity,
