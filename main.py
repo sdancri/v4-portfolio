@@ -1926,7 +1926,7 @@ async def api_pause(token: str = ""):
         )
     except Exception:
         pass
-    return {"status": "paused"}
+    return {"status": "paused", "trading_paused": True}
 
 
 @app.post("/api/resume")
@@ -1942,7 +1942,7 @@ async def api_resume(token: str = ""):
         )
     except Exception:
         pass
-    return {"status": "running"}
+    return {"status": "running", "trading_paused": False}
 
 
 @app.post("/api/stop")
