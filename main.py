@@ -846,8 +846,11 @@ async def _close_position_locked(symbol: str, exit_reason: str,
     reporter = _reporters.get(symbol)
     if reporter is not None:
         try:
-            pnl_pct = ((trade.pnl / trade.entry_price / trade.qty * 100)
-                       if trade.entry_price and trade.qty else None)
+            # pnl_pct = % din initial_account (consistent cu BP — referential
+            # equity, NU notional). Dashboard agreghaza pnl_pct across boti
+            # asumand acelasi numitor.
+            init_acc = _state.initial_account
+            pnl_pct = ((trade.pnl / init_acc * 100) if init_acc else None)
             reporter.record_trade(pnl=trade.pnl, pnl_pct=pnl_pct,
                                    exit_reason=trade.exit_reason)
         except Exception as e:
@@ -863,6 +866,10 @@ async def _close_position_locked(symbol: str, exit_reason: str,
 
     ret_pct = ((_state.shared_equity - _state.initial_account)
                / _state.initial_account * 100) if _state.initial_account else 0
+    # PnL label: cand fallback estimat (closed-pnl neindexat), aratam clar
+    # ca nu e PnL Bybit real → user sti ca cifra e aproximativa.
+    pnl_label = ("estimat — closed-pnl neindexat" if pnl_estimated
+                 else "Bybit real, fees incluse")
     # Best-effort tg.send + broadcast — daca pica, trade-ul ramane corect
     # inregistrat in _state (pipeline-ul nu cade pe notification failure).
     try:
@@ -873,7 +880,7 @@ async def _close_position_locked(symbol: str, exit_reason: str,
             f"<b>Exit:</b>  <code>{ex.smart_price(avg_exit)}</code>  "
             f"(<code>{final_exit_reason}</code>)  (<code>{tg.fmt_time(now_ms)}</code>)\n"
             f"{tg.pnl_emoji(pnl_real)} <b>PnL:</b> <code>${pnl_real:+,.2f}</code>  "
-            f"(Bybit real, fees incluse)\n"
+            f"({pnl_label})\n"
             f"📊 <b>Account:</b> <code>${_state.shared_equity:,.2f}</code>  |  "
             f"<b>Return:</b> <code>{ret_pct:+.2f}%</code>",
             symbol=symbol,
@@ -1018,8 +1025,11 @@ async def _close_pipeline_external_locked(symbol: str, exit_reason: str,
     reporter = _reporters.get(symbol)
     if reporter is not None:
         try:
-            pnl_pct = ((trade.pnl / trade.entry_price / trade.qty * 100)
-                       if trade.entry_price and trade.qty else None)
+            # pnl_pct = % din initial_account (consistent cu BP — referential
+            # equity, NU notional). Dashboard agreghaza pnl_pct across boti
+            # asumand acelasi numitor.
+            init_acc = _state.initial_account
+            pnl_pct = ((trade.pnl / init_acc * 100) if init_acc else None)
             reporter.record_trade(pnl=trade.pnl, pnl_pct=pnl_pct,
                                    exit_reason=trade.exit_reason)
         except Exception as e:
@@ -1038,7 +1048,8 @@ async def _close_pipeline_external_locked(symbol: str, exit_reason: str,
             f"(<code>{tg.fmt_time(pos.opened_ts_ms)}</code>)\n"
             f"<b>Exit:</b>  <code>{ex.smart_price(avg_exit)}</code>  "
             f"(<code>{exit_reason}</code>)  (<code>{tg.fmt_time(now_ms)}</code>)\n"
-            f"{tg.pnl_emoji(pnl_real)} <b>PnL:</b> <code>${pnl_real:+,.2f}</code>\n"
+            f"{tg.pnl_emoji(pnl_real)} <b>PnL:</b> <code>${pnl_real:+,.2f}</code>  "
+            f"({'estimat — closed-pnl neindexat' if pnl_estimated else 'Bybit real, fees incluse'})\n"
             f"📊 <b>Account:</b> <code>${_state.shared_equity:,.2f}</code>  |  "
             f"<b>Return:</b> <code>{ret_pct:+.2f}%</code>",
             symbol=symbol,
@@ -1858,6 +1869,7 @@ async def api_status():
         "pairs": [p.symbol for p in CONFIG.pairs if p.enabled],
         "candles_total": {s: len(c) for s, c in _candles.items()},
         "connected_clients": len(_clients),
+        "trading_paused": bc.is_paused(),
         "summary": _state.summary(),
         "halted": list(_halted.keys()) if _halted else [],
     }
