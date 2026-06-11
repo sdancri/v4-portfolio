@@ -1670,6 +1670,10 @@ async def bootstrap() -> None:
     # → reporter dezactivat pe acel simbol, restul continua. Disable explicit
     # via BOT_REPORTER_DB="" in env.
     db_path = os.getenv("BOT_REPORTER_DB", "/dashboard/state.db")
+    # control_url scris in state.db ca dashboard sa descopere automat unde
+    # POST /api/pause|resume|stop. Format: schema://container:port (fara /api/).
+    # NULL → dashboard NU afiseaza butoane control pt botul asta.
+    control_url = os.getenv("BOT_CONTROL_URL", "") or None
     if db_path and _BOT_REPORTER_AVAILABLE:
         for pair_cfg in CONFIG.pairs:
             if not pair_cfg.enabled or _halted.get(pair_cfg.symbol):
@@ -1682,8 +1686,10 @@ async def bootstrap() -> None:
                     symbol=sym,
                     timeframe=pair_cfg.timeframe,
                     db_path=db_path,
+                    control_url=control_url,
                 )
-                print(f"  [{sym}] reporter init OK (db={db_path})")
+                print(f"  [{sym}] reporter init OK (db={db_path} "
+                      f"control_url={control_url})")
             except Exception as e:
                 print(f"  [{sym}] reporter init FAILED ({type(e).__name__}: {e})"
                       f" — disabled pe simbol")
