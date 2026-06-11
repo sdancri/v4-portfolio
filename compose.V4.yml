@@ -46,6 +46,13 @@ services:
       # BOT_CONTROL_URL = http://<container_name>:<chart_port>. Dashboard scrie
       # in state.db ca sa stie unde POST. Container_name aici = V4, port intern = 8104.
       - BOT_CONTROL_URL=${BOT_CONTROL_URL:-http://V4:8104}
+      # Bot reporter SQLite: dashboard agregat (multi-bot) citeste din asta.
+      # Path-ul corespunde mount-ului /srv/bots/dashboard:/dashboard de mai jos.
+      # Disable explicit: BOT_REPORTER_DB="" (env override → reporter dezactivat).
+      - BOT_REPORTER_DB=${BOT_REPORTER_DB:-/dashboard/state.db}
+      # Taker fee rate pt fallback PnL (cand Bybit closed-pnl nu se indexeaza).
+      # Default 0.055% (Bybit linear taker). Vezi _estimate_pnl_fallback in main.py.
+      - TAKER_FEE_RATE=${TAKER_FEE_RATE:-0.00055}
     ports:
       - "8107:8104"
     volumes:

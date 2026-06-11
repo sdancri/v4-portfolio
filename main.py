@@ -56,6 +56,16 @@ from fastapi.staticfiles import StaticFiles
 
 from core import bot_control as bc
 from core import exchange_api as ex
+
+# Optional: bot_reporter pt integrare cu dashboard agregat (SQLite shared).
+# Fail-safe: import esuat / DB inaccesibil → reporter dezactivat, bot continua.
+try:
+    from bot_reporter import BotReporter  # type: ignore
+    _BOT_REPORTER_AVAILABLE = True
+except Exception as _bre:
+    BotReporter = None  # type: ignore
+    _BOT_REPORTER_AVAILABLE = False
+    print(f"  [REPORTER] bot_reporter import failed ({_bre!r}) — disabled")
 from core import private_ws as pws
 from core import telegram_bot as tg
 from core import no_lookahead as nl
@@ -144,6 +154,7 @@ _last_synced_ts: dict[str, int] = {}  # last confirmed bar ts (seconds) per symb
 _sync_done: dict[str, bool] = {}  # per-symbol: gap-fill rulat pe sesiunea WS curenta
 _clients: set[WebSocket] = set()
 _halted: dict[str, bool] = {}  # per-symbol HALT flag (after ReconciliationError)
+_reporters: dict[str, "BotReporter"] = {}  # per-symbol reporter (dashboard SQLite)
 
 # Map order_id (string) -> entry context, used to fetch_pnl after close
 # Filled at open, consumed at close.
@@ -222,6 +233,25 @@ def _close_side(direction: str) -> str:
 def _next_bar_close_ms(now_ms: int) -> int:
     """Next 4h bar close ts (ms)."""
     return ((now_ms // _TF_MS) + 1) * _TF_MS
+
+
+def _estimate_pnl_fallback(direction: str, entry_price: float, qty: float,
+                            exit_price: float) -> tuple[float, float]:
+    """FALLBACK PnL cand Bybit closed-pnl nu e indexat (n_fills=0).
+
+    Estimare locala: gross dupa directie - fees taker pe ambele picioare.
+    NU prinde slippage-ul real al exit-ului (folosim exit_price = target sau
+    avg_exit daca exista), dar e ordinul de marime corect vs $0 fals.
+    Fara asta, TradeRecord ar fi inregistrat PERMANENT cu PnL=0 (equity nu se
+    misca, Telegram/chart/dashboard arata $0 pt un trade real).
+
+    Returneaza (pnl_est, fees_est). Apelat doar daca n_fills == 0.
+    """
+    sign_dir = 1 if direction == "LONG" else -1
+    gross = (exit_price - entry_price) * qty * sign_dir
+    taker_rate = float(os.getenv("TAKER_FEE_RATE", "0.00055"))
+    fees_est = (entry_price + exit_price) * qty * taker_rate
+    return round(gross - fees_est, 4), round(fees_est, 4)
 
 
 def _build_trade_extra(pos: LivePosition) -> dict:
@@ -782,6 +812,20 @@ async def _close_position_locked(symbol: str, exit_reason: str,
     pnl_real = pnl_data.get("pnl", 0.0)
     fees_real = pnl_data.get("fees", 0.0)
 
+    # FALLBACK PnL: cand closed-pnl nu e indexat dupa ~19s retry (sau API down),
+    # n_fills=0 → pnl_data["pnl"]=0. Fara fallback trade-ul ar avea PnL=0
+    # PERMANENT in TradeRecord. Estimam local din directie + qty + entry/exit.
+    pnl_estimated = pnl_data.get("n_fills", 0) == 0
+    if pnl_estimated:
+        pnl_real, fees_real = _estimate_pnl_fallback(
+            pos.direction, pos.entry_price, pos.qty, avg_exit)
+        print(f"  [PNL {symbol}] closed-pnl neindexat → estimare locala: "
+              f"pnl_est={pnl_real:+.4f} fees_est={fees_real:.4f}")
+
+    extra = _build_trade_extra(pos)
+    if pnl_estimated:
+        extra["pnl_estimated"] = True
+
     trade = TradeRecord(
         id=0,  # set in record_closed_trade
         symbol=symbol, direction=pos.direction,
@@ -790,11 +834,21 @@ async def _close_position_locked(symbol: str, exit_reason: str,
         exit_ts_ms=now_ms, exit_price=avg_exit,
         exit_price_target=target_price, exit_reason=final_exit_reason,
         pnl=pnl_real, fees=fees_real,
-        extra=_build_trade_extra(pos),
+        extra=extra,
     )
     _state.record_closed_trade(trade)
     _state.save()
     log_event("trade_closed", **trade.to_dict())
+    # Dashboard: record trade closed (best-effort, exceptia nu blocheaza).
+    reporter = _reporters.get(symbol)
+    if reporter is not None:
+        try:
+            pnl_pct = ((trade.pnl / trade.entry_price / trade.qty * 100)
+                       if trade.entry_price and trade.qty else None)
+            reporter.record_trade(pnl=trade.pnl, pnl_pct=pnl_pct,
+                                   exit_reason=trade.exit_reason)
+        except Exception as e:
+            print(f"  [REPORTER {symbol}] record_trade failed: {e}")
 
     # Telegram — icon titlu: ⚠️ pe EXTERNAL/reconcile (defense-in-depth, verifica).
     # Altfel 💰 win / 🩸 loss (pnl_emoji) pt scan rapid in stream-ul Telegram.
@@ -933,6 +987,18 @@ async def _close_pipeline_external_locked(symbol: str, exit_reason: str,
     pnl_real = pnl_data.get("pnl", 0.0)
     fees_real = pnl_data.get("fees", 0.0)
 
+    # FALLBACK PnL — vezi nota in _close_position_locked.
+    pnl_estimated = pnl_data.get("n_fills", 0) == 0
+    if pnl_estimated:
+        pnl_real, fees_real = _estimate_pnl_fallback(
+            pos.direction, pos.entry_price, pos.qty, avg_exit)
+        print(f"  [PNL-EXT {symbol}] closed-pnl neindexat → estimare locala: "
+              f"pnl_est={pnl_real:+.4f} fees_est={fees_real:.4f}")
+
+    extra = _build_trade_extra(pos)
+    if pnl_estimated:
+        extra["pnl_estimated"] = True
+
     trade = TradeRecord(
         id=0, symbol=symbol, direction=pos.direction,
         entry_ts_ms=pos.opened_ts_ms, entry_price=pos.entry_price,
@@ -940,10 +1006,21 @@ async def _close_pipeline_external_locked(symbol: str, exit_reason: str,
         exit_ts_ms=now_ms, exit_price=avg_exit,
         exit_price_target=target_price, exit_reason=exit_reason,
         pnl=pnl_real, fees=fees_real,
+        extra=extra,
     )
     _state.record_closed_trade(trade)
     _state.save()
     log_event("trade_closed", **trade.to_dict())
+    # Dashboard: record trade closed (best-effort, exceptia nu blocheaza).
+    reporter = _reporters.get(symbol)
+    if reporter is not None:
+        try:
+            pnl_pct = ((trade.pnl / trade.entry_price / trade.qty * 100)
+                       if trade.entry_price and trade.qty else None)
+            reporter.record_trade(pnl=trade.pnl, pnl_pct=pnl_pct,
+                                   exit_reason=trade.exit_reason)
+        except Exception as e:
+            print(f"  [REPORTER {symbol}] record_trade failed: {e}")
 
     # Icon ⚠️ pe EXTERNAL: defense-in-depth a sintetizat close-ul (Bybit a
     # inchis fara stiinta strategiei — verifica de ce). Altfel pnl_emoji.
@@ -1327,6 +1404,40 @@ async def heartbeat_loop() -> None:
             await sync_equity(reason="HEARTBEAT")
         except Exception as e:
             print(f"  [HEARTBEAT] sync failed: {e}")
+        # Dashboard heartbeat: per simbol, status derivat din is_paused() +
+        # _halted. open_side/entry/uPnL daca pozitia activa. Best-effort:
+        # exceptii pe DB nu opresc bot-ul.
+        if _reporters:
+            paused = bc.is_paused()
+            equity = _state.shared_equity
+            for sym, reporter in _reporters.items():
+                try:
+                    if _halted.get(sym):
+                        status = "error"
+                    elif paused:
+                        status = "paused"
+                    else:
+                        status = "running"
+                    pos = _state.get_position(sym)
+                    open_side = None
+                    open_entry = None
+                    open_pnl = None
+                    if pos is not None:
+                        open_side = pos.direction.lower()
+                        open_entry = pos.entry_price
+                        # uPnL est: last close din signal buffer × qty × direction
+                        sig = _signals.get(sym)
+                        if sig is not None and len(sig.df):
+                            last = float(sig.df.iloc[-1]["close"])
+                            sign_d = 1 if pos.direction == "LONG" else -1
+                            open_pnl = (last - pos.entry_price) * pos.qty * sign_d
+                    reporter.heartbeat(
+                        status=status, equity=equity,
+                        open_side=open_side, open_entry=open_entry,
+                        open_pnl=open_pnl,
+                    )
+                except Exception as e:
+                    print(f"  [REPORTER {sym}] heartbeat failed: {e}")
 
 
 # ============================================================================
@@ -1516,6 +1627,28 @@ async def bootstrap() -> None:
 
     # INIT equity sync
     await sync_equity(reason="INIT")
+
+    # Init bot_reporter per pereche (dashboard agregat). Fail-safe: orice eroare
+    # → reporter dezactivat pe acel simbol, restul continua. Disable explicit
+    # via BOT_REPORTER_DB="" in env.
+    db_path = os.getenv("BOT_REPORTER_DB", "/dashboard/state.db")
+    if db_path and _BOT_REPORTER_AVAILABLE:
+        for pair_cfg in CONFIG.pairs:
+            if not pair_cfg.enabled or _halted.get(pair_cfg.symbol):
+                continue
+            sym = pair_cfg.symbol
+            try:
+                _reporters[sym] = BotReporter(
+                    bot_id=f"{BOT_NAME}_{sym}",
+                    bot_name=BOT_NAME,
+                    symbol=sym,
+                    timeframe=pair_cfg.timeframe,
+                    db_path=db_path,
+                )
+                print(f"  [{sym}] reporter init OK (db={db_path})")
+            except Exception as e:
+                print(f"  [{sym}] reporter init FAILED ({type(e).__name__}: {e})"
+                      f" — disabled pe simbol")
 
     # Strategy register indicators (chart overlay meta)
     # HI overlays
