@@ -851,8 +851,18 @@ async def _close_position_locked(symbol: str, exit_reason: str,
             # asumand acelasi numitor.
             init_acc = _state.initial_account
             pnl_pct = ((trade.pnl / init_acc * 100) if init_acc else None)
-            reporter.record_trade(pnl=trade.pnl, pnl_pct=pnl_pct,
-                                   exit_reason=trade.exit_reason)
+            # side: lowercase "long"/"short" (conventie dashboard, aceeasi ca
+            # open_side din heartbeat). Try/except TypeError = backwards-compat
+            # cu versiuni vechi bot_reporter fara `side` param.
+            side = (trade.direction.lower()
+                    if trade.direction in ("LONG", "SHORT") else None)
+            try:
+                reporter.record_trade(pnl=trade.pnl, pnl_pct=pnl_pct,
+                                       exit_reason=trade.exit_reason,
+                                       side=side)
+            except TypeError:
+                reporter.record_trade(pnl=trade.pnl, pnl_pct=pnl_pct,
+                                       exit_reason=trade.exit_reason)
         except Exception as e:
             print(f"  [REPORTER {symbol}] record_trade failed: {e}")
 
@@ -1030,8 +1040,18 @@ async def _close_pipeline_external_locked(symbol: str, exit_reason: str,
             # asumand acelasi numitor.
             init_acc = _state.initial_account
             pnl_pct = ((trade.pnl / init_acc * 100) if init_acc else None)
-            reporter.record_trade(pnl=trade.pnl, pnl_pct=pnl_pct,
-                                   exit_reason=trade.exit_reason)
+            # side: lowercase "long"/"short" (conventie dashboard, aceeasi ca
+            # open_side din heartbeat). Try/except TypeError = backwards-compat
+            # cu versiuni vechi bot_reporter fara `side` param.
+            side = (trade.direction.lower()
+                    if trade.direction in ("LONG", "SHORT") else None)
+            try:
+                reporter.record_trade(pnl=trade.pnl, pnl_pct=pnl_pct,
+                                       exit_reason=trade.exit_reason,
+                                       side=side)
+            except TypeError:
+                reporter.record_trade(pnl=trade.pnl, pnl_pct=pnl_pct,
+                                       exit_reason=trade.exit_reason)
         except Exception as e:
             print(f"  [REPORTER {symbol}] record_trade failed: {e}")
 
