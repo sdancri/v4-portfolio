@@ -53,6 +53,7 @@ import math
 import os
 import time
 import urllib.parse
+import uuid
 from typing import Optional
 
 import httpx
@@ -471,6 +472,13 @@ async def place_market(symbol: str, side: str, qty: float,
 async def place_limit_postonly(symbol: str, side: str, price: float, qty: float,
                                reduce_only: bool = False) -> Optional[str]:
     info = await get_market_info(symbol)
+    # orderLinkId unic per ordin: pe timeout ambiguu (request-ul a ajuns la
+    # Bybit dar raspunsul s-a pierdut — _post prinde exceptia si intoarce
+    # None), ordinul POATE exista server-side. Fara link id nu-l putem regasi
+    # → ramane ORFAN in book, iar caller-ul (maker_entry_or_market / chase_close)
+    # trimite fallback pe qty intreg → DUBLA pozitie cand orfanul umple si el.
+    # Cu link id: lookup + recover sau cancel defensiv.
+    link_id = f"v4{uuid.uuid4().hex}"[:36]
     r = await _post("/v5/order/create", {
         "category": _cat(),
         "symbol": symbol,
@@ -480,8 +488,39 @@ async def place_limit_postonly(symbol: str, side: str, price: float, qty: float,
         "qty": _fmt_qty(qty, info["qty_prec"]),
         "timeInForce": "PostOnly",
         "reduceOnly": reduce_only,
+        "orderLinkId": link_id,
     })
-    return r.get("orderId") if r else None
+    if r:
+        return r.get("orderId")
+
+    # _post a intors None = (a) rejection certa (retCode != 0, ex PostOnly
+    # would cross — ordinul sigur NU exista) sau (b) exceptie/timeout ambiguu
+    # (ordinul POATE exista). Distingem cu lookup pe orderLinkId.
+    found = await _get("/v5/order/realtime",
+                       {"category": _cat(), "symbol": symbol,
+                        "orderLinkId": link_id})
+    if found is not None:
+        lst = found.get("list") or []
+        if lst:
+            o = lst[0]
+            if o.get("orderStatus") in ("New", "PartiallyFilled", "Filled"):
+                print(f"  [BYBIT] place_limit_postonly {symbol}: raspuns "
+                      f"pierdut dar ordinul EXISTA — orphan recovery "
+                      f"(orderId={o.get('orderId')}, "
+                      f"status={o.get('orderStatus')})")
+                return o.get("orderId")
+        # list gol sau status Rejected/Cancelled → cert nu e activ
+        return None
+
+    # Lookup-ul insusi a esuat (API/network down) — ambiguitatea persista.
+    # Best-effort cancel pe orderLinkId ca un eventual orfan sa nu ramana in
+    # book; abia apoi None (fallback-ul Market al caller-ului devine safe).
+    print(f"  [BYBIT] place_limit_postonly {symbol}: stare AMBIGUA "
+          f"(create si lookup esuate) — cancel defensiv orderLinkId={link_id}")
+    await _post("/v5/order/cancel", {
+        "category": _cat(), "symbol": symbol, "orderLinkId": link_id,
+    })
+    return None
 
 
 async def cancel_order(symbol: str, order_id: Optional[str]) -> None:

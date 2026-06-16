@@ -133,6 +133,10 @@ CLI = _args.parse_args()
 
 CONFIG: AppConfig = load_config(CLI.config)
 BOT_NAME = os.getenv("BOT_NAME", CONFIG.portfolio.name)
+# Versiune raportata in dashboard bot_events (linie verticala pe equity chart
+# la launch/restart). Setata in stack la deploy (ex BOT_VERSION="v1.3 fix SL"
+# sau git short SHA). Gol → eveniment fara label.
+BOT_VERSION = os.getenv("BOT_VERSION", "")
 CHART_PORT = int(os.getenv("CHART_PORT", "8104"))
 # Port host pentru link Telegram (Docker port mapping host:container poate diferi
 # de portul intern). Default = CHART_PORT cand nu e mapping.
@@ -388,11 +392,22 @@ async def open_position(symbol: str, direction: str, close_price: float,
         # Avg-ul ponderat real vine cand fetch_pnl_for_trade trage closed-pnl;
         # pana atunci folosim signal price. Pt SL/TP calc, e suficient.
         real_fill_price = close_price
+    # Filled qty REAL — pe partial fill (maker timeout + market remainder esuat,
+    # rezultat "mixed"/"skipped"), filled_qty < qty CERUTA. Tracking-ul corect
+    # asigura ca SL/close/uPnL opereaza pe cantitatea care chiar exista pe Bybit.
+    filled_qty = float(entry_result.get("filled_qty") or 0) or qty
+    if filled_qty <= 0:
+        print(f"  [OPEN {symbol}] filled_qty=0 → skip (nimic deschis pe Bybit)")
+        return
+    if filled_qty < qty:
+        print(f"  [OPEN {symbol}] PARTIAL FILL: requested={qty} filled={filled_qty}")
     slippage_bps = ((real_fill_price - close_price) / close_price * 10000
                     if real_fill_price > 0 else 0)
     print(f"  [OPEN {symbol}] {fill_kind:6s} signal={close_price:.6f} "
           f"fill={real_fill_price:.6f} slippage={slippage_bps:+.1f}bps")
     order_id = ""  # informational only — maker_entry_or_market nu returneaza id unic
+    # De aici incolo, folosim filled_qty (NU qty cerut) pt LivePosition + SL + Telegram.
+    qty = filled_qty
 
     # SL/TP din fill real — branched per strategy:
     #   - 'hi': SL la sl_initial_pct, TP optional la tp_pct (signal exit dominant)
@@ -1762,6 +1777,21 @@ async def bootstrap() -> None:
         f"🌐 <b>Chart:</b>        port <code>{CHART_HOST_PORT}</code>",
     )
 
+    # Eveniment dashboard (linie verticala pe equity chart):
+    # launch la primul boot, restart pe redeploy-uri ulterioare. Label =
+    # BOT_VERSION env. bot_events e cheiat pe bot_name (NU bot_id/symbol),
+    # deci emite UN SINGUR eveniment per bot — folosim primul reporter
+    # disponibil. Fail-safe: exceptii nu rup boot-ul.
+    if _reporters:
+        first_reporter = next(iter(_reporters.values()))
+        rec = getattr(first_reporter, "record_event", None)
+        if callable(rec):
+            try:
+                rec("launch" if is_first_boot else "restart", BOT_VERSION)
+            except Exception as e:
+                print(f"  [REPORTER] record_event(launch/restart) failed: "
+                      f"{type(e).__name__}: {e}")
+
     # Telegram POZITIE GASITA — dupa BOT PORNIT (ordine UX). Per pozitie
     # adoptata din Bybit, anunta user-ul ca bot-ul a preluat.
     for sym, _pair_cfg, pos in _resume_announce:
@@ -1836,6 +1866,18 @@ async def lifespan(app: FastAPI):
             )
         except Exception as e:
             print(f"  [SHUTDOWN] tg.send failed: {e}")
+        # Eveniment dashboard "shutdown" (linie verticala pe equity chart).
+        # Label = signal name sau "clean" cand lifespan returneaza natural.
+        # Fail-safe: exception nu blocheaza shutdown.
+        if _reporters:
+            first_reporter = next(iter(_reporters.values()))
+            rec = getattr(first_reporter, "record_event", None)
+            if callable(rec):
+                try:
+                    rec("shutdown", SHUTDOWN_SIGNAL["name"] or "clean")
+                except Exception as e:
+                    print(f"  [REPORTER] record_event(shutdown) failed: "
+                          f"{type(e).__name__}: {e}")
 
 
 # Signal handlers: SIGTERM (docker stop), SIGINT (Ctrl-C), SIGHUP. SIGKILL

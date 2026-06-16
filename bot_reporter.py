@@ -49,8 +49,16 @@ CREATE TABLE IF NOT EXISTS trades (
     exit_reason TEXT,
     side        TEXT
 );
+CREATE TABLE IF NOT EXISTS bot_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    bot_name    TEXT NOT NULL,
+    ts          REAL NOT NULL,
+    type        TEXT NOT NULL,
+    label       TEXT
+);
 CREATE INDEX IF NOT EXISTS idx_trades_bot  ON trades(bot_id);
 CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(closed_ts);
+CREATE INDEX IF NOT EXISTS idx_events_name ON bot_events(bot_name);
 """
 
 
@@ -173,6 +181,31 @@ class BotReporter:
                     closed_ts or time.time(), pnl, pnl_pct, exit_reason,
                     (side or "").lower() or None,
                 ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def record_event(
+        self,
+        type: str,                       # "launch" | "version" | "restart" | "shutdown" | "bug" | "note"
+        label: str = "",
+        ts: float | None = None,
+    ) -> None:
+        """Înregistrează un eveniment pe care dashboard-ul îl suprapune ca linie
+        verticală pe graficul de equity. Apelează-l ex. la pornire
+        (record_event("launch", "v1.0")) sau după un deploy
+        (record_event("version", "v1.3 — fix SL")).
+
+        NOTĂ: bot_events e cheiat pe bot_name (NU bot_id/symbol). Pe boti
+        multi-pair (V4), emite UN SINGUR eveniment per bot, nu per simbol —
+        altfel N linii duplicate pe equity chart.
+        """
+        conn = _get_conn(self.db_path)
+        try:
+            conn.execute(
+                "INSERT INTO bot_events (bot_name, ts, type, label) VALUES (?,?,?,?)",
+                (self.bot_name, ts or time.time(), type, label),
             )
             conn.commit()
         finally:

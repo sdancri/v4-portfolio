@@ -25,6 +25,10 @@ services:
       - TZ=Europe/Bucharest
       - CHART_TZ=${CHART_TZ:-Europe/Bucharest}
       - BOT_NAME=V4
+      # Versiune raportata in dashboard la fiecare launch/restart (linie
+      # verticala pe equity chart). Ex: "v1.3 fix SL" sau git short SHA.
+      # Gol → eveniment fara label (acceptat dar mai putin util in UI).
+      - BOT_VERSION=${BOT_VERSION:-}
       - STRATEGY_NAME=BB-MR + Hull+Ichimoku
       - CHART_PORT=8104          # port intern container (FastAPI listen)
       - CHART_HOST_PORT=8107     # port host (afisat in Telegram, link chart)
@@ -45,7 +49,7 @@ services:
       # Dashboard control (vezi core/bot_control.py + endpoints /api/pause|resume|stop):
       # BOT_CONTROL_URL = http://<container_name>:<chart_port>. Dashboard scrie
       # in state.db ca sa stie unde POST. Container_name aici = V4, port intern = 8104.
-      - BOT_CONTROL_URL=${BOT_CONTROL_URL:-http://V4:8104}
+      - BOT_CONTROL_URL=http://100.92.198.95:8107
       # Bot reporter SQLite: dashboard agregat (multi-bot) citeste din asta.
       # Path-ul corespunde mount-ului /srv/bots/dashboard:/dashboard de mai jos.
       # Disable explicit: BOT_REPORTER_DB="" (env override → reporter dezactivat).
