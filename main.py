@@ -1157,12 +1157,21 @@ async def on_confirmed_bar(symbol: str, bar: dict) -> None:
     pos_dir = pos.direction.lower() if pos else None
     entry_px = pos.entry_price if pos else 0.0
 
-    # Increment bars_held pe pozitia activa (folosit la BB MR time-exit)
-    if pos is not None:
-        pos.bars_held += 1
-
     if isinstance(sig, BBMeanReversionSignal):
-        bars_held = pos.bars_held if pos else 0
+        # bars_held DERIVAT din opened_ts_ms (nr bare intre bara-entry si bara
+        # curenta) + 1, NU contor in-memory. Contorul se pierdea la restart
+        # (bars_held=0 la adopt, main.py:1702) → time-exit ratat cat botul restarta.
+        # Derivarea e restart-proof FARA persistenta: la adopt opened_ts_ms =
+        # created_ms Bybit (ora reala a deschiderii). +1 pt paritate Pine
+        # (opened_ts_ms = wall-clock ~= close-ul barei-semnal S = ancora S+1, cu
+        # o bara in urma barei-semnal S; fara +1 time-exit ar iesi la 41 bare, nu 40).
+        if pos is not None and pos.opened_ts_ms:
+            iv_ms = nl.interval_ms(_TF_INTERVAL)
+            entry_bar = nl.current_bar_open_ms(pos.opened_ts_ms, _TF_INTERVAL)
+            bars_held = max(0, int((bar["ts_ms"] - entry_bar) / iv_ms)) + 1
+            pos.bars_held = bars_held      # sync field pt UI/dashboard
+        else:
+            bars_held = 0
         decision = sig.evaluate(has_position=pos_dir, entry_price=entry_px,
                                  bars_held=bars_held)
     else:
