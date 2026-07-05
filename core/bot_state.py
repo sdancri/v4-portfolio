@@ -25,7 +25,8 @@ from __future__ import annotations
 import json
 import os
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+from dataclasses import fields as _dc_fields
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -66,6 +67,16 @@ class LivePosition:
                                        # corect [adopt-60s, now+5min] FĂRĂ piramidari
                                        # vechi (închise ÎNAINTE de adopt) contaminate.
                                        # opened_ts_ms rămâne createdMs Bybit pt chart.
+
+    def to_persist(self) -> dict:
+        """Serializare pt state.json — pozitia activa supravietuieste restartului
+        (detecteaza offline-close la resume: pozitie inchisa EXTERN cat botul jos)."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LivePosition":
+        valid = {f.name for f in _dc_fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in valid})
 
 
 @dataclass
@@ -296,6 +307,11 @@ class BotState:
                 "initial_account": self.initial_account,
                 "shared_equity": self.shared_equity,
                 "trades": [t.to_persist() for t in self.trades],
+                # Pozitii active persistate → detecteaza offline-close la restart
+                # (pozitie inchisa EXTERN cat botul era jos). Bybit are created_ms
+                # nativ; persistam pt offline-close (record + Telegram + DB la boot).
+                "positions": {s: p.to_persist()
+                              for s, p in self.positions.items() if p},
                 "equity_curve": list(self.equity_curve),
                 "first_candle_ts": self.first_candle_ts,
                 "start_utc": self.start_utc.isoformat(),
@@ -332,6 +348,9 @@ class BotState:
         self.initial_account = data.get("initial_account", self.initial_account)
         self.shared_equity = data.get("shared_equity", self.initial_account)
         self.trades = [TradeRecord.from_dict(t) for t in data.get("trades", [])]
+        # Pozitii active persistate. Resume le reconciliaza cu Bybit (adopt).
+        self.positions = {s: LivePosition.from_dict(d)
+                          for s, d in (data.get("positions") or {}).items()}
         self.equity_curve = data.get("equity_curve", []) or self.equity_curve
         self.first_candle_ts = data.get("first_candle_ts", {}) or {}
         self.indicators = data.get("indicators", {}) or {}
