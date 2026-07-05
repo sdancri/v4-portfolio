@@ -1274,6 +1274,12 @@ async def _public_ws_run() -> None:
     # endpoint-uri il asteapta), (3) watchdog pe last_msg_ts (force close daca
     # nu vine niciun mesaj > WS_ZOMBIE_TIMEOUT). Toate → except → reconnect.
     ws_zombie_timeout = int(os.getenv("WS_ZOMBIE_TIMEOUT", "60"))
+    # Per-symbol staleness: last_msg_ts e connection-level (resetat de ORICE
+    # simbol) → un singur topic mort printre altele vii NU e prins (ceilalti tin
+    # timerul proaspat). Track separat per simbol. Prag generos (default 300s) ca
+    # sa NU dea reconnect fals pe simboluri mai putin active — un fals ar pica
+    # TOATE simbolurile de pe conexiune. (analog BP-Bybit 1f9874b / Gate fdfb9d6)
+    sym_stale_timeout = int(os.getenv("WS_SYMBOL_STALE_TIMEOUT", "300"))
     while True:
         try:
             async with websockets.connect(url, ping_interval=20,
@@ -1288,6 +1294,9 @@ async def _public_ws_run() -> None:
                     _sync_done[s] = False
 
                 last_msg_ts = time.time()
+                # Per-symbol liveness — reset la fiecare (re)conectare.
+                _now0 = time.time()
+                last_sym_ts = {s: _now0 for s in enabled}
 
                 async def _hb():
                     while True:
@@ -1300,11 +1309,27 @@ async def _public_ws_run() -> None:
                 async def _watchdog():
                     while True:
                         await asyncio.sleep(10)
-                        idle = time.time() - last_msg_ts
+                        now = time.time()
+                        idle = now - last_msg_ts
                         if idle > ws_zombie_timeout:
                             print(f"  [WS-PUB] ZOMBIE detected: no msg "
                                   f"{idle:.0f}s > {ws_zombie_timeout}s — "
                                   f"forcing close → reconnect")
+                            try:
+                                await ws.close()
+                            except Exception:
+                                pass
+                            return
+                        # Per-symbol: un singur topic mort (conexiunea + restul
+                        # simbolurilor vii) → last_msg_ts ramane proaspat, dar
+                        # ACEST simbol nu mai primeste kline. Reconnect (resub tot).
+                        sym_stale = [(s, now - t) for s, t in last_sym_ts.items()
+                                     if now - t > sym_stale_timeout]
+                        if sym_stale:
+                            for s, age in sym_stale:
+                                print(f"  [WS-PUB] SYMBOL STALE {s}: {age:.0f}s > "
+                                      f"{sym_stale_timeout}s — forcing close → "
+                                      f"reconnect")
                             try:
                                 await ws.close()
                             except Exception:
@@ -1323,6 +1348,7 @@ async def _public_ws_run() -> None:
                         if not topic.startswith("kline."):
                             continue
                         symbol = topic.split(".")[-1]
+                        last_sym_ts[symbol] = time.time()   # per-symbol liveness
                         for k in msg.get("data", []):
                             confirmed = bool(k.get("confirm", False))
                             ts_ms = int(k["start"])
