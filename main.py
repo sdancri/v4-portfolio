@@ -480,7 +480,8 @@ async def open_position(symbol: str, direction: str, close_price: float,
     if sl_geometry_bad:
         print(f"  [OPEN {symbol}] SL GEOMETRY INVALID: dir={direction} "
               f"entry={real_fill_price} sl={sl_price} — NU armez (fallback software)")
-        await tg.send_critical(
+        # WARNING, nu HALT: botul CONTINUA (pozitia ruleaza pe fallback software).
+        await tg.send_warning(
             "SL geometrie INVALIDĂ",
             f"<b>Direcție:</b> {direction}  "
             f"<b>Entry:</b> <code>{ex.smart_price(real_fill_price)}</code>  "
@@ -600,7 +601,9 @@ async def _sl_retry_loop(symbol: str, sl_price: float,
         sl_str = ex.smart_price(sl_price)
         tp_line = (f"🎯 <b>TP:</b> <code>{ex.smart_price(tp_price)}</code>\n"
                    if tp_price is not None else "")
-        await tg.send_critical(
+        # WARNING, nu HALT: botul CONTINUA (pozitia ruleaza pe fallback software
+        # SL_LONG/SHORT + reconcile la close). HALT doar cand botul se opreste.
+        await tg.send_warning(
             "SL/TP NESETAT" if tp_price is not None else "SL NESETAT",
             f"<b>set_position_sl A EȘUAT</b> după <code>{elapsed}s</code> de reîncercări\n"
             f"🛑 <b>SL:</b> <code>{sl_str}</code>\n"
@@ -1925,7 +1928,7 @@ async def lifespan(app: FastAPI):
                                      on_execution=on_execution_event,
                                      on_position=on_position_event)),
         asyncio.create_task(heartbeat_loop()),
-        asyncio.create_task(memory_monitor(BOT_NAME, tg_alert=tg.send_critical)),
+        asyncio.create_task(memory_monitor(BOT_NAME, tg_alert=tg.send_warning)),
         # Periodic heartbeat pt dashboard — 30s default, independent de bare.
         # Pe TF 4h, heartbeat_loop pe bara = 1×/4h → dashboard threshold (5-10min)
         # depasit intre bare → bot apare 'dead'. Acest task tine bot 'alive' in UI.

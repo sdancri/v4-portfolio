@@ -656,7 +656,9 @@ async def set_position_sl(symbol: str, sl_price: float,
         tp_str = smart_price(tp_price) if tp_price is not None else None
         tp_line = f"<b>TP:</b> {tp_str}\n" if tp_str is not None else ""
         if is_initial:
-            await tg.send_critical(
+            # WARNING, nu HALT: botul NU se opreste — pozitia ruleaza (reconcile
+            # o prinde la close + fortare). HALT doar cand botul chiar se opreste.
+            await tg.send_warning(
                 f"{symbol} SL/TP NESETAT" if tp_price is not None else f"{symbol} SL NESETAT",
                 f"<b>set_position_sl A EȘUAT</b> după {n_retries} reîncercări (~{retry_s}s)\n"
                 f"<b>SL:</b> {sl_str}\n"
