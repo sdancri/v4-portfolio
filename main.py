@@ -76,6 +76,7 @@ from core.monitoring import (
     install_asyncio_exception_handler,
     install_signal_handlers,
     memory_monitor,
+    supervise,
 )
 from core.position_sizing import compute_position_size, compute_qty
 from strategies.bb_mr_signal import BBMeanReversionSignal, BBMRConfig
@@ -1922,17 +1923,29 @@ async def lifespan(app: FastAPI):
     # Spawn background tasks (memory_monitor inclusiv — pre-OOM Telegram alert
     # cand RSS > MEM_MON_RSS_ALERT_MB; SIGKILL/OOM NU invoca excepthook,
     # singura fereastra de notification e PRE-kill via monitor).
+    # Task-urile de fundal ruleaza sub `supervise`: daca un task MOARE (exceptie
+    # in afara buclei interne de reconnect — cauza incidentului NEAR 07-08 pe
+    # V4-HL, WS mort silentios ore intregi, fara Telegram, fara restart),
+    # primesti Telegram cu traceback + auto-restart. WARNING, nu HALT — se
+    # auto-vindeca. (model BP Bybit f85012e)
     tasks = [
-        asyncio.create_task(public_ws_loop()),
-        asyncio.create_task(pws.run(on_order=on_order_event,
-                                     on_execution=on_execution_event,
-                                     on_position=on_position_event)),
-        asyncio.create_task(heartbeat_loop()),
-        asyncio.create_task(memory_monitor(BOT_NAME, tg_alert=tg.send_warning)),
+        asyncio.create_task(supervise("bybit_ws", public_ws_loop,
+                                      tg_alert=tg.send_warning)),
+        asyncio.create_task(supervise("private_ws", lambda: pws.run(
+            on_order=on_order_event,
+            on_execution=on_execution_event,
+            on_position=on_position_event,
+        ), tg_alert=tg.send_warning)),
+        asyncio.create_task(supervise("heartbeat", heartbeat_loop,
+                                      tg_alert=tg.send_warning)),
+        asyncio.create_task(supervise("memory_monitor",
+            lambda: memory_monitor(BOT_NAME, tg_alert=tg.send_warning),
+            tg_alert=tg.send_warning)),
         # Periodic heartbeat pt dashboard — 30s default, independent de bare.
         # Pe TF 4h, heartbeat_loop pe bara = 1×/4h → dashboard threshold (5-10min)
         # depasit intre bare → bot apare 'dead'. Acest task tine bot 'alive' in UI.
-        asyncio.create_task(periodic_reporter_heartbeat()),
+        asyncio.create_task(supervise("reporter_heartbeat", periodic_reporter_heartbeat,
+                                      tg_alert=tg.send_warning)),
     ]
     try:
         yield
