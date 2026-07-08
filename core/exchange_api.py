@@ -297,17 +297,32 @@ async def get_kline(symbol: str, interval: str, limit: int = 1000,
 # ============================================================================
 
 async def get_balance() -> Optional[float]:
-    """USDT available — UNIFIED account."""
-    r = await _get("/v5/account/wallet-balance",
-                   {"accountType": "UNIFIED", "coin": "USDT"})
-    if not r:
-        return None
-    try:
-        for coin in r["list"][0]["coin"]:
-            if coin["coin"] == "USDT":
-                return float(coin["availableToWithdraw"] or coin["walletBalance"])
-    except Exception:
-        pass
+    """USDT available — UNIFIED account.
+
+    Folosit pt cap-ul de siguranta din position_sizing SI pt sync_equity
+    (shared_equity — sursa pt sizing viitoarelor trade-uri + mesajul BOT PORNIT).
+
+    Retry 4x/1s: un singur fail tranzitoriu (_get n-are retry intern) lasa
+    sync_equity() cu shared_equity NEACTUALIZAT (stale) → sizing viitoarelor
+    trade-uri + "Account init" calculate pe o valoare veche (aceeasi clasa de
+    bug identificata pe V4-HL 2026-07-08: NEAR supradimensionat din equity stale).
+    """
+    last_exc: Optional[Exception] = None
+    for i in range(4):
+        try:
+            r = await _get("/v5/account/wallet-balance",
+                           {"accountType": "UNIFIED", "coin": "USDT"})
+            if r:
+                for coin in r["list"][0]["coin"]:
+                    if coin["coin"] == "USDT":
+                        return float(coin["availableToWithdraw"] or coin["walletBalance"])
+            last_exc = RuntimeError(f"empty/malformed response: {r!r}")
+        except Exception as e:
+            last_exc = e
+        print(f"[BYBIT] get_balance attempt {i+1}/4 failed: {last_exc!r}")
+        if i < 3:
+            await asyncio.sleep(1.0)
+    print(f"[BYBIT] get_balance FAILED after 4 retries: {last_exc!r}")
     return None
 
 
