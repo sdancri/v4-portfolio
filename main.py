@@ -589,7 +589,7 @@ async def _sl_retry_loop(symbol: str, sl_price: float,
             symbol=symbol,
         )
     except Exception as e:
-        print(f"  [{symbol}] SL timeout tg.send_critical failed: {e!r}")
+        print(f"  [{symbol}] SL timeout tg.send_warning failed: {e!r}")
 
 
 async def _assert_closed(symbol: str, qty_local: float,

@@ -658,8 +658,8 @@ async def set_position_sl(symbol: str, sl_price: float,
         return False
     retry_s = int(sum(delays))
     # Alerta Telegram diferentiata pe is_initial:
-    #   is_initial=True (primul SL post-fill): tg.send_critical — URGENT,
-    #     pozitia ruleaza fara nicio protectie Bybit-side.
+    #   is_initial=True (primul SL post-fill): tg.send_warning — pozitia
+    #     ruleaza fara nicio protectie Bybit-side (botul CONTINUA, nu HALT).
     #   is_initial=False (trailing/breakeven update): tg.send — warning,
     #     pozitia ramane protejata de SL initial setat anterior.
     # Best-effort: tg.send fail NU altereaza return-ul.
