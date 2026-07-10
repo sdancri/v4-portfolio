@@ -20,6 +20,13 @@ services:
       - BYBIT_API_KEY=${BYBIT_API_KEY}
       - BYBIT_API_SECRET=${BYBIT_API_SECRET}
       - BYBIT_TESTNET=${BYBIT_TESTNET:-0}
+      - BYBIT_CATEGORY=${BYBIT_CATEGORY:-linear}
+      # genesis_account (Capital inițial) + baseline shared_equity la primul boot
+      # FARA state.json persistat. Dupa primul boot: genesis_account NICIODATA
+      # suprascris (vezi core/bot_state.py); shared_equity persista din state.
+      # Fara linia asta explicit, Portainer NU poate transmite valoarea reala
+      # in container (env lipsa din environment: = default 100.0 mereu).
+      - ACCOUNT_SIZE=${ACCOUNT_SIZE:-100.0}
       - TELEGRAM_TOKEN=${TELEGRAM_TOKEN:-}
       - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
       - TZ=Europe/Bucharest

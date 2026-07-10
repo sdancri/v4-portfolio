@@ -299,13 +299,13 @@ async def get_kline(symbol: str, interval: str, limit: int = 1000,
 async def get_balance() -> Optional[float]:
     """USDT available — UNIFIED account.
 
-    Folosit pt cap-ul de siguranta din position_sizing SI pt sync_equity
-    (shared_equity — sursa pt sizing viitoarelor trade-uri + mesajul BOT PORNIT).
+    Folosit DOAR pt cap-ul de siguranta din position_sizing la entry (NU
+    actualizeaza shared_equity — model compound local, vezi bot_state.py).
 
     Retry 4x/1s: un singur fail tranzitoriu (_get n-are retry intern) lasa
-    sync_equity() cu shared_equity NEACTUALIZAT (stale) → sizing viitoarelor
-    trade-uri + "Account init" calculate pe o valoare veche (aceeasi clasa de
-    bug identificata pe V4-HL 2026-07-08: NEAR supradimensionat din equity stale).
+    cap-ul de siguranta sa cada pe fallback shared_equity (mai putin sigur —
+    vezi WARNING Telegram in open_position). Aceeasi clasa de bug identificata
+    pe V4-HL 2026-07-08 (NEAR supradimensionat din balance stale).
     """
     last_exc: Optional[Exception] = None
     for i in range(4):
