@@ -1143,6 +1143,16 @@ async def on_confirmed_bar(symbol: str, bar: dict) -> None:
     except ReconciliationError:
         return  # halted
 
+    # Defense-in-depth (INVERS): local FLAT dar exchange are pozitie
+    # NETRACKUITA — adopta ACUM, inainte de a evalua un entry nou (altfel
+    # am dubla pozitia). Vezi _maybe_adopt_untracked_position pt context
+    # complet (port BP maybe_adopt_untracked_position).
+    if _state.get_position(symbol) is None:
+        pair_cfg_cur = next((p for p in CONFIG.pairs if p.symbol == symbol), None)
+        if pair_cfg_cur is not None and await _maybe_adopt_untracked_position(
+                symbol, pair_cfg_cur):
+            return  # adoptat SAU halted — sarim bara asta
+
     # ORDINE BROADCAST: candle + indicators FIRST, apoi strategy decisions.
     # Asta garanteaza ca chart-ul are bara curenta in CANDLES inainte sa
     # primeasca position_open → showLiveLines vede lastCandle.time = entry bar.
@@ -1593,6 +1603,168 @@ async def periodic_reporter_heartbeat() -> None:
 
 
 # ============================================================================
+# Adopt helper — partajat intre bootstrap() (resume la boot) si
+# _maybe_adopt_untracked_position() (defense-in-depth runtime)
+# ============================================================================
+
+async def _try_adopt_position(sym: str, pair_cfg, bybit_pos: dict,
+                              sig) -> Optional["LivePosition"]:
+    """Adopta o pozitie gasita pe exchange, dupa STRAT 1 (are SL) + STRAT 2
+    (geometrie SL vs pret curent) guards. Pe refuz: seteaza _halted[sym]=True
+    + trimite Telegram warning, returneaza None. Pe succes: construieste
+    LivePosition, o pune in _state, returneaza obiectul.
+
+    Extras din bootstrap() (resume la boot) ca sa fie reutilizabil si de
+    _maybe_adopt_untracked_position() (adopt runtime, defense-in-depth —
+    port BP maybe_adopt_untracked_position).
+    """
+    entry_px = bybit_pos["entry_price"]
+    qty_real = bybit_pos["qty"]
+    dir_real = bybit_pos["direction"]
+    sl_real  = bybit_pos["sl_price"]
+    tp_real  = bybit_pos["tp_price"]
+    has_bybit_sl = sl_real is not None and sl_real > 0
+
+    # STRAT 1 — Refuz adopt daca Bybit NU are SL setat.
+    if not has_bybit_sl:
+        print(f"  [{sym}] adopt: REFUZ — Bybit qty={qty_real} FARA SL setat "
+              f"(suspect: manual sau bot fail)")
+        try:
+            await tg.send_warning(
+                "POZIȚIE FĂRĂ SL — refuz adoptie",
+                f"<b>Pe Bybit:</b> {tg.dir_emoji(dir_real)} {dir_real}  "
+                f"<b>Qty:</b> <code>{qty_real}</code>  "
+                f"<b>Entry:</b> <code>{ex.smart_price(entry_px)}</code>\n"
+                f"<b>SL Bybit:</b> <code>NESETAT</code>\n"
+                f"\n"
+                f"<b>Acțiune:</b>\n"
+                f"  1. Setează SL manual pe Bybit App (recomandat: "
+                f"entry × (1 ± <code>{pair_cfg.effective_sl_pct*100:.1f}%</code>)),\n"
+                f"  2. SAU închide poziția manual,\n"
+                f"  3. Apoi redeploy bot.\n"
+                f"\n"
+                f"<b>Stare bot:</b> simbolul e HALTAT — NU va genera "
+                f"trade nou pana la redeploy. Restul perechilor ruleaza normal.",
+                symbol=sym,
+            )
+        except Exception as e:
+            print(f"  [{sym}] adopt tg.send_warning failed: {e!r}")
+        _halted[sym] = True
+        return None
+
+    # STRAT 2 — Refuz adopt daca SL e pe partea GRESITA fata de PRETUL CURENT
+    # (last_close), NU fata de entry (breakeven/profit-lock e legitim).
+    last_close = float(sig.df.iloc[-1]["close"]) if len(sig.df) else 0.0
+    if last_close > 0 and (
+            (dir_real == "LONG" and sl_real >= last_close) or
+            (dir_real == "SHORT" and sl_real <= last_close)):
+        print(f"  [{sym}] adopt: REFUZ — SL instant-trigger "
+              f"(sl={sl_real} vs pret_curent={last_close}, dir={dir_real})")
+        try:
+            await tg.send_warning(
+                "SL S-AR DECLANȘA INSTANT — refuz adoptie",
+                f"<b>Pe Bybit:</b> {tg.dir_emoji(dir_real)} {dir_real}  "
+                f"<b>Preț curent:</b> <code>{ex.smart_price(last_close)}</code>  "
+                f"<b>SL:</b> <code>{ex.smart_price(sl_real)}</code>\n"
+                f"SL-ul e pe partea GREȘITĂ față de prețul curent — s-ar "
+                f"declanșa INSTANT.\n"
+                f"\n"
+                f"<b>Acțiune:</b> verifică manual poziția pe Bybit App "
+                f"(corectează SL sau închide), apoi redeploy bot.\n"
+                f"\n"
+                f"<b>Stare bot:</b> simbolul e HALTAT — NU va genera "
+                f"trade nou pana la redeploy. Restul perechilor ruleaza normal.",
+                symbol=sym,
+            )
+        except Exception as e:
+            print(f"  [{sym}] adopt tg.send_warning failed: {e!r}")
+        _halted[sym] = True
+        return None
+
+    # Bybit are SL → adoptie normala
+    pos_usd = qty_real * entry_px
+    risk_usd = pos_usd * pair_cfg.effective_sl_pct
+    opened_ts = bybit_pos["created_ms"] or int(time.time() * 1000)
+    adopt_ts = int(time.time() * 1000)
+    resumed = LivePosition(
+        symbol=sym,
+        side=("Buy" if dir_real == "LONG" else "Sell"),
+        direction=dir_real,
+        qty=qty_real,
+        entry_price=entry_px,
+        sl_price=sl_real,
+        tp_price=tp_real,
+        leverage=pair_cfg.leverage,
+        pos_usd=pos_usd,
+        risk_usd=risk_usd,
+        opened_ts_ms=opened_ts,
+        order_id="",
+        strategy=pair_cfg.strategy,
+        bars_held=0,
+        sl_armed=True,
+        adopt_ts_ms=adopt_ts,
+    )
+    _state.set_position(sym, resumed)
+    print(f"  [{sym}] adopt: pos adoptata ({dir_real} qty={qty_real} "
+          f"entry={entry_px} sl={sl_real})")
+    return resumed
+
+
+async def _maybe_adopt_untracked_position(symbol: str, pair_cfg) -> bool:
+    """Defense-in-depth: daca local FLAT dar exchange are o pozitie
+    NETRACKUITA, adopta ACUM (acelasi path ca la boot: STRAT1/STRAT2 din
+    _try_adopt_position). Sari entry-ul nou daca a adoptat SAU a intrat in
+    halt (altfel am dubla pozitia / am ignora halt-ul). Cheama din
+    on_confirmed_bar cand local flat, INAINTE de entry.
+
+    Root cause BP (fill de entry PENDING-TRIGGER pierdut in fereastra de
+    disconnect WS — WS la reconnect doar re-subscrie, nu reda evenimente
+    pierdute) NU se aplica direct la V4: entry-ul e SINCRON
+    (maker_entry_or_market poll REST direct pe orderStatus, nu WS). Plasa
+    ramane utila insa ca defense-in-depth generic: intre fill confirmat si
+    _state.set_position (main.py open_position) sunt ~140 linii (SL
+    placement + Telegram) — daca ceva pica acolo FARA sa crape procesul,
+    pozitia ramane netrackuita local desi exista REAL pe exchange. (port
+    BP maybe_adopt_untracked_position — e2803e1)
+
+    Returns True daca a adoptat SAU a halted (caller sare peste bara asta).
+    """
+    if _state.get_position(symbol) is not None or _halted.get(symbol):
+        return False
+    try:
+        bybit_pos = await ex.fetch_open_position(symbol)
+    except Exception as e:
+        print(f"  [{symbol}] adopt-untracked: fetch fail: {e!r}")
+        return False
+    if bybit_pos is None:
+        return False
+
+    print(f"  [{symbol}] ⚠️ pozitie NETRACKUITĂ pe Bybit (fill entry pierdut?) "
+          f"— adopt")
+    sig = _signals[symbol]
+    resumed = await _try_adopt_position(symbol, pair_cfg, bybit_pos, sig)
+    if resumed is None:
+        return True  # refuzat + halted, deja alertat in _try_adopt_position
+
+    sl_str = f"<code>{ex.smart_price(resumed.sl_price)}</code>" if resumed.sl_price else "—"
+    tp_str = f"<code>{ex.smart_price(resumed.tp_price)}</code>" if resumed.tp_price else "—"
+    try:
+        await tg.send_warning(
+            "♻️ POZIȚIE NETRACKUITĂ ADOPTATĂ",
+            f"<b>Direcție:</b> {tg.dir_emoji(resumed.direction)} {resumed.direction}  "
+            f"<b>Qty:</b> <code>{resumed.qty}</code>\n"
+            f"<b>Entry:</b> <code>{ex.smart_price(resumed.entry_price)}</code>\n"
+            f"<b>SL:</b> {sl_str}  <b>TP:</b> {tp_str}\n"
+            f"Fill de entry pierdut la reconnect WS? Verifică manual dacă "
+            f"a fost intenționat.",
+            symbol=symbol,
+        )
+    except Exception as e:
+        print(f"  [{symbol}] adopt-untracked tg failed: {e!r}")
+    return True
+
+
+# ============================================================================
 # Bootstrap
 # ============================================================================
 
@@ -1762,122 +1934,10 @@ async def bootstrap() -> None:
                 _offline_closed.append(sym)
                 continue
         if bybit_pos is not None:
-            entry_px = bybit_pos["entry_price"]
-            qty_real = bybit_pos["qty"]
-            dir_real = bybit_pos["direction"]
-            sl_real  = bybit_pos["sl_price"]
-            tp_real  = bybit_pos["tp_price"]
-            has_bybit_sl = sl_real is not None and sl_real > 0
-
-            # STRAT 1 — Refuz adopt daca Bybit NU are SL setat.
-            # Scenariu suspect: cineva a deschis manual SAU bot anterior a
-            # esuat la set_position_sl + reconcilierile au omis. NU adoptam
-            # local — alerta CRITICA, user decide (close manual sau add SL pe
-            # Bybit App, apoi restart). HALT simbolul (_halted[sym]=True) —
-            # altfel on_confirmed_bar ar continua sa evalueze semnale si ar
-            # STIVUI un trade nou peste pozitia neprotejata de pe Bybit
-            # (port BP 8f404ca — gap identic, doar Telegram avertiza, nu halta).
-            if not has_bybit_sl:
-                print(f"  [{sym}] resume: REFUZ ADOPT — Bybit qty={qty_real} "
-                      f"FARA SL setat (suspect: manual sau bot fail)")
-                try:
-                    # WARNING, nu HALT-alert (dar simbolul E halted mai jos):
-                    # niciun alt simbol nu e afectat. HALT doar cand botul chiar
-                    # se opreste ca proces — aici doar simbolul sta pe loc.
-                    await tg.send_warning(
-                        "POZIȚIE FĂRĂ SL — refuz adoptie",
-                        f"<b>Pe Bybit:</b> {tg.dir_emoji(dir_real)} {dir_real}  "
-                        f"<b>Qty:</b> <code>{qty_real}</code>  "
-                        f"<b>Entry:</b> <code>{ex.smart_price(entry_px)}</code>\n"
-                        f"<b>SL Bybit:</b> <code>NESETAT</code>\n"
-                        f"\n"
-                        f"<b>Acțiune:</b>\n"
-                        f"  1. Setează SL manual pe Bybit App (recomandat: "
-                        f"entry × (1 ± <code>{pair_cfg.effective_sl_pct*100:.1f}%</code>)),\n"
-                        f"  2. SAU închide poziția manual,\n"
-                        f"  3. Apoi redeploy bot.\n"
-                        f"\n"
-                        f"<b>Stare bot:</b> simbolul e HALTAT — NU va genera "
-                        f"trade nou pana la redeploy. Restul perechilor ruleaza normal.",
-                        symbol=sym,
-                    )
-                except Exception as e:
-                    print(f"  [{sym}] resume tg.send_warning failed: {e!r}")
-                _halted[sym] = True
-                # NU adoptam — continuam la urmatorul simbol
-                continue
-
-            # STRAT 2 — Refuz adopt daca SL e pe partea GRESITA fata de PRETUL
-            # CURENT (last_close) — NU fata de entry. Comparatia cu entry
-            # refuza FALS orice pozitie profitabila cu breakeven/profit-lock
-            # stop (SL mutat LEGITIM la/peste entry pe un trade profitabil =
-            # mecanism de risc STANDARD) la ORICE redeploy. Pericolul real
-            # ("SL s-ar declansa instant") e SL pe partea gresita a pretului
-            # CURENT, nu a entry-ului. Skip check daca last_close=0 (fara
-            # warmup data). NU enforc distanta [sl_min,sl_max] — SL live poate
-            # fi legitim in afara bounds. HALT simbolul pe refuz — altfel
-            # on_confirmed_bar ar STIVUI un trade nou peste pozitia neprotejata.
-            # (port BP 4f1cd16 — fix breakeven-false-positive peste edf77cd/8f404ca)
-            last_close = (float(sig.df.iloc[-1]["close"])
-                          if len(sig.df) else 0.0)
-            if last_close > 0 and (
-                    (dir_real == "LONG" and sl_real >= last_close) or
-                    (dir_real == "SHORT" and sl_real <= last_close)):
-                print(f"  [{sym}] resume: REFUZ ADOPT — SL instant-trigger "
-                      f"(sl={sl_real} vs pret_curent={last_close}, dir={dir_real})")
-                try:
-                    await tg.send_warning(
-                        "SL S-AR DECLANȘA INSTANT — refuz adoptie",
-                        f"<b>Pe Bybit:</b> {tg.dir_emoji(dir_real)} {dir_real}  "
-                        f"<b>Preț curent:</b> <code>{ex.smart_price(last_close)}</code>  "
-                        f"<b>SL:</b> <code>{ex.smart_price(sl_real)}</code>\n"
-                        f"SL-ul e pe partea GREȘITĂ față de prețul curent — s-ar "
-                        f"declanșa INSTANT.\n"
-                        f"\n"
-                        f"<b>Acțiune:</b> verifică manual poziția pe Bybit App "
-                        f"(corectează SL sau închide), apoi redeploy bot.\n"
-                        f"\n"
-                        f"<b>Stare bot:</b> simbolul e HALTAT — NU va genera "
-                        f"trade nou pana la redeploy. Restul perechilor ruleaza normal.",
-                        symbol=sym,
-                    )
-                except Exception as e:
-                    print(f"  [{sym}] resume tg.send_warning failed: {e!r}")
-                _halted[sym] = True
-                continue
-
-            # Bybit are SL → adoptie normala
-            pos_usd = qty_real * entry_px
-            risk_usd = pos_usd * pair_cfg.effective_sl_pct
-            # opened_ts_ms = createdMs Bybit (chart entry line afisata la
-            # momentul real al deschiderii). adopt_ts_ms = now (folosit pentru
-            # fetch_pnl_for_trade window la close → exclude piramidari vechi
-            # inchise INAINTE de adopt).
-            opened_ts = bybit_pos["created_ms"] or int(time.time() * 1000)
-            adopt_ts = int(time.time() * 1000)
-            resumed = LivePosition(
-                symbol=sym,
-                side=("Buy" if dir_real == "LONG" else "Sell"),
-                direction=dir_real,
-                qty=qty_real,
-                entry_price=entry_px,
-                sl_price=sl_real,
-                tp_price=tp_real,
-                leverage=pair_cfg.leverage,
-                pos_usd=pos_usd,
-                risk_usd=risk_usd,
-                opened_ts_ms=opened_ts,
-                order_id="",
-                strategy=pair_cfg.strategy,
-                bars_held=0,
-                sl_armed=True,
-                adopt_ts_ms=adopt_ts,
-            )
-            _state.set_position(sym, resumed)
-            print(f"  [{sym}] resume: pos adoptata ({dir_real} qty={qty_real} "
-                  f"entry={entry_px} sl={sl_real})")
-            # Stocam datele pentru Telegram dupa "BOT PORNIT"
-            _resume_announce.append((sym, pair_cfg, resumed))
+            resumed = await _try_adopt_position(sym, pair_cfg, bybit_pos, sig)
+            if resumed is not None:
+                # Stocam datele pentru Telegram dupa "BOT PORNIT"
+                _resume_announce.append((sym, pair_cfg, resumed))
 
     # NU mai exista sync_equity(INIT): shared_equity e compound local (model
     # BP Bybit), deja corect din _state.load() (persistat) — nu se re-citeste
