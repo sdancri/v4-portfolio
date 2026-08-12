@@ -74,12 +74,19 @@ from core.config import AppConfig, load_config
 from core.monitoring import (
     SHUTDOWN_SIGNAL,
     install_asyncio_exception_handler,
+    install_persistent_logs,
     install_signal_handlers,
     memory_monitor,
+    supervise,
 )
 from core.position_sizing import compute_position_size, compute_qty
 from strategies.bb_mr_signal import BBMeanReversionSignal, BBMRConfig
 from strategies.ichimoku_signal import IchimokuSignal, PairStrategyConfig
+
+# Log-uri PERSISTENTE: tee stdout/stderr → fisier rotativ pe DATA_DIR (docker logs
+# dispar la re-pull image in Portainer; fisierul pe /data supravietuieste). Primul,
+# ca sa prinda si bannerul de boot. (port BP 134babf)
+install_persistent_logs()
 
 # Type alias pentru orice signal generator (dispatch by strategy)
 SignalGen = IchimokuSignal | BBMeanReversionSignal
@@ -279,49 +286,6 @@ def _build_trade_extra(pos: LivePosition) -> dict:
 # Equity sync (INIT / CLOSE / HEARTBEAT)
 # ============================================================================
 
-async def sync_equity(reason: str = "MANUAL") -> None:
-    """
-    Bot Ichimoku citeste balance DIRECT de pe Bybit — single source of truth.
-    NU tine equity local prin compound (account += pnl) ca boilerplate.
-
-    La fiecare sync (INIT/CLOSE/HEARTBEAT):
-      - Pull balance real Bybit
-      - OVERWRITE _state.shared_equity = balance
-      - Append punct in equity_curve (pt chart)
-      - Anomaly detect: daca delta vs ultimul sync e neasteptat (>3%
-        fara trade inchis recent), alerta Telegram.
-    """
-    bal = await ex.get_balance()
-    if bal is None:
-        print(f"  [EQUITY-SYNC {reason}] FAILED — Bybit balance None")
-        return
-
-    prev = _state.shared_equity
-    _state.shared_equity = bal
-
-    if reason == "INIT":
-        _state.initial_account = bal
-        _state.equity_curve.clear()
-        _state.equity_curve.append({
-            "time": int(time.time()), "value": round(bal, 4),
-        })
-        print(f"  [EQUITY-SYNC INIT] account = ${bal:,.2f} (Bybit balance)")
-        return
-
-    # Append equity point — chart shows actual Bybit balance over time
-    _state.equity_curve.append({
-        "time": int(time.time()), "value": round(bal, 4),
-    })
-    if len(_state.equity_curve) > 50000:
-        _state.equity_curve.pop(0)
-
-    delta_pct = abs(bal - prev) / prev * 100 if prev > 0 else 0
-    print(f"  [EQUITY-SYNC {reason}] prev=${prev:,.2f}  bybit=${bal:,.2f}  "
-          f"delta={delta_pct:.2f}%")
-    log_event("equity_sync", reason=reason, prev=prev, bybit=bal,
-              delta_pct=delta_pct)
-
-
 # ============================================================================
 # Order pipeline
 # ============================================================================
@@ -349,14 +313,37 @@ async def open_position(symbol: str, direction: str, close_price: float,
     balance = await ex.get_balance()
     if balance is None:
         balance = _state.shared_equity
+        # WARNING (nu HALT): botul continua cu shared_equity ca fallback pt cap
+        # (mai putin sigur — cap-ul e menit sa protejeze exact impotriva unei
+        # shared_equity gresite). Alerta pierduta la eliminarea sync_equity()
+        # (dde71f3/953e04b) — singurul loc ramas unde get_balance() se citeste
+        # live; fara ea, esecul cap-ului e complet silentios.
+        try:
+            await tg.send_warning(
+                f"get_balance eșuat la entry {symbol} — cap pe shared_equity",
+                f"<b>get_balance a eșuat</b> (după 4 reîncercări).\n"
+                f"Cap-ul de siguranță folosește <code>shared_equity</code> local "
+                f"(${_state.shared_equity:,.2f}) în loc de balanța reală Bybit.",
+                symbol=symbol,
+            )
+        except Exception as e:
+            print(f"  [OPEN {symbol}] tg alert (get_balance fail) failed: {e!r}")
     sizing = compute_position_size(
         pair_cfg, _state.shared_equity, balance,
         CONFIG.portfolio, leverage=pair_cfg.leverage,
     )
-    if sizing.skip:
-        print(f"  [OPEN {symbol}] SKIP: {sizing.skip_reason}")
-        log_event("entry_skipped", symbol=symbol, reason=sizing.skip_reason)
-        return
+    # Cap pe margin disponibila (nu skip) — model BP qty_by_risk: pos_usd
+    # deja capat de compute_position_size daca cerea mai mult decat cap_usd.
+    # Intram cu pozitie MAI MICA, nu ratam trade-ul (risc dublu-lipsa daca alte
+    # perechi tin deja margin pe acelasi wallet — vezi incident live NEAR pe
+    # V4-HL 2026-07-17: cerere $178 vs cap $81 disponibil, inainte se sarea
+    # complet).
+    if sizing.capped:
+        print(f"  [OPEN {symbol}] CAPPED: pos_usd ${sizing.pos_usd:,.2f} "
+              f"(cap ${sizing.cap_usd:,.2f} — margin limitata, alte perechi "
+              f"tin deja capital pe wallet)")
+        log_event("entry_capped", symbol=symbol, pos_usd=sizing.pos_usd,
+                  cap_usd=sizing.cap_usd)
 
     info = await ex.get_market_info(symbol)
     qty_raw = sizing.pos_usd / close_price
@@ -378,9 +365,11 @@ async def open_position(symbol: str, direction: str, close_price: float,
     )
     if entry_result["result"] == "failed":
         print(f"  [OPEN {symbol}] maker_entry_or_market FAILED")
-        await tg.send_critical(f"OPEN FAILED — {symbol}",
-                               "maker_entry_or_market returned failed",
-                               symbol=symbol)
+        # WARNING, nu HALT: botul CONTINUA (niciun trade deschis, asteapta
+        # urmatorul semnal). HALT doar cand botul se opreste. (aliniat cu V4-HL)
+        await tg.send_warning(f"OPEN FAILED — {symbol}",
+                              "maker_entry_or_market returned failed",
+                              symbol=symbol)
         return
 
     # Pretul real de fill: pe maker pur, avg_price din ordin; pe mixed/taker,
@@ -440,6 +429,9 @@ async def open_position(symbol: str, direction: str, close_price: float,
     fill_emoji = {"maker": "🟢", "mixed": "🟡", "taker": "🔴"}.get(fill_kind, "⚪")
     tp_section = (f"🎯 <b>Take Profit:</b> <code>{ex.smart_price(tp_price)}</code>  "
                  f"<i>(Market atomic)</i>\n\n" if tp_price else "")
+    capped_line = (f"⚠️ <i>Poziție CAPATĂ — margin limitată "
+                   f"(alte perechi rulează pe același wallet)</i>\n"
+                   if sizing.capped else "")
     await tg.send(
         f"🚀 INTRARE: {direction} {tg.dir_emoji(direction)}",
         f"<b>Fill:</b>     {fill_emoji} <code>{fill_kind}</code>\n"
@@ -449,6 +441,7 @@ async def open_position(symbol: str, direction: str, close_price: float,
         f"<b>Risk:</b>     <code>${sizing.risk_usd:,.2f}</code>  "
         f"(<code>{pair_cfg.risk_pct_per_trade*100:.0f}%</code> × "
         f"<code>${_state.shared_equity:,.2f}</code>)\n"
+        f"{capped_line}"
         f"\n"
         f"{tp_section}"
         f"🛑 <b>Stop Loss:</b>   <code>{ex.smart_price(sl_price)}</code>  "
@@ -480,7 +473,8 @@ async def open_position(symbol: str, direction: str, close_price: float,
     if sl_geometry_bad:
         print(f"  [OPEN {symbol}] SL GEOMETRY INVALID: dir={direction} "
               f"entry={real_fill_price} sl={sl_price} — NU armez (fallback software)")
-        await tg.send_critical(
+        # WARNING, nu HALT: botul CONTINUA (pozitia ruleaza pe fallback software).
+        await tg.send_warning(
             "SL geometrie INVALIDĂ",
             f"<b>Direcție:</b> {direction}  "
             f"<b>Entry:</b> <code>{ex.smart_price(real_fill_price)}</code>  "
@@ -600,7 +594,9 @@ async def _sl_retry_loop(symbol: str, sl_price: float,
         sl_str = ex.smart_price(sl_price)
         tp_line = (f"🎯 <b>TP:</b> <code>{ex.smart_price(tp_price)}</code>\n"
                    if tp_price is not None else "")
-        await tg.send_critical(
+        # WARNING, nu HALT: botul CONTINUA (pozitia ruleaza pe fallback software
+        # SL_LONG/SHORT + reconcile la close). HALT doar cand botul se opreste.
+        await tg.send_warning(
             "SL/TP NESETAT" if tp_price is not None else "SL NESETAT",
             f"<b>set_position_sl A EȘUAT</b> după <code>{elapsed}s</code> de reîncercări\n"
             f"🛑 <b>SL:</b> <code>{sl_str}</code>\n"
@@ -611,7 +607,34 @@ async def _sl_retry_loop(symbol: str, sl_price: float,
             symbol=symbol,
         )
     except Exception as e:
-        print(f"  [{symbol}] SL timeout tg.send_critical failed: {e!r}")
+        print(f"  [{symbol}] SL timeout tg.send_warning failed: {e!r}")
+
+
+async def halt(symbol: str, reason: str, *, notify: bool = True) -> None:
+    """Opreste botul pe acest simbol (_halted[symbol]=True) + ANUNTA Telegram
+    critical. Foloseste ASTA in loc de `_halted[symbol] = True` direct →
+    garanteaza ca niciun halt nu e TACUT (sa afli in timp real, nu peste o luna).
+
+    notify=False cand alerta a fost deja trimisa upstream (ex reconcile →
+    _reconcile_close/_assert_closed a trimis deja send_critical cu detalii)
+    ca sa nu dublezi.
+
+    _halted NU se persista in bot_state.json: la REDEPLOY botul PORNESTE curat
+    (resume/reconcile re-detecteaza daca anomalia inca persista). E oprire pe
+    sesiunea curenta, nu blocaj permanent. (port BP halt() helper — 7098743)
+    """
+    _halted[symbol] = True
+    print(f"  [{symbol}] 🚨 HALTED: {reason}")
+    if notify:
+        try:
+            await tg.send_critical(
+                f"🚨 {BOT_NAME} HALTED — {symbol}",
+                f"{reason}\n\nBotul NU mai trada pe {symbol} pana la restart. "
+                f"La redeploy porneste curat.",
+                symbol=symbol,
+            )
+        except Exception as e:
+            print(f"  [{symbol}] halt Telegram send failed: {e}")
 
 
 async def _assert_closed(symbol: str, qty_local: float,
@@ -731,6 +754,41 @@ async def _reconcile_close(symbol: str, direction: str,
     return forced_reason
 
 
+def _dedup_and_record_trade(trade: TradeRecord) -> bool:
+    """
+    Dedup pe (symbol, entry_ts_ms) + record, intr-un singur pas — chemat DOAR
+    de langa _state.record_closed_trade (nu la intrarea in close_position/
+    close_pipeline_external). Model exact BP main_multi.py record_closed_trade:
+    dedup-ul e o proprietate a PASULUI DE RECORD, nu a intregului pipeline de
+    close (place_market/reconcile ruleaza NECONDITIONAT, ca la BP — dedup-ul
+    nu trebuie sa le gateze).
+
+    Previne double-record cand 2 cai concurente (semnal + WS fast-path /
+    defense-in-depth) ajung sa inregistreze ACELASI close. Curata pozitia
+    local NECONDITIONAT (dedup sau record real) — la BP, caller-ul (strategy
+    _close()/on_candle) face clear_active_position()/_in_trade=False dupa
+    ORICE return non-exceptie din record_closed_trade, indiferent de dedup.
+    Fara curatarea neconditionata, un dedup-hit lasa pozitia FANTOMA
+    PERMANENT: opened_ts_ms nu se schimba niciodata, deci ORICE close ulterior
+    re-loveste acelasi dedup la infinit (incident live 2026-07-11 TIAUSDT
+    stuck open dupa close manual pe Bybit).
+
+    Returneaza True daca a inregistrat efectiv (caller trimite Telegram/
+    reporter/broadcast), False daca a fost dedup (caller doar salveaza+return).
+    """
+    existing = next((t for t in reversed(_state.trades)
+                      if t.symbol == trade.symbol
+                      and t.entry_ts_ms == trade.entry_ts_ms), None)
+    if existing is not None:
+        print(f"  [RECORD {trade.symbol}] dedup: trade entry_ts={trade.entry_ts_ms} "
+              f"deja inregistrat (id={existing.id}) — skip duplicate, "
+              f"curat pozitia stale local")
+        _state.set_position(trade.symbol, None)
+        return False
+    _state.record_closed_trade(trade)
+    return True
+
+
 async def close_position(symbol: str, exit_reason: str,
                           target_price: float) -> None:
     """
@@ -752,9 +810,12 @@ async def close_position(symbol: str, exit_reason: str,
     check_external_close — acelea folosesc close_pipeline_external (qty=0
     deja confirmat, reconciliere redundanta).
 
-    Concurrent safety: lock + dedup pe entry_ts_ms previn double-record cand
-    Bybit fileaza SL/TP atomic in paralel (private WS task triggereaza si
-    close_pipeline_external pentru acelasi trade).
+    Concurrent safety: lock previne race pe acelasi simbol. Dedup pe
+    entry_ts_ms NU mai e aici (era gresit sa gateze place_market/reconcile) —
+    traiește langa _state.record_closed_trade, in _dedup_and_record_trade
+    (model BP main_multi.py record_closed_trade: dedup + curatare pozitie
+    decuplate de restul pipeline-ului, exact langa recordare, nu la intrarea
+    in functie).
     """
     async with _get_close_lock(symbol):
         pos = _state.get_position(symbol)
@@ -762,13 +823,6 @@ async def close_position(symbol: str, exit_reason: str,
             # Inchis deja de un alt coroutine (private WS / defense-in-depth).
             print(f"  [CLOSE {symbol}] no position — skip (already closed by other coroutine)")
             return
-        # Dedup explicit: daca un trade cu acelasi entry_ts deja inregistrat.
-        for existing in reversed(_state.trades):
-            if (existing.symbol == symbol
-                    and existing.entry_ts_ms == pos.opened_ts_ms):
-                print(f"  [CLOSE {symbol}] dedup: trade entry_ts={pos.opened_ts_ms} "
-                      f"deja inregistrat (id={existing.id}) — skip duplicate")
-                return
         await _close_position_locked(symbol, exit_reason, target_price, pos)
 
 
@@ -812,8 +866,9 @@ async def _close_position_locked(symbol: str, exit_reason: str,
         final_exit_reason = await _reconcile_close(
             symbol, pos.direction, pos.qty, exit_reason)
     except ReconciliationError as e:
-        print(f"  [{symbol}] HALT pe ReconciliationError: {e}")
-        _halted[symbol] = True
+        # Alerta detaliata deja trimisa upstream in _reconcile_close/_assert_closed
+        # → notify=False (evita dubla alerta).
+        await halt(symbol, f"reconciliere anormala: {e}", notify=False)
         log_event("reconcile_halt", symbol=symbol, reason=exit_reason, error=str(e))
         return
 
@@ -854,8 +909,10 @@ async def _close_position_locked(symbol: str, exit_reason: str,
         pnl=pnl_real, fees=fees_real,
         extra=extra,
     )
-    _state.record_closed_trade(trade)
+    recorded = _dedup_and_record_trade(trade)
     _state.save()
+    if not recorded:
+        return
     log_event("trade_closed", **trade.to_dict())
     # Dashboard: record trade closed (best-effort, exceptia nu blocheaza).
     reporter = _reporters.get(symbol)
@@ -864,7 +921,7 @@ async def _close_position_locked(symbol: str, exit_reason: str,
             # pnl_pct = % din initial_account (consistent cu BP — referential
             # equity, NU notional). Dashboard agreghaza pnl_pct across boti
             # asumand acelasi numitor.
-            init_acc = _state.initial_account
+            init_acc = _state.genesis_account
             pnl_pct = ((trade.pnl / init_acc * 100) if init_acc else None)
             # side: lowercase "long"/"short" (conventie dashboard, aceeasi ca
             # open_side din heartbeat). Try/except TypeError = backwards-compat
@@ -889,8 +946,8 @@ async def _close_position_locked(symbol: str, exit_reason: str,
     else:
         sign = tg.pnl_emoji(pnl_real)
 
-    ret_pct = ((_state.shared_equity - _state.initial_account)
-               / _state.initial_account * 100) if _state.initial_account else 0
+    ret_pct = ((_state.shared_equity - _state.genesis_account)
+               / _state.genesis_account * 100) if _state.genesis_account else 0
     # PnL label: cand fallback estimat (closed-pnl neindexat), aratam clar
     # ca nu e PnL Bybit real → user sti ca cifra e aproximativa.
     pnl_label = ("estimat — closed-pnl neindexat" if pnl_estimated
@@ -922,9 +979,6 @@ async def _close_position_locked(symbol: str, exit_reason: str,
     except Exception as e:
         print(f"  [CLOSE {symbol}] broadcast failed (best-effort): {e!r}")
 
-    # Post-close equity sync
-    await sync_equity(reason=f"CLOSE_{symbol}")
-
 
 # ============================================================================
 # Defense-in-depth: detect external close
@@ -951,14 +1005,7 @@ async def check_external_close(symbol: str) -> bool:
         # Position still exists — check no anomaly
         if qty_real > pos.qty + _RECONCILE_QTY_EPS:
             msg = f"qty_real={qty_real} > qty_local={pos.qty}"
-            print(f"  [{symbol}] RECONCILE HALT: {msg}")
-            await tg.send_critical(
-                f"{symbol} qty desync",
-                f"<b>Local:</b> {pos.qty}\n<b>Bybit:</b> {qty_real}\n"
-                f"Bot HALTED pe simbol. Verifică manual.",
-                symbol=symbol,
-            )
-            _halted[symbol] = True
+            await halt(symbol, f"qty desync — Local: {pos.qty}, Bybit: {qty_real}")
             raise ReconciliationError(msg)
         return False
 
@@ -990,21 +1037,16 @@ async def close_pipeline_external(symbol: str, exit_reason: str,
     Variant a close_position pt cazul cand pozitia NU mai e pe Bybit (deja
     inchisa extern). Skip place_market, doar fetch PnL + record + notify.
 
-    Concurrent safety: lock + dedup pe entry_ts_ms (acelasi mecanism ca
-    close_position) — apelat din private WS si din check_external_close
-    (defense-in-depth public WS); ambele pot observa qty=0 simultan.
+    Concurrent safety: lock previne race pe acelasi simbol. Dedup pe
+    entry_ts_ms traiește langa _state.record_closed_trade, in
+    _dedup_and_record_trade (vezi close_position pentru detaliu complet —
+    model BP main_multi.py record_closed_trade).
     """
     async with _get_close_lock(symbol):
         pos = _state.get_position(symbol)
         if pos is None:
             print(f"  [CLOSE-EXT {symbol}] no position — skip (already closed)")
             return
-        for existing in reversed(_state.trades):
-            if (existing.symbol == symbol
-                    and existing.entry_ts_ms == pos.opened_ts_ms):
-                print(f"  [CLOSE-EXT {symbol}] dedup: trade entry_ts="
-                      f"{pos.opened_ts_ms} deja inregistrat (id={existing.id}) — skip")
-                return
         await _close_pipeline_external_locked(symbol, exit_reason, target_price, pos)
 
 
@@ -1019,6 +1061,12 @@ async def _close_pipeline_external_locked(symbol: str, exit_reason: str,
     pnl_entry_ts = pos.adopt_ts_ms if pos.adopt_ts_ms is not None else pos.opened_ts_ms
     pnl_data = await ex.fetch_pnl_for_trade(symbol, pnl_entry_ts, now_ms)
     avg_exit = pnl_data.get("avg_exit") or target_price
+    # AUTO reason (fast-path on_position_event): deducem exit_reason din pretul
+    # REAL de exit (avg_exit din fills), NU dintr-un proxy (avg la momentul
+    # event-ului). Direction-aware. (model BP Bybit 9bd6bae)
+    if exit_reason == "AUTO":
+        exit_reason = _reason_from_exit(pos.direction, avg_exit,
+                                        pos.sl_price, pos.tp_price)
     pnl_real = pnl_data.get("pnl", 0.0)
     fees_real = pnl_data.get("fees", 0.0)
 
@@ -1043,8 +1091,10 @@ async def _close_pipeline_external_locked(symbol: str, exit_reason: str,
         pnl=pnl_real, fees=fees_real,
         extra=extra,
     )
-    _state.record_closed_trade(trade)
+    recorded = _dedup_and_record_trade(trade)
     _state.save()
+    if not recorded:
+        return
     log_event("trade_closed", **trade.to_dict())
     # Dashboard: record trade closed (best-effort, exceptia nu blocheaza).
     reporter = _reporters.get(symbol)
@@ -1053,7 +1103,7 @@ async def _close_pipeline_external_locked(symbol: str, exit_reason: str,
             # pnl_pct = % din initial_account (consistent cu BP — referential
             # equity, NU notional). Dashboard agreghaza pnl_pct across boti
             # asumand acelasi numitor.
-            init_acc = _state.initial_account
+            init_acc = _state.genesis_account
             pnl_pct = ((trade.pnl / init_acc * 100) if init_acc else None)
             # side: lowercase "long"/"short" (conventie dashboard, aceeasi ca
             # open_side din heartbeat). Try/except TypeError = backwards-compat
@@ -1073,8 +1123,8 @@ async def _close_pipeline_external_locked(symbol: str, exit_reason: str,
     # Icon ⚠️ pe EXTERNAL: defense-in-depth a sintetizat close-ul (Bybit a
     # inchis fara stiinta strategiei — verifica de ce). Altfel pnl_emoji.
     sign = "⚠️" if exit_reason == "EXTERNAL" else tg.pnl_emoji(pnl_real)
-    ret_pct = ((_state.shared_equity - _state.initial_account)
-               / _state.initial_account * 100) if _state.initial_account else 0
+    ret_pct = ((_state.shared_equity - _state.genesis_account)
+               / _state.genesis_account * 100) if _state.genesis_account else 0
     # Best-effort: tg + broadcast nu blocheaza state cleanup.
     try:
         await tg.send(
@@ -1098,7 +1148,6 @@ async def _close_pipeline_external_locked(symbol: str, exit_reason: str,
                          "equity_point": eq_point})
     except Exception as e:
         print(f"  [CLOSE-EXT {symbol}] broadcast failed (best-effort): {e!r}")
-    await sync_equity(reason=f"CLOSE_{symbol}")
 
 
 # ============================================================================
@@ -1120,6 +1169,16 @@ async def on_confirmed_bar(symbol: str, bar: dict) -> None:
             return  # handled, don't evaluate this bar
     except ReconciliationError:
         return  # halted
+
+    # Defense-in-depth (INVERS): local FLAT dar exchange are pozitie
+    # NETRACKUITA — adopta ACUM, inainte de a evalua un entry nou (altfel
+    # am dubla pozitia). Vezi _maybe_adopt_untracked_position pt context
+    # complet (port BP maybe_adopt_untracked_position).
+    if _state.get_position(symbol) is None:
+        pair_cfg_cur = next((p for p in CONFIG.pairs if p.symbol == symbol), None)
+        if pair_cfg_cur is not None and await _maybe_adopt_untracked_position(
+                symbol, pair_cfg_cur):
+            return  # adoptat SAU halted — sarim bara asta
 
     # ORDINE BROADCAST: candle + indicators FIRST, apoi strategy decisions.
     # Asta garanteaza ca chart-ul are bara curenta in CANDLES inainte sa
@@ -1157,12 +1216,21 @@ async def on_confirmed_bar(symbol: str, bar: dict) -> None:
     pos_dir = pos.direction.lower() if pos else None
     entry_px = pos.entry_price if pos else 0.0
 
-    # Increment bars_held pe pozitia activa (folosit la BB MR time-exit)
-    if pos is not None:
-        pos.bars_held += 1
-
     if isinstance(sig, BBMeanReversionSignal):
-        bars_held = pos.bars_held if pos else 0
+        # bars_held DERIVAT din opened_ts_ms (nr bare intre bara-entry si bara
+        # curenta) + 1, NU contor in-memory. Contorul se pierdea la restart
+        # (bars_held=0 la adopt, main.py:1702) → time-exit ratat cat botul restarta.
+        # Derivarea e restart-proof FARA persistenta: la adopt opened_ts_ms =
+        # created_ms Bybit (ora reala a deschiderii). +1 pt paritate Pine
+        # (opened_ts_ms = wall-clock ~= close-ul barei-semnal S = ancora S+1, cu
+        # o bara in urma barei-semnal S; fara +1 time-exit ar iesi la 41 bare, nu 40).
+        if pos is not None and pos.opened_ts_ms:
+            iv_ms = nl.interval_ms(_TF_INTERVAL)
+            entry_bar = nl.current_bar_open_ms(pos.opened_ts_ms, _TF_INTERVAL)
+            bars_held = max(0, int((bar["ts_ms"] - entry_bar) / iv_ms)) + 1
+            pos.bars_held = bars_held      # sync field pt UI/dashboard
+        else:
+            bars_held = 0
         decision = sig.evaluate(has_position=pos_dir, entry_price=entry_px,
                                  bars_held=bars_held)
     else:
@@ -1265,6 +1333,12 @@ async def _public_ws_run() -> None:
     # endpoint-uri il asteapta), (3) watchdog pe last_msg_ts (force close daca
     # nu vine niciun mesaj > WS_ZOMBIE_TIMEOUT). Toate → except → reconnect.
     ws_zombie_timeout = int(os.getenv("WS_ZOMBIE_TIMEOUT", "60"))
+    # Per-symbol staleness: last_msg_ts e connection-level (resetat de ORICE
+    # simbol) → un singur topic mort printre altele vii NU e prins (ceilalti tin
+    # timerul proaspat). Track separat per simbol. Prag generos (default 300s) ca
+    # sa NU dea reconnect fals pe simboluri mai putin active — un fals ar pica
+    # TOATE simbolurile de pe conexiune. (analog BP-Bybit 1f9874b / Gate fdfb9d6)
+    sym_stale_timeout = int(os.getenv("WS_SYMBOL_STALE_TIMEOUT", "300"))
     while True:
         try:
             async with websockets.connect(url, ping_interval=20,
@@ -1279,6 +1353,9 @@ async def _public_ws_run() -> None:
                     _sync_done[s] = False
 
                 last_msg_ts = time.time()
+                # Per-symbol liveness — reset la fiecare (re)conectare.
+                _now0 = time.time()
+                last_sym_ts = {s: _now0 for s in enabled}
 
                 async def _hb():
                     while True:
@@ -1291,11 +1368,27 @@ async def _public_ws_run() -> None:
                 async def _watchdog():
                     while True:
                         await asyncio.sleep(10)
-                        idle = time.time() - last_msg_ts
+                        now = time.time()
+                        idle = now - last_msg_ts
                         if idle > ws_zombie_timeout:
                             print(f"  [WS-PUB] ZOMBIE detected: no msg "
                                   f"{idle:.0f}s > {ws_zombie_timeout}s — "
                                   f"forcing close → reconnect")
+                            try:
+                                await ws.close()
+                            except Exception:
+                                pass
+                            return
+                        # Per-symbol: un singur topic mort (conexiunea + restul
+                        # simbolurilor vii) → last_msg_ts ramane proaspat, dar
+                        # ACEST simbol nu mai primeste kline. Reconnect (resub tot).
+                        sym_stale = [(s, now - t) for s, t in last_sym_ts.items()
+                                     if now - t > sym_stale_timeout]
+                        if sym_stale:
+                            for s, age in sym_stale:
+                                print(f"  [WS-PUB] SYMBOL STALE {s}: {age:.0f}s > "
+                                      f"{sym_stale_timeout}s — forcing close → "
+                                      f"reconnect")
                             try:
                                 await ws.close()
                             except Exception:
@@ -1314,6 +1407,7 @@ async def _public_ws_run() -> None:
                         if not topic.startswith("kline."):
                             continue
                         symbol = topic.split(".")[-1]
+                        last_sym_ts[symbol] = time.time()   # per-symbol liveness
                         for k in msg.get("data", []):
                             confirmed = bool(k.get("confirm", False))
                             ts_ms = int(k["start"])
@@ -1391,13 +1485,33 @@ async def _public_ws_run() -> None:
 # Private WS handlers
 # ============================================================================
 
+def _reason_from_exit(direction: str, exit_px: float, sl_price: float,
+                      tp_price: Optional[float], tol: float = 0.01) -> str:
+    """Deduce exit_reason din pretul REAL de exit (avg_exit din fills), ca
+    Gate/VSE/BP. DIRECTION-AWARE: LONG → SL sub (exit <= sl), TP peste
+    (exit >= tp); SHORT invers. Mid-range → EXTERNAL. Naming V4 (BYBIT_SL/
+    BYBIT_TP/EXTERNAL) pastrat pt consistenta dashboard/Telegram."""
+    if exit_px <= 0:
+        return "EXTERNAL"
+    if direction == "LONG":
+        if sl_price and exit_px <= sl_price * (1 + tol):
+            return "BYBIT_SL"
+        if tp_price and exit_px >= tp_price * (1 - tol):
+            return "BYBIT_TP"
+    else:   # SHORT
+        if sl_price and exit_px >= sl_price * (1 - tol):
+            return "BYBIT_SL"
+        if tp_price and exit_px <= tp_price * (1 + tol):
+            return "BYBIT_TP"
+    return "EXTERNAL"
+
+
 async def on_position_event(event: dict) -> None:
     """
     Detect Bybit-side close (SL/TP atomic trigger) sau external close.
 
-    Eveniment cu size=0 dupa ce local has_position → trigger close pipeline.
-    Distinctia BYBIT_SL vs BYBIT_TP se face prin avgPrice proximity to
-    sl_price vs tp_price.
+    Eveniment cu size=0 dupa ce local has_position → trigger close pipeline cu
+    exit_reason="AUTO" → dedus din avg_exit REAL in _close_pipeline_external_locked.
     """
     symbol = event.get("symbol", "")
     size = float(event.get("size", 0) or 0)
@@ -1414,16 +1528,11 @@ async def on_position_event(event: dict) -> None:
     if pos is None:
         return  # already closed locally
 
-    # Determine reason based on price proximity (sl vs tp)
-    if pos.tp_price and abs(avg - pos.tp_price) / pos.tp_price < 0.005:
-        reason = "BYBIT_TP"
-    elif abs(avg - pos.sl_price) / pos.sl_price < 0.005:
-        reason = "BYBIT_SL"
-    else:
-        reason = "EXTERNAL"
-
-    print(f"  [{symbol}] private WS detected close: avg={avg} → {reason}")
-    await close_pipeline_external(symbol, reason, target_price=avg or pos.entry_price)
+    # Fast-path: pasam "AUTO" → reason dedus din avg_exit REAL (media ponderata a
+    # fill-urilor de inchidere) in _close_pipeline_external_locked, NU dintr-un
+    # proxy (avg de aici = doar ULTIMUL fill/event). (model BP Bybit 9bd6bae)
+    print(f"  [{symbol}] fast-path close pe fill: avg={avg} → reason AUTO (din avg_exit)")
+    await close_pipeline_external(symbol, "AUTO", target_price=avg or pos.entry_price)
 
 
 async def on_order_event(event: dict) -> None:
@@ -1494,10 +1603,6 @@ async def heartbeat_loop() -> None:
         next_close = _next_bar_close_ms(now_ms)
         sleep_s = max(1, (next_close - 60_000 - now_ms) / 1000)
         await asyncio.sleep(sleep_s)
-        try:
-            await sync_equity(reason="HEARTBEAT")
-        except Exception as e:
-            print(f"  [HEARTBEAT] sync failed: {e}")
         _send_reporter_heartbeat()
 
 
@@ -1525,6 +1630,137 @@ async def periodic_reporter_heartbeat() -> None:
 
 
 # ============================================================================
+# Adopt helper — partajat intre bootstrap() (resume la boot) si
+# _maybe_adopt_untracked_position() (defense-in-depth runtime)
+# ============================================================================
+
+async def _try_adopt_position(sym: str, pair_cfg, bybit_pos: dict,
+                              sig) -> Optional["LivePosition"]:
+    """Adopta o pozitie gasita pe exchange, dupa STRAT 1 (are SL) + STRAT 2
+    (geometrie SL vs pret curent) guards. Pe refuz: seteaza _halted[sym]=True
+    + trimite Telegram warning, returneaza None. Pe succes: construieste
+    LivePosition, o pune in _state, returneaza obiectul.
+
+    Extras din bootstrap() (resume la boot) ca sa fie reutilizabil si de
+    _maybe_adopt_untracked_position() (adopt runtime, defense-in-depth —
+    port BP maybe_adopt_untracked_position).
+    """
+    entry_px = bybit_pos["entry_price"]
+    qty_real = bybit_pos["qty"]
+    dir_real = bybit_pos["direction"]
+    sl_real  = bybit_pos["sl_price"]
+    tp_real  = bybit_pos["tp_price"]
+    has_bybit_sl = sl_real is not None and sl_real > 0
+
+    # STRAT 1 — Refuz adopt daca Bybit NU are SL setat.
+    if not has_bybit_sl:
+        await halt(
+            sym,
+            f"Poziție {dir_real} qty={qty_real} @ {ex.smart_price(entry_px)} "
+            f"FĂRĂ SL pe Bybit (stopLoss=0) — risc indefinit, defense-in-depth "
+            f"oprit, expusă la lichidare. NU o adopt. Setează SL manual pe Bybit "
+            f"App (recomandat: entry × (1 ± {pair_cfg.effective_sl_pct*100:.1f}%)) "
+            f"SAU închide poziția manual, apoi redeploy.")
+        return None
+
+    # STRAT 2 — Refuz adopt daca SL e pe partea GRESITA fata de PRETUL CURENT
+    # (last_close), NU fata de entry (breakeven/profit-lock e legitim).
+    last_close = float(sig.df.iloc[-1]["close"]) if len(sig.df) else 0.0
+    if last_close > 0 and (
+            (dir_real == "LONG" and sl_real >= last_close) or
+            (dir_real == "SHORT" and sl_real <= last_close)):
+        await halt(
+            sym,
+            f"Poziție {dir_real} cu SL={ex.smart_price(sl_real)} pe partea "
+            f"GREȘITĂ față de prețul curent {ex.smart_price(last_close)} "
+            f"(s-ar declanșa instant) — NU o adopt. Verifică manual poziția pe "
+            f"Bybit App (corectează SL sau închide), apoi redeploy.")
+        return None
+
+    # Bybit are SL → adoptie normala
+    pos_usd = qty_real * entry_px
+    risk_usd = pos_usd * pair_cfg.effective_sl_pct
+    opened_ts = bybit_pos["created_ms"] or int(time.time() * 1000)
+    adopt_ts = int(time.time() * 1000)
+    resumed = LivePosition(
+        symbol=sym,
+        side=("Buy" if dir_real == "LONG" else "Sell"),
+        direction=dir_real,
+        qty=qty_real,
+        entry_price=entry_px,
+        sl_price=sl_real,
+        tp_price=tp_real,
+        leverage=pair_cfg.leverage,
+        pos_usd=pos_usd,
+        risk_usd=risk_usd,
+        opened_ts_ms=opened_ts,
+        order_id="",
+        strategy=pair_cfg.strategy,
+        bars_held=0,
+        sl_armed=True,
+        adopt_ts_ms=adopt_ts,
+    )
+    _state.set_position(sym, resumed)
+    print(f"  [{sym}] adopt: pos adoptata ({dir_real} qty={qty_real} "
+          f"entry={entry_px} sl={sl_real})")
+    return resumed
+
+
+async def _maybe_adopt_untracked_position(symbol: str, pair_cfg) -> bool:
+    """Defense-in-depth: daca local FLAT dar exchange are o pozitie
+    NETRACKUITA, adopta ACUM (acelasi path ca la boot: STRAT1/STRAT2 din
+    _try_adopt_position). Sari entry-ul nou daca a adoptat SAU a intrat in
+    halt (altfel am dubla pozitia / am ignora halt-ul). Cheama din
+    on_confirmed_bar cand local flat, INAINTE de entry.
+
+    Root cause BP (fill de entry PENDING-TRIGGER pierdut in fereastra de
+    disconnect WS — WS la reconnect doar re-subscrie, nu reda evenimente
+    pierdute) NU se aplica direct la V4: entry-ul e SINCRON
+    (maker_entry_or_market poll REST direct pe orderStatus, nu WS). Plasa
+    ramane utila insa ca defense-in-depth generic: intre fill confirmat si
+    _state.set_position (main.py open_position) sunt ~140 linii (SL
+    placement + Telegram) — daca ceva pica acolo FARA sa crape procesul,
+    pozitia ramane netrackuita local desi exista REAL pe exchange. (port
+    BP maybe_adopt_untracked_position — e2803e1)
+
+    Returns True daca a adoptat SAU a halted (caller sare peste bara asta).
+    """
+    if _state.get_position(symbol) is not None or _halted.get(symbol):
+        return False
+    try:
+        bybit_pos = await ex.fetch_open_position(symbol)
+    except Exception as e:
+        print(f"  [{symbol}] adopt-untracked: fetch fail: {e!r}")
+        return False
+    if bybit_pos is None:
+        return False
+
+    print(f"  [{symbol}] ⚠️ pozitie NETRACKUITĂ pe Bybit (fill entry pierdut?) "
+          f"— adopt")
+    sig = _signals[symbol]
+    resumed = await _try_adopt_position(symbol, pair_cfg, bybit_pos, sig)
+    if resumed is None:
+        return True  # refuzat + halted, deja alertat in _try_adopt_position
+
+    sl_str = f"<code>{ex.smart_price(resumed.sl_price)}</code>" if resumed.sl_price else "—"
+    tp_str = f"<code>{ex.smart_price(resumed.tp_price)}</code>" if resumed.tp_price else "—"
+    try:
+        await tg.send_warning(
+            "♻️ POZIȚIE NETRACKUITĂ ADOPTATĂ",
+            f"<b>Direcție:</b> {tg.dir_emoji(resumed.direction)} {resumed.direction}  "
+            f"<b>Qty:</b> <code>{resumed.qty}</code>\n"
+            f"<b>Entry:</b> <code>{ex.smart_price(resumed.entry_price)}</code>\n"
+            f"<b>SL:</b> {sl_str}  <b>TP:</b> {tp_str}\n"
+            f"Fill de entry pierdut la reconnect WS? Verifică manual dacă "
+            f"a fost intenționat.",
+            symbol=symbol,
+        )
+    except Exception as e:
+        print(f"  [{symbol}] adopt-untracked tg failed: {e!r}")
+    return True
+
+
+# ============================================================================
 # Bootstrap
 # ============================================================================
 
@@ -1543,6 +1779,10 @@ async def bootstrap() -> None:
     # Colectam pozitiile adoptate la resume; Telegram POZITIE GASITA se trimite
     # DUPA "BOT PORNIT" (UX: user vede intai ca bot-ul s-a pornit, apoi pozitiile).
     _resume_announce: list[tuple] = []
+    # Pozitii persistate dar inchise EXTERN cat botul era jos (exchange flat la
+    # boot). Le inregistram (PnL din fills + Telegram + DB) DUPA init reporter,
+    # NU le stergem silentios. Vezi procesarea de dupa init reporter.
+    _offline_closed: list[str] = []
 
     for pair_cfg in CONFIG.pairs:
         if not pair_cfg.enabled:
@@ -1615,102 +1855,81 @@ async def bootstrap() -> None:
             _last_synced_ts[sym] = int(bars[-1][0]) // 1000
             print(f"  [{sym}] warmup {len(bars)} bars  last={df.index[-1]}")
         else:
-            print(f"  [{sym}] FATAL: warmup esuat dupa 4 retry-uri — halt simbol")
-            _halted[sym] = True
-            try:
-                await tg.send_critical(
-                    f"{sym} warmup eșuat",
-                    f"<b>get_kline</b> returnează 0 bare după 4 reîncercări "
-                    f"(~17s total).\n"
-                    f"<b>Stare bot:</b> simbolul e HALTAT — restul perechilor "
-                    f"rulează normal.\nVerifică connectivitate Bybit și redeploy.",
-                    symbol=sym,
-                )
-            except Exception:
-                pass
+            await halt(
+                sym,
+                "get_kline returnează 0 bare după 4 reîncercări (~17s total). "
+                "Verifică conectivitate Bybit și redeploy.")
             continue  # skip restul setup-ului pt acest simbol
 
         # Boot-time resume: V4 NU persista LivePosition in bot_state.json (doar
         # trades + equity). Single source of truth pt pozitii active = Bybit.
         # Scanam Bybit, dar Telegram POZITIE GASITA se trimite DUPA "BOT PORNIT"
         # (vezi mai jos) — colectam aici in _resume_announce.
-        bybit_pos = await ex.fetch_open_position(sym)
-        if bybit_pos is not None:
-            entry_px = bybit_pos["entry_price"]
-            qty_real = bybit_pos["qty"]
-            dir_real = bybit_pos["direction"]
-            sl_real  = bybit_pos["sl_price"]
-            tp_real  = bybit_pos["tp_price"]
-            has_bybit_sl = sl_real is not None and sl_real > 0
-
-            # STRAT 1 — Refuz adopt daca Bybit NU are SL setat.
-            # Scenariu suspect: cineva a deschis manual SAU bot anterior a
-            # esuat la set_position_sl + reconcilierile au omis. NU adoptam
-            # local — alerta CRITICA, user decide (close manual sau add SL pe
-            # Bybit App, apoi restart). Strategia continua in stadiul "no
-            # position" si poate genera trade nou pe semnal — risc dublu-pozitie
-            # pe care user trebuie sa-l gestioneze manual.
-            if not has_bybit_sl:
-                print(f"  [{sym}] resume: REFUZ ADOPT — Bybit qty={qty_real} "
-                      f"FARA SL setat (suspect: manual sau bot fail)")
-                try:
-                    await tg.send_critical(
-                        "POZIȚIE FĂRĂ SL — refuz adoptie",
-                        f"<b>Pe Bybit:</b> {tg.dir_emoji(dir_real)} {dir_real}  "
-                        f"<b>Qty:</b> <code>{qty_real}</code>  "
-                        f"<b>Entry:</b> <code>{ex.smart_price(entry_px)}</code>\n"
-                        f"<b>SL Bybit:</b> <code>NESETAT</code>\n"
-                        f"\n"
-                        f"<b>Acțiune:</b>\n"
-                        f"  1. Setează SL manual pe Bybit App (recomandat: "
-                        f"entry × (1 ± <code>{pair_cfg.effective_sl_pct*100:.1f}%</code>)),\n"
-                        f"  2. SAU închide poziția manual,\n"
-                        f"  3. Apoi redeploy bot.\n"
-                        f"\n"
-                        f"<b>Stare bot:</b> NU adoptă local. Strategia poate "
-                        f"genera trade nou pe semnal — risc dublă-poziție.",
-                        symbol=sym,
-                    )
-                except Exception as e:
-                    print(f"  [{sym}] resume tg.send_critical failed: {e!r}")
-                # NU adoptam — continuam la urmatorul simbol
+        try:
+            bybit_pos = await ex.fetch_open_position(sym)
+        except Exception as e:
+            # Blip API tranzitoriu la boot NU trebuie sa crape tot bootstrap-ul
+            # SI NU trebuie tratat ca "flat" (ar phantom-inchide o pozitie VIE →
+            # risc dublu-expunere daca strategia re-intra pe semnal). Skip acest
+            # simbol — starea persistata ramane neatinsa, se re-verifica normal
+            # la runtime (check_external_close pe bara urmatoare). (model BP-Gate
+            # #3 phantom offline-close, adaptat: aici gap-ul era lipsa try/except.)
+            print(f"  [{sym}] resume: fetch_open_position EXCEPTION ({e!r}) — "
+                  f"API incert, SKIP resume pt acest simbol (stare persistata neatinsa)")
+            continue
+        if bybit_pos is None and _state.get_position(sym) is not None:
+            # Exchange (raspuns normal) zice FLAT, dar avem pozitie persistata.
+            # NU presupunem offline-close direct: docstring-ul fetch_open_position
+            # spune explicit "None ... sau pe error" — un raspuns gol/malformat
+            # tranzitoriu (NU exceptie) ar produce acelasi None — phantom-close pe
+            # o pozitie VIE (audit BP-Gate #3). Confirmam STRICT multi-attempt
+            # inainte de a trata ca inchisa cu adevarat.
+            confirmed = await ex.confirm_position_closed(sym, attempts=3, delay=1.5)
+            if confirmed is None:
+                print(f"  [{sym}] resume: confirm_position_closed API incert dupa "
+                      f"3 incercari — NU presupun offline-close (risc dublu-expunere). "
+                      f"SKIP, stare persistata neatinsa.")
                 continue
+            if confirmed is False:
+                # Anomalie: fetch initial a zis flat, dar confirm zice INCA
+                # deschisa. Re-incercam fetch o data — daca reuseste acum,
+                # cade prin la adopt normal mai jos (NU offline-close).
+                print(f"  [{sym}] resume: ANOMALIE — fetch initial flat dar "
+                      f"confirm_position_closed zice INCA deschisa. Re-fetch...")
+                try:
+                    bybit_pos = await ex.fetch_open_position(sym)
+                except Exception as e:
+                    bybit_pos = None
+                    print(f"  [{sym}] resume: re-fetch dupa anomalie a EȘUAT "
+                          f"({e!r}) — SKIP, stare persistata neatinsa.")
+                    continue
+                if bybit_pos is None:
+                    print(f"  [{sym}] resume: re-fetch tot None dupa anomalie — "
+                          f"SKIP, stare persistata neatinsa.")
+                    continue
+                # bybit_pos populat acum → NU continue, cade la blocul de adopt
+                # normal de mai jos (if bybit_pos is not None).
+            else:
+                # confirmed True — genuinely flat. Inchisa EXTERN (manual/SL/TP)
+                # cat botul era jos. NU stergem silentios (s-ar pierde trade-ul
+                # din Telegram + dashboard DB). O pastram in _state si o
+                # inregistram via close_pipeline_external DUPA init reporter
+                # (PnL real din fills). Colectam aici, procesam mai jos.
+                print(f"  [{sym}] resume: exchange flat (confirmat) + pozitie "
+                      f"persistata → inchisa extern cat botul era jos; "
+                      f"inregistrez close dupa init reporter.")
+                _offline_closed.append(sym)
+                continue
+        if bybit_pos is not None:
+            resumed = await _try_adopt_position(sym, pair_cfg, bybit_pos, sig)
+            if resumed is not None:
+                # Stocam datele pentru Telegram dupa "BOT PORNIT"
+                _resume_announce.append((sym, pair_cfg, resumed))
 
-            # Bybit are SL → adoptie normala
-            pos_usd = qty_real * entry_px
-            risk_usd = pos_usd * pair_cfg.effective_sl_pct
-            # opened_ts_ms = createdMs Bybit (chart entry line afisata la
-            # momentul real al deschiderii). adopt_ts_ms = now (folosit pentru
-            # fetch_pnl_for_trade window la close → exclude piramidari vechi
-            # inchise INAINTE de adopt).
-            opened_ts = bybit_pos["created_ms"] or int(time.time() * 1000)
-            adopt_ts = int(time.time() * 1000)
-            resumed = LivePosition(
-                symbol=sym,
-                side=("Buy" if dir_real == "LONG" else "Sell"),
-                direction=dir_real,
-                qty=qty_real,
-                entry_price=entry_px,
-                sl_price=sl_real,
-                tp_price=tp_real,
-                leverage=pair_cfg.leverage,
-                pos_usd=pos_usd,
-                risk_usd=risk_usd,
-                opened_ts_ms=opened_ts,
-                order_id="",
-                strategy=pair_cfg.strategy,
-                bars_held=0,
-                sl_armed=True,
-                adopt_ts_ms=adopt_ts,
-            )
-            _state.set_position(sym, resumed)
-            print(f"  [{sym}] resume: pos adoptata ({dir_real} qty={qty_real} "
-                  f"entry={entry_px} sl={sl_real})")
-            # Stocam datele pentru Telegram dupa "BOT PORNIT"
-            _resume_announce.append((sym, pair_cfg, resumed))
-
-    # INIT equity sync
-    await sync_equity(reason="INIT")
+    # NU mai exista sync_equity(INIT): shared_equity e compound local (model
+    # BP Bybit), deja corect din _state.load() (persistat) — nu se re-citeste
+    # balanta live la boot. Prima pornire vreodata (fara state.json) porneste
+    # de la genesis_account (ACCOUNT_SIZE) via BotState.__init__.
 
     # Init bot_reporter per pereche (dashboard agregat). Fail-safe: orice eroare
     # → reporter dezactivat pe acel simbol, restul continua. Disable explicit
@@ -1768,13 +1987,20 @@ async def bootstrap() -> None:
         f"⏰ <b>Pornit initial:</b> <code>{tg.fmt_time(_state.start_utc)}</code>\n"
         f"🔄 <b>Restart la:</b>     <code>{tg.fmt_time(restart_at)}</code>\n"
     )
+    # Capital actual + % diferenta fata de genesis (💚 pozitiv / ❤️ negativ;
+    # Telegram HTML n-are culoare text → inima verde/rosie). (model BP cf29de2)
+    _cap_pct = ((_state.shared_equity - _state.genesis_account)
+                / _state.genesis_account * 100) if _state.genesis_account else 0.0
+    _cap_pct_str = (f" (💚 +{_cap_pct:.1f}%)" if _cap_pct > 0
+                    else f" (❤️ {_cap_pct:.1f}%)" if _cap_pct < 0 else "")
     await tg.send(
         "BOT PORNIT ✅ (multi-pair)",
-        f"🧠 <b>Strategies:</b>   <code>multi (BB MR + Hull+Ichimoku)</code>\n"
-        f"🪙 <b>Pairs:</b>        {pairs_label}\n"
-        f"📊 <b>Account init:</b> <code>${_state.initial_account:,.2f}</code>\n"
+        f"🧠 <b>Strategies:</b>      <code>multi (BB MR + Hull+Ichimoku)</code>\n"
+        f"🪙 <b>Pairs:</b>           {pairs_label}\n"
+        f"📊 <b>Capital inițial:</b> <code>${_state.genesis_account:,.2f}</code>\n"
+        f"💰 <b>Capital actual:</b>  <code>${_state.shared_equity:,.2f}</code>{_cap_pct_str}\n"
         f"{time_lines}"
-        f"🌐 <b>Chart:</b>        port <code>{CHART_HOST_PORT}</code>",
+        f"🌐 <b>Chart:</b>           port <code>{CHART_HOST_PORT}</code>",
     )
 
     # Eveniment dashboard (linie verticala pe equity chart):
@@ -1811,6 +2037,30 @@ async def bootstrap() -> None:
         except Exception as e:
             print(f"  [{sym}] resume tg.send failed (best-effort): {e!r}")
 
+    # Offline-close drain: pozitii persistate dar inchise EXTERN cat botul era
+    # jos (colectate in bucla de resume la _offline_closed). Le procesam ABIA
+    # AICI — DUPA init reporter (close_pipeline_external scrie in DB via
+    # _reporters.get(sym), care era None in bucla de sus, init dupa warmup) SI
+    # DUPA "BOT PORNIT" (ordine UX: user vede intai ca bot-ul a pornit, apoi
+    # "TRADE ÎNCHIS" pt pozitiile inchise extern — nu invers). Fara acest drain,
+    # close-ul amanat s-ar pierde: trade neinregistrat (fara PnL/DB/Telegram)
+    # SI pozitie fantoma ramasa in state (record_closed_trade n-ar rula → nu
+    # s-ar curata). target_price = fallback (fills dau avg_exit real); ultimul
+    # close din warmup, altfel entry.
+    for sym in _offline_closed:
+        if _state.get_position(sym) is None:
+            continue  # deja procesata (dedup/race)
+        sig = _signals.get(sym)
+        last_close = (float(sig.df.iloc[-1]["close"])
+                      if sig is not None and len(sig.df)
+                      else _state.get_position(sym).entry_price)
+        try:
+            await close_pipeline_external(sym, exit_reason="EXTERNAL",
+                                          target_price=last_close)
+            print(f"  [{sym}] offline-close inregistrat (PnL fills + DB + Telegram)")
+        except Exception as e:
+            print(f"  [{sym}] offline-close FAILED: {e!r} — pozitia ramane in state")
+
 
 # ============================================================================
 # FastAPI app + lifespan
@@ -1827,17 +2077,29 @@ async def lifespan(app: FastAPI):
     # Spawn background tasks (memory_monitor inclusiv — pre-OOM Telegram alert
     # cand RSS > MEM_MON_RSS_ALERT_MB; SIGKILL/OOM NU invoca excepthook,
     # singura fereastra de notification e PRE-kill via monitor).
+    # Task-urile de fundal ruleaza sub `supervise`: daca un task MOARE (exceptie
+    # in afara buclei interne de reconnect — cauza incidentului NEAR 07-08 pe
+    # V4-HL, WS mort silentios ore intregi, fara Telegram, fara restart),
+    # primesti Telegram cu traceback + auto-restart. WARNING, nu HALT — se
+    # auto-vindeca. (model BP Bybit f85012e)
     tasks = [
-        asyncio.create_task(public_ws_loop()),
-        asyncio.create_task(pws.run(on_order=on_order_event,
-                                     on_execution=on_execution_event,
-                                     on_position=on_position_event)),
-        asyncio.create_task(heartbeat_loop()),
-        asyncio.create_task(memory_monitor(BOT_NAME, tg_alert=tg.send_critical)),
+        asyncio.create_task(supervise("bybit_ws", public_ws_loop,
+                                      tg_alert=tg.send_warning)),
+        asyncio.create_task(supervise("private_ws", lambda: pws.run(
+            on_order=on_order_event,
+            on_execution=on_execution_event,
+            on_position=on_position_event,
+        ), tg_alert=tg.send_warning)),
+        asyncio.create_task(supervise("heartbeat", heartbeat_loop,
+                                      tg_alert=tg.send_warning)),
+        asyncio.create_task(supervise("memory_monitor",
+            lambda: memory_monitor(BOT_NAME, tg_alert=tg.send_warning),
+            tg_alert=tg.send_warning)),
         # Periodic heartbeat pt dashboard — 30s default, independent de bare.
         # Pe TF 4h, heartbeat_loop pe bara = 1×/4h → dashboard threshold (5-10min)
         # depasit intre bare → bot apare 'dead'. Acest task tine bot 'alive' in UI.
-        asyncio.create_task(periodic_reporter_heartbeat()),
+        asyncio.create_task(supervise("reporter_heartbeat", periodic_reporter_heartbeat,
+                                      tg_alert=tg.send_warning)),
     ]
     try:
         yield
@@ -1853,8 +2115,8 @@ async def lifespan(app: FastAPI):
         for t in tasks:
             t.cancel()
         try:
-            ret_pct = ((_state.shared_equity - _state.initial_account)
-                       / _state.initial_account * 100) if _state.initial_account else 0
+            ret_pct = ((_state.shared_equity - _state.genesis_account)
+                       / _state.genesis_account * 100) if _state.genesis_account else 0
             await tg.send(
                 "BOT OPRIT 🛑",
                 f"🧠 <b>Strategies:</b> <code>multi (BB MR + Hull+Ichimoku)</code>\n"
@@ -1989,14 +2251,32 @@ async def api_resume(token: str = ""):
 
 @app.post("/api/stop")
 async def api_stop(token: str = ""):
-    """Stop = pauza + market-close TOATE pozitiile active."""
+    """Stop = pauza + market-close TOATE pozitiile active, inregistrate IMEDIAT
+    ca DASHBOARD_STOP (close_position → PnL real din fills + DB + Telegram).
+
+    Ordinea mesajelor Telegram (model BP 7b03a64): "Bot OPRIT" INAINTE de
+    "TRADE ÎNCHIS" per simbol — trimitem "Bot OPRIT" ACUM, apoi close_position
+    (care trimite "TRADE ÎNCHIS")."""
     ok, err = bc.check_token(token)
     if not ok:
         return JSONResponse({"error": err}, status_code=403)
     bc.set_paused(True)
+    active_syms = [s for s in _state.positions
+                   if _state.get_position(s) is not None]
+    # MESAJ 1 — "Bot OPRIT" INAINTE de close-uri (ordine: bot oprit → pozitii inchise).
+    try:
+        await tg.send_critical(
+            "Bot OPRIT via dashboard",
+            f"<b>Inchid pozitiile:</b> {', '.join(active_syms) if active_syms else '—'}\n"
+            f"<b>Stare:</b> PAUZAT (use /api/resume pt restart trading).",
+        )
+    except Exception:
+        pass
+    # MESAJ 2 (per simbol) — close_position inregistreaza DASHBOARD_STOP + DB +
+    # "TRADE ÎNCHIS", DUPA "Bot OPRIT".
     closed: list = []
     failed: list = []
-    for sym in list(_state.positions.keys()):
+    for sym in active_syms:
         pos = _state.get_position(sym)
         if pos is None:
             continue
@@ -2006,15 +2286,6 @@ async def api_stop(token: str = ""):
         except Exception as e:
             print(f"  [STOP {sym}] close failed: {e!r}")
             failed.append(sym)
-    try:
-        await tg.send_critical(
-            "Bot OPRIT via dashboard",
-            f"<b>Inchise:</b> {', '.join(closed) if closed else '—'}\n"
-            f"<b>Esuate:</b> {', '.join(failed) if failed else '—'}\n"
-            f"<b>Stare:</b> PAUZAT (use /api/resume pt restart trading).",
-        )
-    except Exception:
-        pass
     return {"status": "stopped", "closed": closed, "failed": failed}
 
 

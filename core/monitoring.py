@@ -74,6 +74,138 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+_persistent_logs_installed = False
+
+
+def install_persistent_logs() -> None:
+    """Log-uri PERSISTENTE fara a atinge sutele de print() din framework.
+
+    `docker logs` sunt legate de INSTANTA containerului → dispar definitiv la
+    re-pull image / recreare in Portainer. Redirectam sys.stdout+stderr printr-un
+    "tee" care scrie SIMULTAN la stdout-ul original (pastrat pt `docker logs` live)
+    SI intr-un fisier rotativ pe DATA_DIR (=/data, montat din BOT_DATA_DIR pe host
+    → supravietuieste recrearii). Accesibil oricand:
+        docker exec <bot> cat /data/app.log     (sau /data/app.log.1, .2 ...)
+        /srv/bots/<BOT_NAME>/data/app.log        (direct pe host)
+
+    Non-invaziv: print() ramane peste tot, doar stream-ul de dedesubt e teed.
+    Cheama PRIMUL in main.py (inainte de orice print) ca sa prinzi si bannerul.
+    No-op daca DATA_DIR nu e setat (persistenta OFF — modelul default al BP) sau
+    daca a fost deja instalat (idempotent). Rotatie pe dimensiune printr-un sink
+    propriu (LOG_MAX_BYTES/LOG_BACKUP_COUNT, ca json-file driver-ul Docker) — NU
+    logging.handlers, ca sa nu fie inchis de dictConfig-ul intern al uvicorn.
+    (port BP 134babf/607bd74/4bee601/d7059a2)"""
+    global _persistent_logs_installed
+    if _persistent_logs_installed:
+        return
+    data_dir = os.getenv("DATA_DIR", "")
+    if not data_dir:
+        return
+    import sys
+    import threading
+    try:
+        os.makedirs(data_dir, exist_ok=True)
+        path = os.path.join(data_dir, "app.log")
+        max_bytes = _env_int("LOG_MAX_BYTES", 10 * 1024 * 1024)   # 10MB
+        backup_count = _env_int("LOG_BACKUP_COUNT", 5)
+        lock = threading.Lock()   # PARTAJAT intre tee-ul de stdout si cel de stderr
+
+        # Sink PROPRIU (fisier plain), NU logging.handlers.RotatingFileHandler:
+        # ORICE logging.Handler se auto-inregistreaza in logging._handlerList la
+        # __init__, iar uvicorn.run() cheama intern logging.config.dictConfig(
+        # uvicorn LOGGING_CONFIG) care face shutdown() la TOATE handler-ele din acel
+        # registru — inclusiv pe al nostru, desi nu e atasat la NICIUN logger. Efect:
+        # dupa boot handler.stream devine None si tot ce scriem se pierde silentios
+        # (AttributeError inghitit), deci fisierul capta DOAR fereastra minuscula
+        # install_persistent_logs() → uvicorn.run(). Un fisier deschis direct e
+        # complet in afara subsistemului logging → imun la dictConfig/shutdown.
+        class _RotatingSink:
+            def __init__(self) -> None:
+                self.stream = open(path, "a", encoding="utf-8")
+
+            def write(self, s: str) -> None:
+                self.stream.write(s)
+                # flush dupa FIECARE write: fisierul e block-buffered (~8KB) de OS,
+                # spre deosebire de stdout (unbuffered via PYTHONUNBUFFERED). Fara
+                # flush, ultimele linii raman in buffer si se PIERD la SIGKILL/OOM.
+                self.stream.flush()
+                # Rotatie pe dimensiune (mirror RotatingFileHandler): cap disc =
+                # max_bytes x (backup_count + 1).
+                if max_bytes > 0 and self.stream.tell() >= max_bytes:
+                    self._rollover()
+
+            def _rollover(self) -> None:
+                self.stream.close()
+                if backup_count > 0:
+                    for i in range(backup_count - 1, 0, -1):
+                        src, dst = f"{path}.{i}", f"{path}.{i + 1}"
+                        if os.path.exists(src):
+                            if os.path.exists(dst):
+                                os.remove(dst)
+                            os.rename(src, dst)
+                    dst1 = f"{path}.1"
+                    if os.path.exists(dst1):
+                        os.remove(dst1)
+                    os.rename(path, dst1)
+                    self.stream = open(path, "a", encoding="utf-8")
+                else:
+                    # fara backups: taie la max_bytes (cap disc = max_bytes)
+                    self.stream = open(path, "w", encoding="utf-8")
+
+            def flush(self) -> None:
+                try:
+                    self.stream.flush()
+                except Exception:
+                    pass
+
+        sink = _RotatingSink()
+
+        class _Tee:
+            def __init__(self, original: Any) -> None:
+                self._orig = original
+
+            def write(self, s: str) -> int:
+                try:
+                    self._orig.write(s)
+                except Exception:
+                    pass
+                with lock:
+                    try:
+                        sink.write(s)
+                    except Exception:
+                        pass
+                return len(s)
+
+            def flush(self) -> None:
+                try:
+                    self._orig.flush()
+                except Exception:
+                    pass
+                with lock:
+                    sink.flush()
+
+            def isatty(self) -> bool:
+                return getattr(self._orig, "isatty", lambda: False)()
+
+            def fileno(self) -> int:
+                # Fd-ul original — scrierile C/subprocess merg direct la stdout
+                # real (NU sunt teed). Rar; print() trece prin write() → teed.
+                return self._orig.fileno()
+
+        sys.stdout = _Tee(sys.stdout)
+        sys.stderr = _Tee(sys.stderr)
+        _persistent_logs_installed = True
+        print(f"  [LOGS] persistent → {path} "
+              f"(maxBytes={max_bytes}, backups={backup_count})")
+    except Exception as e:
+        # NU pica boot-ul pt logging — scrie pe stdout-ul REAL.
+        try:
+            (sys.__stdout__ or sys.stdout).write(
+                f"  [LOGS] persistent log setup failed: {e}\n")
+        except Exception:
+            pass
+
+
 def install_signal_handlers() -> None:
     """
     Intercepteaza SIGTERM/SIGINT/SIGHUP. Loggeaza numele si seteaza
@@ -123,6 +255,55 @@ def install_asyncio_exception_handler() -> None:
         # No running loop yet — caller should invoke after loop creation.
         # (FastAPI lifespan rulează după ce loop-ul există, deci ok.)
         pass
+
+
+async def supervise(
+    name:         str,
+    coro_factory: Callable[[], Awaitable[None]],
+    tg_alert:     Optional[Callable[[str, str], Awaitable[None]]] = None,
+    max_backoff:  float = 60.0,
+) -> None:
+    """Supervisor restart-on-death pentru un task de fundal (WS etc.).
+
+    Ruleaza `coro_factory()`; daca task-ul MOARE (raise) sau returneaza (o bucla
+    WS infinita n-ar trebui sa returneze) → alerta Telegram cu traceback COMPLET
+    + auto-restart cu backoff exponential (cap `max_backoff`). Doua beneficii:
+      - prinzi cauza data viitoare (traceback in alerta, nu pierdut la GC),
+      - auto-vindecare (nu mai sta ore cu WS mort).
+
+    tg_alert: foloseste `send_warning` — NU HALT (botul se auto-vindeca prin
+    restart, deci NU s-a oprit). CancelledError propaga (shutdown legit — NU
+    restarta). Wrap fiecare task de fundal in lifespan:
+        asyncio.create_task(supervise("bybit_ws", _bybit_ws_task,
+                                      tg_alert=tg.send_warning))
+    """
+    import html as _html
+    backoff = 1.0
+    while True:
+        died_tb: Optional[str] = None
+        try:
+            await coro_factory()
+        except asyncio.CancelledError:
+            raise   # shutdown legit — nu restarta
+        except Exception:
+            died_tb = traceback.format_exc()
+        if died_tb:
+            print(f"  [SUPERVISOR] {name} A MURIT — restart în {backoff:.0f}s:\n"
+                  f"{died_tb}", flush=True)
+            if tg_alert is not None:
+                try:
+                    await tg_alert(
+                        f"WS task '{name}' a murit — auto-restart",
+                        f"Botul se auto-vindecă (restart în ~{backoff:.0f}s).\n"
+                        f"<pre>{_html.escape(died_tb[-1400:])}</pre>",
+                    )
+                except Exception as e:
+                    print(f"  [SUPERVISOR] {name} tg alert failed: {e}", flush=True)
+        else:
+            print(f"  [SUPERVISOR] {name} a returnat (n-ar trebui) — "
+                  f"restart în {backoff:.0f}s", flush=True)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, max_backoff)
 
 
 async def memory_monitor(

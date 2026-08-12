@@ -17,15 +17,17 @@ Persistenta:
 Equity contract:
   shared_equity NU se interogheaza din Bybit — local compute:
       shared_equity = initial + sum(trade.pnl_real for trade in closed)
-  Sync cu Bybit balance se face DOAR la INIT (set initial = balance) si dupa
-  fiecare close (audit ±3% drift, alerta Telegram daca diverge).
+  initial = genesis_account (ACCOUNT_SIZE), fixat la primul boot si NICIODATA
+  suprascris ulterior. Balanta Bybit live se citeste DOAR la entry, ca safety
+  cap pe sizing (vezi open_position) — nu re-sincronizeaza shared_equity.
 """
 from __future__ import annotations
 
 import json
 import os
 import threading
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
+from dataclasses import fields as _dc_fields
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -66,6 +68,16 @@ class LivePosition:
                                        # corect [adopt-60s, now+5min] FĂRĂ piramidari
                                        # vechi (închise ÎNAINTE de adopt) contaminate.
                                        # opened_ts_ms rămâne createdMs Bybit pt chart.
+
+    def to_persist(self) -> dict:
+        """Serializare pt state.json — pozitia activa supravietuieste restartului
+        (detecteaza offline-close la resume: pozitie inchisa EXTERN cat botul jos)."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "LivePosition":
+        valid = {f.name for f in _dc_fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in valid})
 
 
 @dataclass
@@ -158,6 +170,14 @@ class BotState:
 
     def __init__(self, account_size: float = ACCOUNT_SIZE) -> None:
         self.initial_account: float = account_size
+        # Capital NOMINAL de pornire (= ACCOUNT_SIZE/pool_total, $100) — FIX,
+        # persistat, NICIODATA suprascris (nici de sync_equity, nici de load()
+        # daca lipseste doar cu default ACCOUNT_SIZE, NU cu balanta live).
+        # Spre deosebire de `initial_account` (suprascris de sync_equity la
+        # FIECARE restart cu balanta live — V4 citeste live, NU compound local
+        # ca boilerplate), `genesis_account` da "capital inițial" adevarat pt
+        # mesajul BOT PORNIT (Capital inițial FIX $100 vs Capital actual live).
+        self.genesis_account: float = ACCOUNT_SIZE
         self.shared_equity: float = account_size
         self.positions: dict[str, Optional[LivePosition]] = {}
         self.trades: list[TradeRecord] = []
@@ -197,19 +217,25 @@ class BotState:
         """
         Inregistreaza trade inchis cu pnl real (deja tras de pe Bybit).
 
-        IMPORTANT: shared_equity NU se muta local prin += trade.pnl.
-        Caller-ul (main.py) face sync_equity(reason='CLOSE_<sym>') imediat
-        dupa, care OVERWRITE shared_equity = balance real Bybit. Asta e
-        single source of truth pentru equity (modelul Ichimoku, nu compound
-        local ca boilerplate).
+        Equity-ul se calculeaza LOCAL (model BP Bybit, NU mai citeste balanta live):
+            self.shared_equity += trade.pnl     # nimic tras din balance-ul Bybit!
+
+        Balanta live (ex.get_balance) ramane folosita DOAR la entry, pt cap-ul
+        de siguranta (vezi open_position) — NU pt sizing-ul de baza si NU pt
+        equity-ul raportat. Compound local elimina dependenta de un balance-fetch
+        corect la fiecare sync (mirror fix V4-HL dde71f3).
         """
         trade.id = len(self.trades) + 1
         self.trades.append(trade)
-        # equity_curve point e adaugat de sync_equity (care e apelat dupa)
+        self.shared_equity += trade.pnl                # local compute — NU balanta Bybit
+        self.equity_curve.append({
+            "time":  trade.exit_ts_ms // 1000,          # ms -> s
+            "value": round(self.shared_equity, 4),
+        })
         # Free position slot
         self.positions[trade.symbol] = None
         print(f"  [STATE] Trade #{trade.id} {trade.symbol} {trade.direction} "
-              f"PnL=${trade.pnl:+,.2f}  (equity update via sync_equity)")
+              f"PnL=${trade.pnl:+,.2f}  shared_equity_local=${self.shared_equity:,.2f}")
 
     # ----------------------------------------------------------------
     # Indicators (overlay chart)
@@ -245,10 +271,10 @@ class BotState:
     def summary(self) -> dict:
         n = len(self.trades)
         wins = sum(1 for t in self.trades if t.pnl > 0)
-        pnl_total = self.shared_equity - self.initial_account
-        ret_pct = (pnl_total / self.initial_account * 100) if self.initial_account else 0.0
+        pnl_total = self.shared_equity - self.genesis_account
+        ret_pct = (pnl_total / self.genesis_account * 100) if self.genesis_account else 0.0
         return {
-            "initial_account": round(self.initial_account, 2),
+            "initial_account": round(self.genesis_account, 2),
             "account": round(self.shared_equity, 2),
             "pnl_total": round(pnl_total, 2),
             "return_pct": round(ret_pct, 2),
@@ -288,14 +314,41 @@ class BotState:
         return os.path.join(DATA_DIR, "bot_state.json")
 
     def save(self) -> None:
+        """
+        Persista state-ul pe disk. Idempotent.
+
+        TOT sub lock (build payload + write + os.replace). Doua save() concurente
+        sunt normale aici (record_closed_trade / clear_active_position / synth
+        DESYNC / heartbeat pot declansa salvari aproape simultan, fiecare prin
+        asyncio.to_thread → thread-uri diferite). Cu write-ul in AFARA lock-ului
+        si un tmp cu nume FIX comun se calcau reciproc:
+          (a) ENOENT: A face os.replace si MUTA tmp-ul; B, care intre timp scrisese
+              in ACELASI tmp, gaseste tmp-ul disparut la propriul replace → eroare;
+          (b) STALE overwrite: B construise payload mai NOU, dar daca replace-ul lui
+              A (payload mai VECHI) ateriza ultimul, pe disk ramanea state VECHI →
+              la un crash/restart in fereastra aia se pierdea ultima mutatie (ex un
+              trade proaspat inchis).
+        Lock-ul serializeaza: cine intra ultimul are payload-ul cel mai proaspat SI
+        ateriza ultimul. `_lock` NU e reentrant, dar niciun caller nu-l tine cand
+        cheama save() (ar fi deadlock-uit deja pe `with` de build) → sigur de extins.
+        I/O sub lock = cateva ms pe un fisier mic, in thread pool (nu event loop).
+        NOTA: lock-ul e IN-PROCES. Doi boti pe ACELASI DATA_DIR ar cere file-lock —
+        nesuportat by design (fiecare bot are DATA_DIR propriu). (port BP cf3b289)
+        """
         path = self._state_path()
         if not path:
             return
         with self._lock:
             data = {
                 "initial_account": self.initial_account,
+                "genesis_account": self.genesis_account,
                 "shared_equity": self.shared_equity,
                 "trades": [t.to_persist() for t in self.trades],
+                # Pozitii active persistate → detecteaza offline-close la restart
+                # (pozitie inchisa EXTERN cat botul era jos). Bybit are created_ms
+                # nativ; persistam pt offline-close (record + Telegram + DB la boot).
+                "positions": {s: p.to_persist()
+                              for s, p in self.positions.items() if p},
                 "equity_curve": list(self.equity_curve),
                 "first_candle_ts": self.first_candle_ts,
                 "start_utc": self.start_utc.isoformat(),
@@ -303,13 +356,19 @@ class BotState:
                 "indicator_meta": self.indicator_meta,
                 "reset_token": RESET_TOKEN,
             }
-        try:
             tmp = path + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            os.replace(tmp, path)
-        except Exception as e:
-            print(f"  [STATE] save error: {e}")
+            try:
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                os.replace(tmp, path)
+            except Exception as e:
+                print(f"  [STATE] save error: {e}")
+                # Nu lasa tmp orfan daca replace-ul a picat (write-ul a reusit).
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
 
     def load(self) -> None:
         path = self._state_path()
@@ -330,8 +389,15 @@ class BotState:
             return
 
         self.initial_account = data.get("initial_account", self.initial_account)
+        # genesis_account: FIX la $100 (ACCOUNT_SIZE) daca lipseste din state.json
+        # vechi (pre-fix) — NU la self.genesis_account curent (ar fi acelasi
+        # default oricum) si NU la o balanta live (genesis = nominal, nu real).
+        self.genesis_account = data.get("genesis_account", ACCOUNT_SIZE)
         self.shared_equity = data.get("shared_equity", self.initial_account)
         self.trades = [TradeRecord.from_dict(t) for t in data.get("trades", [])]
+        # Pozitii active persistate. Resume le reconciliaza cu Bybit (adopt).
+        self.positions = {s: LivePosition.from_dict(d)
+                          for s, d in (data.get("positions") or {}).items()}
         self.equity_curve = data.get("equity_curve", []) or self.equity_curve
         self.first_candle_ts = data.get("first_candle_ts", {}) or {}
         self.indicators = data.get("indicators", {}) or {}

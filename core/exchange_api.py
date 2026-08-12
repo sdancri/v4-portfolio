@@ -297,17 +297,56 @@ async def get_kline(symbol: str, interval: str, limit: int = 1000,
 # ============================================================================
 
 async def get_balance() -> Optional[float]:
-    """USDT available — UNIFIED account."""
-    r = await _get("/v5/account/wallet-balance",
-                   {"accountType": "UNIFIED", "coin": "USDT"})
-    if not r:
-        return None
-    try:
-        for coin in r["list"][0]["coin"]:
-            if coin["coin"] == "USDT":
-                return float(coin["availableToWithdraw"] or coin["walletBalance"])
-    except Exception:
-        pass
+    """Margin DISPONIBILA (nu total equity) — conturi UNIFIED.
+
+    Folosit DOAR pt cap-ul de siguranta din position_sizing la entry (NU
+    actualizeaza shared_equity — model compound local, vezi bot_state.py).
+
+    Sursa: `totalAvailableBalance` la nivel de CONT — disponibilul netat cu
+    marja TUTUROR pozitiilor (alte perechi pe acelasi UNIFIED). Populat pe
+    AMBELE moduri de margin (Regular + Portfolio Margin). Capcana veche:
+    per-coin `availableToWithdraw or walletBalance` — pe Portfolio Margin
+    `availableToWithdraw` e GOL ("") → `or` cadea silentios pe `walletBalance`
+    = TOTAL ne-netat → cap de sizing supra-dimensionat pe cont partajat →
+    order rejected / supra-levier (aceeasi clasa ca fix-ul HL df67f07,
+    port BP 9f8f7f5).
+
+    Retry 4x/1s: un singur fail tranzitoriu (_get n-are retry intern) lasa
+    cap-ul de siguranta sa cada pe fallback shared_equity (mai putin sigur —
+    vezi WARNING Telegram in open_position). Aceeasi clasa de bug identificata
+    pe V4-HL 2026-07-08 (NEAR supradimensionat din balance stale).
+    """
+    last_exc: Optional[Exception] = None
+    for i in range(4):
+        try:
+            r = await _get("/v5/account/wallet-balance",
+                           {"accountType": "UNIFIED", "coin": "USDT"})
+            if r:
+                acct = r["list"][0]
+                # 1) Preferat: disponibil la nivel de cont (netat, populat pe
+                # Regular + Portfolio Margin).
+                tab = acct.get("totalAvailableBalance", "")
+                if tab not in ("", None):
+                    return float(tab)
+                # 2) Fallback: per-coin availableToWithdraw (Regular margin il
+                # populeaza; PM il lasa gol).
+                for coin in acct.get("coin", []):
+                    if coin.get("coin") == "USDT":
+                        atw = coin.get("availableToWithdraw", "")
+                        if atw not in ("", None):
+                            return float(atw)
+                        # 3) Ultima instanta: walletBalance (TOTAL ne-netat) —
+                        # degradat, dar ramura (1) prinde deja pe PM. Doar daca
+                        # API-ul e complet atipic.
+                        wb = coin.get("walletBalance", "")
+                        return float(wb) if wb not in ("", None) else None
+            last_exc = RuntimeError(f"empty/malformed response: {r!r}")
+        except Exception as e:
+            last_exc = e
+        print(f"[BYBIT] get_balance attempt {i+1}/4 failed: {last_exc!r}")
+        if i < 3:
+            await asyncio.sleep(1.0)
+    print(f"[BYBIT] get_balance FAILED after 4 retries: {last_exc!r}")
     return None
 
 
@@ -643,8 +682,8 @@ async def set_position_sl(symbol: str, sl_price: float,
         return False
     retry_s = int(sum(delays))
     # Alerta Telegram diferentiata pe is_initial:
-    #   is_initial=True (primul SL post-fill): tg.send_critical — URGENT,
-    #     pozitia ruleaza fara nicio protectie Bybit-side.
+    #   is_initial=True (primul SL post-fill): tg.send_warning — pozitia
+    #     ruleaza fara nicio protectie Bybit-side (botul CONTINUA, nu HALT).
     #   is_initial=False (trailing/breakeven update): tg.send — warning,
     #     pozitia ramane protejata de SL initial setat anterior.
     # Best-effort: tg.send fail NU altereaza return-ul.
@@ -656,7 +695,9 @@ async def set_position_sl(symbol: str, sl_price: float,
         tp_str = smart_price(tp_price) if tp_price is not None else None
         tp_line = f"<b>TP:</b> {tp_str}\n" if tp_str is not None else ""
         if is_initial:
-            await tg.send_critical(
+            # WARNING, nu HALT: botul NU se opreste — pozitia ruleaza (reconcile
+            # o prinde la close + fortare). HALT doar cand botul chiar se opreste.
+            await tg.send_warning(
                 f"{symbol} SL/TP NESETAT" if tp_price is not None else f"{symbol} SL NESETAT",
                 f"<b>set_position_sl A EȘUAT</b> după {n_retries} reîncercări (~{retry_s}s)\n"
                 f"<b>SL:</b> {sl_str}\n"

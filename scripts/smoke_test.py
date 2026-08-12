@@ -1,24 +1,25 @@
 """
-smoke_test.py — Verificari sanity rapide pe Ichimoku2.
+smoke_test.py — Verificari sanity rapide pe V4 (BB-MR + Hull+Ichimoku).
 
 Ruleaza: python scripts/smoke_test.py
 
 Testeaza:
   1. Toate modulele importeaza fara erori
-  2. Configurile Ichi1/Ichi2 incarca corect
-  3. PairStrategyConfig + IchimokuSignal instantiaza
-  4. warm_up + evaluate lucreaza pe date simulate
-  5. position_sizing calculeaza corect
-  6. exchange_api functii exista
-  7. bot_state operatii (LivePosition, TradeRecord, equity update)
-  8. no_lookahead filter
-  9. telegram_bot fmt_time
-  10. private_ws auth signing
+  2. Config-ul V4 (config_v4.yaml) incarca corect
+  3. Strategy: PairStrategyConfig + Signal instantiaza
+  4. position_sizing calculeaza corect
+  5. exchange_api functii exista
+  6. bot_state operatii (LivePosition, TradeRecord, equity update)
+  7. no_lookahead filter
+  8. telegram_bot fmt_time
+  9. private_ws auth signing
+  10. main.py (full import)
 
 NU face apeluri reale catre Bybit. Verifica doar structura codului.
 """
 from __future__ import annotations
 
+import asyncio
 import sys
 import time
 from pathlib import Path
@@ -113,29 +114,19 @@ except Exception as e:
 # ============================================================================
 # 2. Config loading
 # ============================================================================
-section("2. Config loading (Ichi1 + Ichi2)")
+section("2. Config loading (config_v4.yaml)")
 
 try:
-    cfg1 = load_config(str(ROOT / "config" / "config_ichi1.yaml"))
+    cfg1 = load_config(str(ROOT / "config" / "config_v4.yaml"))
     enabled1 = [p.symbol for p in cfg1.pairs if p.enabled]
-    check("config_ichi1.yaml loads", True)
-    check("Ichi1 has SUN+MNT+ILV", set(enabled1) == {"SUNUSDT", "MNTUSDT", "ILVUSDT"},
+    check("config_v4.yaml loads", True)
+    check("V4 has BTC+TIA+NEAR", set(enabled1) == {"BTCUSDT", "TIAUSDT", "NEARUSDT"},
           detail=f"got {enabled1}")
-    check("Ichi1 leverage_max=12", cfg1.portfolio.leverage_max == 12,
+    check("V4 leverage_max=10", cfg1.portfolio.leverage_max == 10,
           detail=f"got {cfg1.portfolio.leverage_max}")
-    check("Ichi1 pool_total=100", cfg1.portfolio.pool_total == 100.0)
+    check("V4 pool_total=100", cfg1.portfolio.pool_total == 100.0)
 except Exception as e:
-    check("Ichi1 config", False, repr(e))
-
-try:
-    cfg2 = load_config(str(ROOT / "config" / "config_ichi2.yaml"))
-    enabled2 = [p.symbol for p in cfg2.pairs if p.enabled]
-    check("config_ichi2.yaml loads", True)
-    check("Ichi2 has AERO+RSR+AKT", set(enabled2) == {"AEROUSDT", "RSRUSDT", "AKTUSDT"},
-          detail=f"got {enabled2}")
-    check("Ichi2 leverage_max=12", cfg2.portfolio.leverage_max == 12)
-except Exception as e:
-    check("Ichi2 config", False, repr(e))
+    check("V4 config", False, repr(e))
 
 # ============================================================================
 # 3. Strategy: PairStrategyConfig + IchimokuSignal
@@ -198,27 +189,44 @@ except Exception as e:
 section("4. Position sizing")
 
 try:
-    pair_cfg = cfg1.pairs[0]  # SUNUSDT
+    pair_cfg = cfg1.pairs[0]  # BTCUSDT (bb_mr)
     sizing = compute_position_size(pair_cfg, shared_equity=100.0,
                                     balance_broker=100.0,
                                     portfolio_cfg=cfg1.portfolio,
                                     leverage=pair_cfg.leverage)
-    expected_pos_usd = (100.0 * pair_cfg.risk_pct_per_trade) / pair_cfg.sl_initial_pct
+    # effective_sl_pct (nu sl_initial_pct direct) — BB MR foloseste sl_pct,
+    # HI foloseste sl_initial_pct (vezi compute_position_size).
+    expected_pos_usd = (100.0 * pair_cfg.risk_pct_per_trade) / pair_cfg.effective_sl_pct
     cap_usd = cfg1.portfolio.cap_pct_of_max * 100.0 * cfg1.portfolio.leverage_max
-    # pos_usd should be at most expected_pos_usd; if > cap_usd, sizing.skip=True
-    if sizing.skip:
-        check("position_sizing skip flag", sizing.pos_usd > cap_usd,
-              detail=f"skip={sizing.skip_reason}")
-    else:
-        check("compute_position_size pos_usd",
-              abs(sizing.pos_usd - expected_pos_usd) < 0.01,
-              detail=f"got {sizing.pos_usd:.2f} expected {expected_pos_usd:.2f}")
-    check("risk_usd = 7%",
-          abs(sizing.risk_usd - 7.0) < 0.01,
+    check("compute_position_size pos_usd (necapat, balance normal)",
+          abs(sizing.pos_usd - expected_pos_usd) < 0.01,
+          detail=f"got {sizing.pos_usd:.2f} expected {expected_pos_usd:.2f}")
+    check("capped=False cand pos_usd < cap_usd", sizing.capped is False)
+    check("risk_usd = 10%",
+          abs(sizing.risk_usd - 10.0) < 0.01,
           detail=f"got {sizing.risk_usd:.2f}")
-    check("cap_usd = $1,140 (0.95*100*12)",
-          abs(sizing.cap_usd - 1140.0) < 0.01,
+    check("cap_usd = $950 (0.95*100*10)",
+          abs(sizing.cap_usd - 950.0) < 0.01,
           detail=f"got {sizing.cap_usd:.2f}")
+
+    # Regression incident live NEAR pe V4-HL 2026-07-17: cand pos_usd cerut
+    # depaseste cap_usd (margin limitata — alte perechi tin deja capital pe
+    # acelasi wallet), botul TREBUIE sa CAPEZE pozitia (model BP qty_by_risk:
+    # min(notional, cap)), NU sa sara peste trade. Balance mic (1.0) forteaza
+    # cap_usd sub pos_usd dorit.
+    sizing_capped = compute_position_size(pair_cfg, shared_equity=100.0,
+                                          balance_broker=1.0,
+                                          portfolio_cfg=cfg1.portfolio,
+                                          leverage=pair_cfg.leverage)
+    expected_cap = cfg1.portfolio.cap_pct_of_max * 1.0 * cfg1.portfolio.leverage_max
+    check("capped=True cand pos_usd > cap_usd (nu skip)",
+          sizing_capped.capped is True)
+    check("pos_usd == cap_usd cand capat (min(), nu skip)",
+          abs(sizing_capped.pos_usd - expected_cap) < 0.01,
+          detail=f"got {sizing_capped.pos_usd:.4f} expected {expected_cap:.4f}")
+    check("risk_usd recalculat proportional pe pozitia capata",
+          sizing_capped.risk_usd < 10.0,
+          detail=f"got {sizing_capped.risk_usd:.4f} (expected < 10.0, risc redus)")
 except Exception as e:
     check("position_sizing", False, repr(e))
 
@@ -284,11 +292,12 @@ try:
         exit_reason="BYBIT_TP", pnl=4.95, fees=0.05,
     )
     state.record_closed_trade(trade)
-    # Modelul Ichimoku: record_closed_trade NU muta shared_equity local —
-    # caller-ul (main.py) face sync_equity dupa, care OVERWRITE din Bybit.
-    check("record_closed_trade NU modifica shared_equity local",
-          state.shared_equity == 1000.0,
-          detail=f"got {state.shared_equity} (expected 1000 — sync_equity face update real)")
+    # Model compound local (conform BP, dde71f3/953e04b): record_closed_trade
+    # MUTA shared_equity local (+= trade.pnl). Nu mai exista sync_equity() care
+    # sa re-citeasca balanta live de pe Bybit.
+    check("record_closed_trade actualizeaza shared_equity local (compound)",
+          state.shared_equity == 1004.95,
+          detail=f"got {state.shared_equity} (expected 1004.95 = 1000 + pnl 4.95)")
     check("position cleared after close", state.n_open_positions() == 0)
     check("trade in history", len(state.trades) == 1)
 
@@ -307,6 +316,67 @@ try:
           "return_pct" in summary and summary["n_trades"] == 1)
 except Exception as e:
     check("BotState flow", False, repr(e))
+
+# Regression BP cf3b289: save() TREBUIE sa fie tot sub lock (build+write+
+# replace), altfel doua save() concurente (record_closed_trade/heartbeat/etc,
+# fiecare prin asyncio.to_thread → thread-uri diferite) se calca pe tmp-ul cu
+# nume fix → "save error" (ENOENT) si/sau stale-overwrite silentios pe disk.
+# Reproducere identica cu BP: 40 threads concurente → 0 erori, JSON final
+# valid, zero tmp orfan (pe codul VECHI: 15-19 erori pe reproducerea BP).
+try:
+    import os as _os
+    import json as _json
+    import shutil as _shutil
+    import threading as _threading
+    import core.bot_state as _bs
+
+    # DATA_DIR e constanta MODUL-LEVEL (citita o data la import, NU live din
+    # os.environ) — setarea os.environ["DATA_DIR"] dupa import n-ar avea NICIUN
+    # efect (capcana cunoscuta). Trebuie mutat direct atributul modulului.
+    _race_dir = "/tmp/smoke_save_race_test"
+    _shutil.rmtree(_race_dir, ignore_errors=True)
+    _os.makedirs(_race_dir, exist_ok=True)
+    _prev_data_dir = _bs.DATA_DIR
+    _bs.DATA_DIR = _race_dir
+
+    race_state = BotState(account_size=100.0)
+    save_errors = []
+    _orig_print = print
+
+    def _capture_print(*a, **kw):
+        msg = " ".join(str(x) for x in a)
+        if "save error" in msg:
+            save_errors.append(msg)
+        _orig_print(*a, **kw)
+
+    import builtins as _builtins
+    _builtins.print = _capture_print
+    try:
+        def _worker(i):
+            race_state.shared_equity = 100.0 + i
+            race_state.save()
+
+        threads = [_threading.Thread(target=_worker, args=(i,)) for i in range(40)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    finally:
+        _builtins.print = _orig_print
+
+    _tmp_path = race_state._state_path() + ".tmp"
+    _final_path = race_state._state_path()
+    check("save() concurent (40x) — zero erori", len(save_errors) == 0,
+          detail=f"got {len(save_errors)} save error(s)")
+    check("save() concurent — zero tmp orfan", not _os.path.exists(_tmp_path))
+    with open(_final_path, encoding="utf-8") as f:
+        _final_data = _json.load(f)
+    check("save() concurent — JSON final valid", "shared_equity" in _final_data)
+
+    _bs.DATA_DIR = _prev_data_dir
+    _shutil.rmtree(_race_dir, ignore_errors=True)
+except Exception as e:
+    check("save() concurrent race", False, repr(e))
 
 # ============================================================================
 # 7. no_lookahead
@@ -364,7 +434,7 @@ section("10. main.py")
 
 try:
     import os
-    os.environ["CONFIG_FILE"] = str(ROOT / "config" / "config_ichi1.yaml")
+    os.environ["CONFIG_FILE"] = str(ROOT / "config" / "config_v4.yaml")
     # Reimport main daca a fost incarcat anterior
     if "main" in sys.modules:
         del sys.modules["main"]
@@ -373,7 +443,59 @@ try:
     check("CONFIG.pairs loaded",
           len([p for p in main.CONFIG.pairs if p.enabled]) == 3)
     check("FastAPI app constructed",
-          main.app is not None and main.app.title.startswith("ichi"))
+          main.app is not None and main.app.title.startswith("v4"))
+
+    # Regression BP 7098743: halt() TREBUIE sa seteze _halted[symbol]=True
+    # necondiționat, indiferent de notify — single source of truth (elimina
+    # site-uri care ar putea seta _halted[sym]=True direct, fara alerta).
+    asyncio.run(main.halt("TESTSYM", "motiv de test", notify=False))
+    check("halt() seteaza _halted[symbol]=True", main._halted.get("TESTSYM") is True)
+    del main._halted["TESTSYM"]
+
+    # Regression BP 8f404ca: _halted[sym]=True TREBUIE sa scurt-circuiteze
+    # on_confirmed_bar INAINTE de orice acces la _signals[sym] — altfel un
+    # simbol halted la refuz-adopt ar STIVUI un trade nou pe next bar peste
+    # pozitia neprotejata. _signals nu e populat fara bootstrap() → daca
+    # halt-check-ul nu opreste PRIMUL, ar arunca KeyError (proof-of-reach).
+    main._halted["BTCUSDT"] = True
+    try:
+        asyncio.run(main.on_confirmed_bar("BTCUSDT", {"ts": 0, "close": 1.0}))
+        check("on_confirmed_bar respecta _halted (nu atinge _signals)", True)
+    except KeyError:
+        check("on_confirmed_bar respecta _halted (nu atinge _signals)", False,
+              detail="a trecut de halt-check pana la _signals[sym] — regresie 8f404ca")
+    finally:
+        del main._halted["BTCUSDT"]
+
+    # Regression incident live 2026-07-11 (TIAUSDT stuck open): dedup-hit in
+    # _dedup_and_record_trade TREBUIE sa curete _state.positions[symbol],
+    # altfel pozitia ramane FANTOMA permanent (model BP main_multi.py:
+    # record_closed_trade e dedup-safe, caller curata neconditionat).
+    main._state.set_position("BTCUSDT", LivePosition(
+        symbol="BTCUSDT", side="Buy", direction="LONG",
+        qty=1.0, entry_price=100.0, sl_price=96.0, tp_price=105.0,
+        leverage=10, pos_usd=100.0, risk_usd=4.0, opened_ts_ms=123456,
+    ))
+    main._state.trades.append(TradeRecord(
+        id=999, symbol="BTCUSDT", direction="LONG",
+        entry_ts_ms=123456, entry_price=100.0, sl_price=96.0, tp_price=105.0,
+        qty=1.0, exit_ts_ms=124000, exit_price=105.0, exit_price_target=105.0,
+        exit_reason="TP", pnl=5.0, fees=0.05,
+    ))
+    try:
+        dup_trade = TradeRecord(
+            id=0, symbol="BTCUSDT", direction="LONG",
+            entry_ts_ms=123456, entry_price=100.0, sl_price=96.0, tp_price=105.0,
+            qty=1.0, exit_ts_ms=999999, exit_price=101.0, exit_price_target=101.0,
+            exit_reason="AUTO", pnl=1.0, fees=0.01,
+        )
+        recorded = main._dedup_and_record_trade(dup_trade)
+        check("_dedup_and_record_trade returneaza False pe dedup",
+              recorded is False)
+        check("_dedup_and_record_trade curata pozitia stale pe dedup-hit",
+              main._state.get_position("BTCUSDT") is None)
+    finally:
+        main._state.trades.pop()  # scoate trade-ul de test (id=999)
 except Exception as e:
     check("main.py", False, repr(e))
 
