@@ -445,6 +445,13 @@ try:
     check("FastAPI app constructed",
           main.app is not None and main.app.title.startswith("v4"))
 
+    # Regression BP 7098743: halt() TREBUIE sa seteze _halted[symbol]=True
+    # necondiționat, indiferent de notify — single source of truth (elimina
+    # site-uri care ar putea seta _halted[sym]=True direct, fara alerta).
+    asyncio.run(main.halt("TESTSYM", "motiv de test", notify=False))
+    check("halt() seteaza _halted[symbol]=True", main._halted.get("TESTSYM") is True)
+    del main._halted["TESTSYM"]
+
     # Regression BP 8f404ca: _halted[sym]=True TREBUIE sa scurt-circuiteze
     # on_confirmed_bar INAINTE de orice acces la _signals[sym] — altfel un
     # simbol halted la refuz-adopt ar STIVUI un trade nou pe next bar peste

@@ -74,6 +74,7 @@ from core.config import AppConfig, load_config
 from core.monitoring import (
     SHUTDOWN_SIGNAL,
     install_asyncio_exception_handler,
+    install_persistent_logs,
     install_signal_handlers,
     memory_monitor,
     supervise,
@@ -81,6 +82,11 @@ from core.monitoring import (
 from core.position_sizing import compute_position_size, compute_qty
 from strategies.bb_mr_signal import BBMeanReversionSignal, BBMRConfig
 from strategies.ichimoku_signal import IchimokuSignal, PairStrategyConfig
+
+# Log-uri PERSISTENTE: tee stdout/stderr → fisier rotativ pe DATA_DIR (docker logs
+# dispar la re-pull image in Portainer; fisierul pe /data supravietuieste). Primul,
+# ca sa prinda si bannerul de boot. (port BP 134babf)
+install_persistent_logs()
 
 # Type alias pentru orice signal generator (dispatch by strategy)
 SignalGen = IchimokuSignal | BBMeanReversionSignal
@@ -604,6 +610,33 @@ async def _sl_retry_loop(symbol: str, sl_price: float,
         print(f"  [{symbol}] SL timeout tg.send_warning failed: {e!r}")
 
 
+async def halt(symbol: str, reason: str, *, notify: bool = True) -> None:
+    """Opreste botul pe acest simbol (_halted[symbol]=True) + ANUNTA Telegram
+    critical. Foloseste ASTA in loc de `_halted[symbol] = True` direct →
+    garanteaza ca niciun halt nu e TACUT (sa afli in timp real, nu peste o luna).
+
+    notify=False cand alerta a fost deja trimisa upstream (ex reconcile →
+    _reconcile_close/_assert_closed a trimis deja send_critical cu detalii)
+    ca sa nu dublezi.
+
+    _halted NU se persista in bot_state.json: la REDEPLOY botul PORNESTE curat
+    (resume/reconcile re-detecteaza daca anomalia inca persista). E oprire pe
+    sesiunea curenta, nu blocaj permanent. (port BP halt() helper — 7098743)
+    """
+    _halted[symbol] = True
+    print(f"  [{symbol}] 🚨 HALTED: {reason}")
+    if notify:
+        try:
+            await tg.send_critical(
+                f"🚨 {BOT_NAME} HALTED — {symbol}",
+                f"{reason}\n\nBotul NU mai trada pe {symbol} pana la restart. "
+                f"La redeploy porneste curat.",
+                symbol=symbol,
+            )
+        except Exception as e:
+            print(f"  [{symbol}] halt Telegram send failed: {e}")
+
+
 async def _assert_closed(symbol: str, qty_local: float,
                           reason_label: str) -> None:
     """Verifica ca pozitia e inchisa dupa chase_close. Raise pe esec.
@@ -833,8 +866,9 @@ async def _close_position_locked(symbol: str, exit_reason: str,
         final_exit_reason = await _reconcile_close(
             symbol, pos.direction, pos.qty, exit_reason)
     except ReconciliationError as e:
-        print(f"  [{symbol}] HALT pe ReconciliationError: {e}")
-        _halted[symbol] = True
+        # Alerta detaliata deja trimisa upstream in _reconcile_close/_assert_closed
+        # → notify=False (evita dubla alerta).
+        await halt(symbol, f"reconciliere anormala: {e}", notify=False)
         log_event("reconcile_halt", symbol=symbol, reason=exit_reason, error=str(e))
         return
 
@@ -971,14 +1005,7 @@ async def check_external_close(symbol: str) -> bool:
         # Position still exists — check no anomaly
         if qty_real > pos.qty + _RECONCILE_QTY_EPS:
             msg = f"qty_real={qty_real} > qty_local={pos.qty}"
-            print(f"  [{symbol}] RECONCILE HALT: {msg}")
-            await tg.send_critical(
-                f"{symbol} qty desync",
-                f"<b>Local:</b> {pos.qty}\n<b>Bybit:</b> {qty_real}\n"
-                f"Bot HALTED pe simbol. Verifică manual.",
-                symbol=symbol,
-            )
-            _halted[symbol] = True
+            await halt(symbol, f"qty desync — Local: {pos.qty}, Bybit: {qty_real}")
             raise ReconciliationError(msg)
         return False
 
@@ -1627,29 +1654,13 @@ async def _try_adopt_position(sym: str, pair_cfg, bybit_pos: dict,
 
     # STRAT 1 — Refuz adopt daca Bybit NU are SL setat.
     if not has_bybit_sl:
-        print(f"  [{sym}] adopt: REFUZ — Bybit qty={qty_real} FARA SL setat "
-              f"(suspect: manual sau bot fail)")
-        try:
-            await tg.send_warning(
-                "POZIȚIE FĂRĂ SL — refuz adoptie",
-                f"<b>Pe Bybit:</b> {tg.dir_emoji(dir_real)} {dir_real}  "
-                f"<b>Qty:</b> <code>{qty_real}</code>  "
-                f"<b>Entry:</b> <code>{ex.smart_price(entry_px)}</code>\n"
-                f"<b>SL Bybit:</b> <code>NESETAT</code>\n"
-                f"\n"
-                f"<b>Acțiune:</b>\n"
-                f"  1. Setează SL manual pe Bybit App (recomandat: "
-                f"entry × (1 ± <code>{pair_cfg.effective_sl_pct*100:.1f}%</code>)),\n"
-                f"  2. SAU închide poziția manual,\n"
-                f"  3. Apoi redeploy bot.\n"
-                f"\n"
-                f"<b>Stare bot:</b> simbolul e HALTAT — NU va genera "
-                f"trade nou pana la redeploy. Restul perechilor ruleaza normal.",
-                symbol=sym,
-            )
-        except Exception as e:
-            print(f"  [{sym}] adopt tg.send_warning failed: {e!r}")
-        _halted[sym] = True
+        await halt(
+            sym,
+            f"Poziție {dir_real} qty={qty_real} @ {ex.smart_price(entry_px)} "
+            f"FĂRĂ SL pe Bybit (stopLoss=0) — risc indefinit, defense-in-depth "
+            f"oprit, expusă la lichidare. NU o adopt. Setează SL manual pe Bybit "
+            f"App (recomandat: entry × (1 ± {pair_cfg.effective_sl_pct*100:.1f}%)) "
+            f"SAU închide poziția manual, apoi redeploy.")
         return None
 
     # STRAT 2 — Refuz adopt daca SL e pe partea GRESITA fata de PRETUL CURENT
@@ -1658,27 +1669,12 @@ async def _try_adopt_position(sym: str, pair_cfg, bybit_pos: dict,
     if last_close > 0 and (
             (dir_real == "LONG" and sl_real >= last_close) or
             (dir_real == "SHORT" and sl_real <= last_close)):
-        print(f"  [{sym}] adopt: REFUZ — SL instant-trigger "
-              f"(sl={sl_real} vs pret_curent={last_close}, dir={dir_real})")
-        try:
-            await tg.send_warning(
-                "SL S-AR DECLANȘA INSTANT — refuz adoptie",
-                f"<b>Pe Bybit:</b> {tg.dir_emoji(dir_real)} {dir_real}  "
-                f"<b>Preț curent:</b> <code>{ex.smart_price(last_close)}</code>  "
-                f"<b>SL:</b> <code>{ex.smart_price(sl_real)}</code>\n"
-                f"SL-ul e pe partea GREȘITĂ față de prețul curent — s-ar "
-                f"declanșa INSTANT.\n"
-                f"\n"
-                f"<b>Acțiune:</b> verifică manual poziția pe Bybit App "
-                f"(corectează SL sau închide), apoi redeploy bot.\n"
-                f"\n"
-                f"<b>Stare bot:</b> simbolul e HALTAT — NU va genera "
-                f"trade nou pana la redeploy. Restul perechilor ruleaza normal.",
-                symbol=sym,
-            )
-        except Exception as e:
-            print(f"  [{sym}] adopt tg.send_warning failed: {e!r}")
-        _halted[sym] = True
+        await halt(
+            sym,
+            f"Poziție {dir_real} cu SL={ex.smart_price(sl_real)} pe partea "
+            f"GREȘITĂ față de prețul curent {ex.smart_price(last_close)} "
+            f"(s-ar declanșa instant) — NU o adopt. Verifică manual poziția pe "
+            f"Bybit App (corectează SL sau închide), apoi redeploy.")
         return None
 
     # Bybit are SL → adoptie normala
@@ -1859,19 +1855,10 @@ async def bootstrap() -> None:
             _last_synced_ts[sym] = int(bars[-1][0]) // 1000
             print(f"  [{sym}] warmup {len(bars)} bars  last={df.index[-1]}")
         else:
-            print(f"  [{sym}] FATAL: warmup esuat dupa 4 retry-uri — halt simbol")
-            _halted[sym] = True
-            try:
-                await tg.send_critical(
-                    f"{sym} warmup eșuat",
-                    f"<b>get_kline</b> returnează 0 bare după 4 reîncercări "
-                    f"(~17s total).\n"
-                    f"<b>Stare bot:</b> simbolul e HALTAT — restul perechilor "
-                    f"rulează normal.\nVerifică connectivitate Bybit și redeploy.",
-                    symbol=sym,
-                )
-            except Exception:
-                pass
+            await halt(
+                sym,
+                "get_kline returnează 0 bare după 4 reîncercări (~17s total). "
+                "Verifică conectivitate Bybit și redeploy.")
             continue  # skip restul setup-ului pt acest simbol
 
         # Boot-time resume: V4 NU persista LivePosition in bot_state.json (doar

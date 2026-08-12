@@ -53,6 +53,12 @@ services:
       # boot, baseline > 560 → mareste pragul + mem_limit + memswap_limit.
       - MEM_MON_INTERVAL_SEC=${MEM_MON_INTERVAL_SEC:-300}
       - MEM_MON_RSS_ALERT_MB=${MEM_MON_RSS_ALERT_MB:-560}
+      # Log-uri persistente pe /data (tee stdout/stderr → fisier rotativ,
+      # supravietuieste re-pull image in Portainer — vezi DATA_DIR mai jos,
+      # deja setat). Cap disc = LOG_MAX_BYTES × (LOG_BACKUP_COUNT+1) (~60MB
+      # default). Citeste: docker exec V4 cat /app/data/app.log
+      - LOG_MAX_BYTES=${LOG_MAX_BYTES:-10485760}
+      - LOG_BACKUP_COUNT=${LOG_BACKUP_COUNT:-5}
       # Dashboard control (vezi core/bot_control.py + endpoints /api/pause|resume|stop):
       # BOT_CONTROL_URL = http://<container_name>:<chart_port>. Dashboard scrie
       # in state.db ca sa stie unde POST. Container_name aici = V4, port intern = 8104.
